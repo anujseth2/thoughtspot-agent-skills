@@ -33,10 +33,12 @@ cross-Model scan caps the corpus at 3 Models so the test stays fast.
 Usage:
     python tools/smoke-tests/smoke_ts_object_model_coach.py \\
         --ts-profile champ-staging \\
-        --model-name "Dunder Mifflin Sales & Inventory" \\
+        --model-guid  abc123...              \\  # preferred — stable, unambiguous
+        [--model-name "Dunder Mifflin..."]   \\  # alternative — resolved to GUID at runtime
         --column-name "Inventory Balance" \\
         [--no-cleanup]
 
+Provide exactly one of --model-guid or --model-name.
 Credentials: read from ~/.claude/thoughtspot-profiles.json by the ts CLI.
 """
 from __future__ import annotations
@@ -125,8 +127,20 @@ def _ts_tml_import(yaml_text: str, profile: str) -> dict:
 # Steps
 # ---------------------------------------------------------------------------
 
-def step_resolve_model(profile: str, model_name: str) -> str:
-    """Find Model GUID by display-name match."""
+def step_resolve_model(profile: str, model_name: str | None,
+                       model_guid: str | None) -> tuple[str, str]:
+    """Return (guid, display_name) for the target Model.
+
+    If model_guid is provided, verify it exists and retrieve its name.
+    Otherwise search by display name (exact match required).
+    """
+    if model_guid:
+        matches = run_ts(["metadata", "search", "--subtype", "WORKSHEET",
+                          "--guid", model_guid], profile)
+        if not matches:
+            raise RuntimeError(f"No model found with GUID '{model_guid}'. Check --model-guid.")
+        name = matches[0].get("metadata_header", {}).get("name", model_guid)
+        return model_guid, name
     matches = run_ts(["metadata", "search", "--subtype", "WORKSHEET",
                       "--name", f"%{model_name}%"], profile)
     exact = [m for m in matches
@@ -136,7 +150,7 @@ def step_resolve_model(profile: str, model_name: str) -> str:
             f"Model {model_name!r} not found. {len(matches)} partial matches; "
             f"need an exact name match."
         )
-    return exact[0]["metadata_id"]
+    return exact[0]["metadata_id"], model_name
 
 
 def step_export_and_parse(model_guid: str, profile: str) -> tuple[dict, list[dict]]:
@@ -466,13 +480,19 @@ def step_cleanup_restore_model(original_tml: dict, profile: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ts-profile", required=True, help="ThoughtSpot profile name")
-    parser.add_argument("--model-name", required=True, help="Model display name (exact match)")
-    parser.add_argument("--column-name", required=True, help="Column on the Model to patch")
+    id_group = parser.add_mutually_exclusive_group(required=True)
+    id_group.add_argument("--model-guid",
+                          help="GUID of the ThoughtSpot Model (preferred — stable, unambiguous)")
+    id_group.add_argument("--model-name",
+                          help="Model display name — resolved to GUID at runtime (exact match)")
+    parser.add_argument("--column-name", default=None,
+                        help="Column on the Model to patch (auto-selects first MEASURE if omitted)")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="Skip Model rollback (useful for debugging)")
     args = parser.parse_args()
 
-    print(f"smoke_ts_object_model_coach — target: {args.model_name!r}, column: {args.column_name!r}")
+    label = args.model_guid or args.model_name
+    print(f"smoke_ts_object_model_coach — target: {label!r}, column: {args.column_name or '(auto)'!r}")
     print()
 
     r = SmokeTestResult()
@@ -481,11 +501,12 @@ def main() -> int:
     if not ok:
         return r.summary()
 
-    ok, model_guid = r.step("resolve Model GUID", step_resolve_model,
-                             args.ts_profile, args.model_name)
+    ok, resolved = r.step("resolve Model GUID", step_resolve_model,
+                           args.ts_profile, args.model_name, args.model_guid)
     if not ok:
         return r.summary()
-    r.info(f"Model GUID: {model_guid}")
+    model_guid, model_display_name = resolved
+    r.info(f"Model GUID: {model_guid}  ({model_display_name})")
 
     ok, exported = r.step("export Model TML (with --associated)",
                            step_export_and_parse, model_guid, args.ts_profile)
@@ -518,12 +539,30 @@ def main() -> int:
             ok2, collisions = r.step(
                 "Step 4.5 — detect cross-Model column collisions (corpus capped at 10)",
                 step_detect_cross_model_collisions,
-                original_tml, args.model_name, siblings, args.ts_profile, 10,
+                original_tml, model_display_name, siblings, args.ts_profile, 10,
             )
             if ok2:
                 r.info(f"Detected {len(collisions)} collision(s) across the prioritised sibling corpus")
                 r.step("Step 4.5 — proposed RouteAction defaults to NEEDS_REVIEW (open-items #15)",
                         step_verify_proposed_action_default, collisions)
+
+    # Auto-select column if not specified: first MEASURE, else first non-date ATTRIBUTE
+    column_name = args.column_name
+    if not column_name:
+        cols = original_tml["model"].get("columns", [])
+        measures = [c["name"] for c in cols
+                    if c.get("properties", {}).get("column_type") == "MEASURE"]
+        if measures:
+            column_name = measures[0]
+        else:
+            attrs = [c["name"] for c in cols
+                     if c.get("properties", {}).get("column_type") == "ATTRIBUTE"]
+            column_name = attrs[0] if attrs else (cols[0]["name"] if cols else None)
+        if column_name:
+            r.info(f"Auto-selected column: {column_name!r}")
+        else:
+            r.info("No columns found on Model — cannot patch")
+            return r.summary()
 
     timestamp = int(time.time())
     test_ai_context = f"smoke test ai_context probe (run {timestamp})"
@@ -532,7 +571,7 @@ def main() -> int:
 
     ok, patched = r.step("patch Model with ai_context + synonyms",
                           step_patch_model_with_ai_assets, original_tml,
-                          args.column_name, test_ai_context, test_synonyms)
+                          column_name, test_ai_context, test_synonyms)
     if not ok:
         return r.summary()
 
@@ -543,7 +582,7 @@ def main() -> int:
 
     ok, _ = r.step("verify ai_context + synonyms round-tripped",
                     step_verify_round_trip, model_guid, args.ts_profile,
-                    args.column_name, test_ai_context, test_synonyms)
+                    column_name, test_ai_context, test_synonyms)
     if not ok and not args.no_cleanup:
         r.info("Attempting rollback...")
         try:
@@ -552,7 +591,7 @@ def main() -> int:
             r.info(f"Rollback failed: {e}")
         return r.summary()
 
-    target_token = f"[{args.column_name}]"
+    target_token = f"[{column_name}]"
     ok, _ = r.step("import REFERENCE_QUESTION feedback probe",
                     step_import_feedback_probe, model_guid, args.ts_profile,
                     probe_phrase, target_token)

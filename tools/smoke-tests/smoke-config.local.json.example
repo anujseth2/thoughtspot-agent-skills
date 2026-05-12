@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "Copy this file to smoke-config.local.json and fill in your values.",
+    "smoke-config.local.json is gitignored — never commit it.",
+    "",
+    "Keys per skill entry:",
+    "  ts_profile  — optional; overrides default_ts_profile for this skill only.",
+    "                Any skill can have its own profile.",
+    "  extra_args  — required args beyond --ts-profile (model GUIDs, connection names, etc.).",
+    "                Skills with unconfigured required args are skipped, not failed.",
+    "",
+    "Snowflake profile requirement:",
+    "  --sf-profile must be a CLI method profile (method: cli) in ~/.claude/snowflake-profiles.json.",
+    "  Key-pair / python method profiles are not supported by the smoke tests.",
+    "  Run 'SHOW SEMANTIC VIEWS IN DATABASE <db>;' in Snowflake to find valid --sv-fqn values."
+  ],
+
+  "default_ts_profile": "champ-staging",
+  "default_org": "Primary",
+
+  "skills": {
+    "ts-dependency-manager": {
+      "extra_args": ["--model-guid", "YOUR_MODEL_GUID_HERE"]
+    },
+    "ts-object-model-coach": {
+      "ts_profile": "YOUR_PROFILE_IF_DIFFERENT",
+      "extra_args": ["--model-guid", "YOUR_MODEL_GUID_HERE"]
+    },
+    "ts-convert-to-snowflake-sv": {
+      "ts_profile": "YOUR_OTHER_PROFILE",
+      "extra_args": [
+        "--sf-profile",       "YOUR_SF_PROFILE",
+        "--sf-target-db",     "YOUR_DATABASE",
+        "--sf-target-schema", "YOUR_SCHEMA"
+      ]
+    },
+    "ts-convert-from-snowflake-sv": {
+      "ts_profile": "YOUR_OTHER_PROFILE",
+      "extra_args": [
+        "--sf-profile", "YOUR_SF_PROFILE",
+        "--sv-fqn",     "YOUR_DATABASE.YOUR_SCHEMA.YOUR_VIEW"
+      ]
+    }
+  }
+}
