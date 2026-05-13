@@ -113,13 +113,19 @@ These skills work in both **Claude Code** and **Cortex Code CLI**. They use the
 | `ts-dependency-manager` | Audit dependencies, safely remove or repoint columns across Models, Views, Answers, Liveboards |
 | `ts-variable-timezone` | Search, set, or remove timezone values for the `ts_user_timezone` variable at org or user level ⚠️ Beta in 26.5, EA in 26.6 |
 
-**Setup** — deploy infrastructure and manage connection profiles
+**Connection Profiles** — manage credentials and connections
 
 | Skill | What it does |
 |---|---|
 | `ts-profile-thoughtspot` | Add, update, test, or delete ThoughtSpot profiles |
 | `ts-profile-snowflake` | Add, update, test, or delete Snowflake profiles (**Claude Code only** — Cortex Code manages Snowflake connections natively) |
-| `ts-setup-snowflake-udfs-business-days` | Deploy three Snowflake scalar UDFs for weekday-only date arithmetic, then show ThoughtSpot formula syntax |
+
+**Recipes** — pre-built analytical capabilities for ThoughtSpot
+
+| Skill | What it builds | Platform |
+|---|---|---|
+| `ts-recipe-formula-business-days-snowflake` | Business-day formula: deploy three Snowflake UDFs for weekday-only date arithmetic, then show ThoughtSpot formula syntax | Snowflake |
+| `ts-recipe-formula-hms-display-snowflake` | Duration display formula: deploy four Snowflake UDFs to format integer seconds/minutes as `HH:MM:SS`, `DD:HH:MM:SS`, `HH:MM`, or `DD:HH:MM` strings | Snowflake |
 
 See **[agents/cli/SETUP.md](agents/cli/SETUP.md)** for installation and setup.
 
@@ -144,7 +150,8 @@ install required — runs entirely within Snowflake using stored procedures.
 |---|---|
 | `ts-profile-thoughtspot` | Add, update, test, or delete ThoughtSpot profiles (uses Snowflake Secrets) |
 | `ts-setup-sv` | Install or upgrade stored procedures required by the other skills |
-| `ts-setup-snowflake-udfs-business-days` | Deploy three Snowflake scalar UDFs for weekday-only date arithmetic |
+| `ts-recipe-formula-business-days-snowflake` | Deploy three Snowflake scalar UDFs for weekday-only date arithmetic, then show ThoughtSpot formula syntax |
+| `ts-recipe-formula-hms-display-snowflake` | Deploy four Snowflake scalar UDFs to format integer seconds/minutes as `HH:MM:SS`, `DD:HH:MM:SS`, `HH:MM`, or `DD:HH:MM` |
 | `ts-convert-to-snowflake-sv` | Convert a ThoughtSpot model to a Snowflake Semantic View |
 | `ts-convert-from-snowflake-sv` | Convert a Snowflake Semantic View into a ThoughtSpot Model |
 
@@ -168,7 +175,8 @@ language in the Cursor AI chat.
 | `ts-object-model-coach` | Prepare a Model for Spotter — review AI Context, synonyms, mine dependent objects, generate improvements ⚠️ Untested in Cursor |
 | `ts-dependency-manager` | Audit dependencies, safely remove or repoint columns across Models, Views, Answers, Liveboards ⚠️ Untested in Cursor |
 | `ts-variable-timezone` | Search, set, or remove timezone values for the `ts_user_timezone` variable ⚠️ Beta in 26.5, EA in 26.6, Untested in Cursor |
-| `ts-setup-snowflake-udfs-business-days` | Deploy three Snowflake scalar UDFs for weekday-only date arithmetic, then show ThoughtSpot formula syntax |
+| `ts-recipe-formula-business-days-snowflake` | Deploy three Snowflake scalar UDFs for weekday-only date arithmetic, then show ThoughtSpot formula syntax |
+| `ts-recipe-formula-hms-display-snowflake` | Deploy four Snowflake scalar UDFs to format integer seconds/minutes as `HH:MM:SS`, `DD:HH:MM:SS`, `HH:MM`, or `DD:HH:MM` |
 
 See **[agents/cursor/SETUP.md](agents/cursor/SETUP.md)** for installation.
 

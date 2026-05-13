@@ -79,15 +79,26 @@ Trigger by asking: "Show timezone assignments" or "Set timezone for this user".
 > Untested in Cursor — best-effort condensation of the Claude version. See the rule
 > file's header for details.
 
-### `ts-setup-snowflake-udfs-business-days`
+### `ts-recipe-formula-business-days-snowflake`
 
 Deploys three Snowflake scalar UDFs for weekday-only date arithmetic
 (`get_business_days_clamped`, `get_business_minutes_clamped`,
 `get_business_duration_str`), then shows the ThoughtSpot formula syntax to
 call them via `sql_int_op` / `sql_string_op`.
 
-Trigger by asking: "Set up business day calculations in Snowflake" or
-"Create the business days UDFs".
+Trigger by asking: "Set up business day calculations in Snowflake",
+"Create the business days UDFs", or "I need a business days formula in ThoughtSpot".
+
+### `ts-recipe-formula-hms-display-snowflake`
+
+Deploys four Snowflake scalar UDFs that format integer durations as readable
+time strings (`format_seconds_to_hms`, `format_seconds_to_dhms`,
+`format_minutes_to_hm`, `format_minutes_to_dhm`), then shows the
+ThoughtSpot `sql_string_op` formula syntax to display them.
+
+Trigger by asking: "Format seconds as HH:MM:SS", "Display call duration as a
+time string", "Create a duration display formula in ThoughtSpot", or
+"Convert minutes to HH:MM".
 
 ---
 
