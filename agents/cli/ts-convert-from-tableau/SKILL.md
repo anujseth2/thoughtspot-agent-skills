@@ -165,6 +165,10 @@ resolves.
 
 ## Step A3 — Classify Formulas (Audit Mode)
 
+> **MANDATORY (I7) — before classifying any calculated field as untranslatable, open
+> [`../../shared/mappings/tableau/tableau-formula-translation.md`](../../shared/mappings/tableau/tableau-formula-translation.md)
+> and check its full function table and pass-through section. Do not decide from syntax alone.**
+
 For each calculated field extracted in Step A2, classify it into one of these tiers
 based on the patterns in `tableau-formula-translation.md`:
 
@@ -667,6 +671,36 @@ and joining the other datasource in (see the join/blend rules in 5b and
 The `model_tables[]` section references both regular tables (from Step 5a) and SQL
 Views (from Step 5c) — both are referenced by `name` in the same way.
 
+**Model name:** use the Tableau datasource display name — no prefix (no `TEST_` or environment
+markers). Ask the user if they want a different name before importing. See
+`../../shared/schemas/ts-model-conversion-invariants.md` (N1).
+
+**Model TML hard rules** — these apply to every model this step generates.
+Violations cause silent data loss or import rejections with no clear error.
+See `../../shared/schemas/ts-model-conversion-invariants.md` for full detail.
+
+> **I1 — Every `formulas[]` entry must have a paired `columns[]` entry** with `formula_id:`
+> matching the formula's `id`. An unpaired formula is silently dropped on import.
+>
+> **I2 — Never add `aggregation:` to a `formulas[]` entry.** It belongs only on `columns[]`
+> entries. Adding it to `formulas[]` causes `FORMULA is not a valid aggregation type`.
+>
+> **I3 — Add `index_type: DONT_INDEX`** on every `columns[]` entry that has a `formula_id`
+> and `column_type: MEASURE`.
+>
+> **I4 — `with:` must exactly match the target table's `name:`.** (In ThoughtSpot, `with:`
+> resolves against `name`, not an `id`. If you add an `id:` field to a `model_tables` entry,
+> it must equal `name:` exactly — same case, same characters — or joins break with
+> `"{table} does not exist in schema"` at query time.)
+>
+> **I5 — `COUNTD(x)` → `unique count ( [T::x] )` formula entry, never `aggregation: COUNT_DISTINCT`.**
+> Using `aggregation: COUNT_DISTINCT` silently flips `column_type` from MEASURE to ATTRIBUTE.
+>
+> **I6 — Connection referenced by name, never GUID.** In every table and sql_view TML block,
+> use `connection: name: "{name}"` — the display name from Step 4. GUIDs are environment-specific
+> and will fail on any ThoughtSpot instance other than the one they were exported from.
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I1–I6).
+
 **Template:**
 
 ```yaml
@@ -678,7 +712,7 @@ model:
   model_tables:
   - name: TABLE_NAME
     joins:                      # only if this table has joins to others
-    - with: OTHER_TABLE
+    - with: OTHER_TABLE         # must match OTHER_TABLE's name exactly (same case)
       on: "[TABLE_NAME::JOIN_COL] = [OTHER_TABLE::JOIN_COL]"
       type: LEFT_OUTER          # INNER | LEFT_OUTER | RIGHT_OUTER | OUTER
       cardinality: ONE_TO_MANY
@@ -693,14 +727,33 @@ model:
       - value: CAD
       - value: GBP
   formulas:                     # omit section entirely if no translatable calculated fields
-  - id: formula_Formula Name
+  - id: formula_Formula Name    # id: "formula_" + display name
     name: Formula Name
     expr: "ThoughtSpot expression"
+    properties:
+      column_type: MEASURE      # or ATTRIBUTE — NO aggregation: here (I2)
+  - id: formula_Unique Customers   # COUNTD(x) → unique count formula, NOT aggregation: COUNT_DISTINCT (I5)
+    name: Unique Customers
+    expr: "unique count ( [TABLE_NAME::customer_id] )"
+    properties:
+      column_type: MEASURE
   columns:
   - name: display_name
     column_id: TABLE_NAME::COLUMN_NAME
     properties:
       column_type: ATTRIBUTE    # or MEASURE
+  - name: Formula Name          # paired columns[] entry for every formulas[] entry (I1)
+    formula_id: formula_Formula Name   # must match the formula's id exactly
+    properties:
+      column_type: MEASURE
+      aggregation: SUM
+      index_type: DONT_INDEX    # always on computed MEASURE formula columns (I3)
+  - name: Unique Customers      # paired entry for the COUNTD formula (I1 + I5)
+    formula_id: formula_Unique Customers
+    properties:
+      column_type: MEASURE
+      aggregation: SUM
+      index_type: DONT_INDEX
 ```
 
 ### Parameter migration (Tableau → ThoughtSpot `parameters[]`)
@@ -752,6 +805,11 @@ ThoughtSpot: [Currency]
 This is a simple prefix strip: `[Parameters].[X]` → `[X]`. Apply AFTER resolving
 Tableau internal cross-references (`[Calculation_\d+]`) and BEFORE translating function
 syntax.
+
+> **MANDATORY (I7) — before classifying any calculated field as untranslatable, open
+> [`../../shared/mappings/tableau/tableau-formula-translation.md`](../../shared/mappings/tableau/tableau-formula-translation.md)
+> and check its full function table and pass-through section. Do not decide from syntax alone.**
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I7).
 
 Formula translation rules: use `tableau-formula-translation.md`.
 - Convert Tableau join types: `full` → `OUTER`, `left` → `LEFT_OUTER`,
@@ -1748,6 +1806,8 @@ in-product **Migration Summary** tab (Step 10g) and any `MIGRATION_LIMITATIONS.m
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.5.39 | 2026-06-11 | Add I6 (connection by name, never GUID) to Step 5b callout; callout now covers I1–I6. |
+| 1.5.38 | 2026-06-11 | Add Model TML hard rules (I1–I5) callout to Step 5b with paired `formula_id`/`DONT_INDEX` template and COUNTD → `unique count` example. Add mandatory formula-reference gate (I7) to Step 5b and Step A3. Add model name N1 citation (bare datasource name, no prefix). |
 | 1.5.37 | 2026-06-10 | **Corrects the liveboard in-place rule (1.5.32/1.5.36 were wrong about *why*):** the only thing that matters is that `guid`/`obj_id` are **top-level keys of the TML doc — siblings of `liveboard:`, not nested inside it**. Nesting `liveboard.guid` makes every re-import fork a duplicate regardless of `--policy` (the `PARTIAL`-forks claim was a red herring — it was the nesting all along; models worked only because their guid was already top-level). Plus two review fixes: **(a)** detect & drop **redundant pass-through formulas** (`SUM([col])`/`[col]` of an existing physical column — e.g. `Total sales`, `Monthly sales` vs physical `Sales`); use the physical column, note the collapse. **(b)** put the **original Tableau formula in each coverage answer's `description`** for side-by-side review. |
 | 1.5.36 | 2026-06-10 | Three fixes from the Multiple Calculated Fields review: **(1)** new **Step 11.5 — Formula coverage answers**: every formula not on a dashboard tile (or *all* of them, for a model-only workbook) gets a simple testable answer — a "Formula coverage" tab on the liveboard, or standalone saved answers when there's no liveboard. **(2)** `cumulative_*`/`moving_*` must take the **worksheet's shelf attribute as the trailing sort arg** and reference the **measure column** by name (`cumulative_sum([Sales],[Month])`), not `sum()`. **(3)** apply **`PERCENTAGE` format** (`answer_columns[].format`) to contribution/percent-of-total/growth measures. Also: **in-place liveboard re-import must use `ALL_OR_NONE`** — `PARTIAL` forks a duplicate even with `guid`+`obj_id` pinned; and `chart.type: TABLE` is invalid (omit the chart block for `TABLE_MODE` tiles). |
 | 1.5.35 | 2026-06-10 | Rewrite **Step 12** into a written **MIGRATION_REPORT.md**: an overview table of every source `.twb` → outcome (✅ Model + Liveboard / ◑ Model only / ⊘ No action) with **hyperlinks** to each created object, a per-workbook section (what done / decisions / partial / not migrated), and a **full formula-mapping table** (Tableau expr → ThoughtSpot expr → status ✅/◑/⊘) covering *every* calc field. One accumulating report across a multi-file loop. (Requested while migrating Multiple Calculated Fields.) |

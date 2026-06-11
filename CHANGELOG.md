@@ -5,6 +5,17 @@ Skill-level changes are tracked in each skill's own `## Changelog` section.
 
 ---
 
+## 2026-06-11
+- docs: add `ts-model-conversion-invariants.md` shared reference — canonical hard-rule checklist (I1–I7 + EXC1 + N1) for all Model-producing conversion skills; cross-linked from `thoughtspot-model-tml.md`
+- feat: add `conversion-consistency-auditor` subagent — semantic auditor for I1–I7 and N1 across the five conversion skills plus their cursor + coco-snowsight mirrors (Mirror parity section); I3 is advisory (WARN); run before merging any conversion-skill PR
+- fix(agents): update `consistency-checker` to current layout — scans `agents/cli/`, `agents/claude/`, and `agents/coco-snowsight/` (keeps `agents/claude/`-only skills like `ts-profile-snowflake` in coverage)
+- feat(from-snowflake-sv): v1.5.0 — drop TEST_SV_ prefix, I5 explicit note, open-items.md
+- feat(from-databricks-mv): v1.1.0 — preserve Spotter setting on in-place update, drop TEST_MV_ prefix
+- fix(from-tableau): v1.5.39 — add I1–I6 hard rules to Step 5b, I7 formula-reference gate
+- fix(mirrors): mirror the conversion invariants into the snowflake-sv cursor rule (v1.3.1) and coco-snowsight skill (v1.3.1) — I1–I6 + N1 callout and I7 gate, matching the CLI skill
+- fix(validators): complete the `agents/claude/`→`agents/cli/` + `agents/coco/`→`agents/coco-snowsight/` rename left incomplete by PR #18. The validators (`check_references`, `check_skill_versions`, `check_skill_naming`, `check_yaml`, `check_patterns`, `check_smoke_tests`, `check_consistency`, `check_open_items`, `suggest_*`) globbed the old paths and were silently checking only 1 of 20 skills; they now scan `agents/cli/`, `agents/claude/`, and `agents/coco-snowsight/`. `check_references` now skips `{template}` placeholder link targets.
+- docs(layout): fix stale `agents/claude/` / `agents/coco/` references across `.claude/rules/*`, `CLAUDE.md`, `agents/PARITY.md`, `agents/cursor/*`, `agents/coco-snowsight/CLAUDE.md`, `tools/` docs, and two cursor rule mirrors to the canonical `agents/cli/` + `agents/coco-snowsight/` layout (`agents/claude/` retained for the Claude-only `ts-profile-snowflake` annex)
+
 ## 2026-06-10
 - feat: `ts-convert-from-tableau` v1.2.0 → v1.5.37 — major dashboard→liveboard migration upgrade, hardened against 6 real workbook migrations on a live ThoughtSpot. Adds Step 4.5 (confirm tables exist before searching; connection required, no placeholders), Step 5.5 (Spotter on every model), Step 7/7.5 (formula-review checkpoint + model confirmation), Step 9d (orphan-worksheet prompt), full liveboard generation (obj_id binding, complete chart blocks with resolved names, note tiles, KPI-per-measure, parameter header chips, Migration Summary tab, curated style themes), Step 11.5 (formula-coverage answers — every formula gets a testable answer), and Step 12 (written `MIGRATION_REPORT.md` with outcomes table, hyperlinks, and a full formula-mapping status table)
 - docs: expand Tableau shared reference library — `tableau-formula-translation.md` (rank direction arg; `cumulative_*`/`moving_*` are query-time only and take the shelf attribute as sort arg; `concat()` not `+`; dynamic year-comparison; drop redundant pass-through formulas), `tableau-tml-rules.md` (in-place re-import requires top-level `guid`/`obj_id`), and schema docs (`thoughtspot-answer-tml.md` PERCENTAGE format; `thoughtspot-liveboard-tml.md` TABLE_MODE tiles omit the chart block)

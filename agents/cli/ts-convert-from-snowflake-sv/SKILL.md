@@ -32,6 +32,7 @@ Two scenarios are supported:
 | [../ts-profile-thoughtspot/SKILL.md](../ts-profile-thoughtspot/SKILL.md) | ThoughtSpot auth methods, profile config, CLI usage |
 | [../../claude/references/direct-api-auth.md](../../claude/references/direct-api-auth.md) | Direct API authentication fallback when stored procedures are unavailable |
 | Cortex Code connection (configured via `cortex connections set`) | Snowflake connection code, SQL execution patterns |
+| [references/open-items.md](references/open-items.md) | Known gaps and deferred capabilities for this skill |
 
 ---
 
@@ -763,8 +764,9 @@ If no matching join is found:
 Construct the model TML as a YAML string. Use the templates in
 [../../shared/mappings/ts-snowflake/ts-from-snowflake-rules.md](../../shared/mappings/ts-snowflake/ts-from-snowflake-rules.md).
 
-**Model name:** `TEST_SV_{view_name_title_case}` — prefix indicates this is a
-test/converted model. Ask the user if they want a different name.
+**Model name:** `{view_name_title_case}` — derived from the Snowflake Semantic View name.
+Ask the user if they want a different name. Do not add a `TEST_SV_` or other prefix —
+see `../../shared/schemas/ts-model-conversion-invariants.md` (N1).
 
 **Identify the fact table** (the table that is never on the "TO" side of any relationship)
 — it gets no `referencing_join` and no `joins[]`.
@@ -785,7 +787,7 @@ test/converted model. Ask the user if they want a different name.
 
 ```yaml
 model:
-  name: "TEST_SV_{view_name}"
+  name: "{view_name}"
   model_tables:
   - id: FACT_TABLE          # MUST equal name exactly (copy verbatim — often uppercase)
     name: FACT_TABLE        # exact ThoughtSpot table object name — FK side, joins go here
@@ -820,7 +822,7 @@ new Table objects for views. Inline joins live on the **source (FROM) table** en
 
 ```yaml
 model:
-  name: "TEST_SV_{view_name}"
+  name: "{view_name}"
   model_tables:
   - id: FROM_TABLE          # MUST equal name exactly (copy verbatim from import response)
     name: FROM_TABLE        # exact ThoughtSpot table object name — never lowercase or transform
@@ -862,6 +864,12 @@ For each simple metric (`AGG(view_alias.metric_name)`):
 - `column_id`: `{id}::{col_name}`
 - `properties.column_type: MEASURE`
 - `aggregation`: mapped from the SQL aggregate function (see ts-from-snowflake-rules.md)
+
+**`COUNT(DISTINCT col)` metrics — use a formula, not `aggregation: COUNT_DISTINCT` (I5):**
+`COUNT(DISTINCT col)` must be expressed as a `formulas[]` entry with `unique count ( [TABLE::col] )`.
+Never use `aggregation: COUNT_DISTINCT` on a `column_id` entry — ThoughtSpot silently overrides
+`column_type: MEASURE` → `ATTRIBUTE` when `COUNT_DISTINCT` is used this way.
+See `../../shared/schemas/ts-model-conversion-invariants.md` (I5).
 
 For each complex metric (formula expression):
 - See Step 9 for translation. Results go into `formulas[]`.
@@ -978,7 +986,7 @@ Apply the answer to the model TML's properties block:
 
 ```yaml
 model:
-  name: TEST_SV_{view_name}
+  name: {view_name}
   # ... model_tables, columns, formulas, etc.
   properties:
     spotter_config:
@@ -997,7 +1005,7 @@ overwriting it with a default.
 Before importing, show the user a summary:
 
 ```
-Model to import: TEST_SV_{view_name}
+Model to import: {view_name}
 Tables:
   ✓ {FACT_TABLE} (GUID: {guid}) — fact table
   ✓ {DIM_TABLE}  (GUID: {guid}) — referencing_join: {join_name}
@@ -1160,7 +1168,7 @@ shape — not just that the API returned 200.
 **1. Search for the model by GUID:**
 
 ```bash
-source ~/.zshenv && ts metadata search --subtype WORKSHEET --name "%TEST_SV_{view_name}%" --profile {profile}
+source ~/.zshenv && ts metadata search --subtype WORKSHEET --name "%{view_name}%" --profile {profile}
 ```
 
 The GUID returned by the import response must appear in the results. If it is absent,
@@ -1185,7 +1193,7 @@ sent in Step 11 to identify which columns ThoughtSpot silently dropped, and inve
 ```
 Model imported successfully.
 
-  Name:    TEST_SV_{view_name}
+  Name:    {view_name}
   GUID:    {created_guid}
   URL:     {base_url}/#/model/{created_guid}
 
@@ -1201,7 +1209,7 @@ After a successful import, output:
 ```
 ## Model Import Complete
 
-**Model:** TEST_SV_{view_name}
+**Model:** {view_name}
 **GUID:** {created_guid}
 **ThoughtSpot URL:** {base_url}/#/model/{created_guid}
 
@@ -1254,6 +1262,7 @@ Model in one pass through Steps 4–13.
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.5.0 | 2026-06-11 | Drop `TEST_SV_` prefix — model name now uses the bare SV name (N1); cite canonical conversion invariants doc. Add I5 explicit note: `COUNT(DISTINCT)` → `unique count(...)` formula, never `aggregation: COUNT_DISTINCT`. Add `references/open-items.md` tracking sql_view generation gap. |
 | 1.4.1 | 2026-05-11 | Add `source ~/.zshenv &&` prefix to all bash blocks and convert subprocess.run calls from `["ts", ...]` to `["bash", "-c", "source ~/.zshenv && ts ..."]` for consistent env var loading |
 | 1.4.0 | 2026-05-05 | Add Mode C (update existing): Steps C1–C6. Identifies a changed SV and an existing TS Model, diffs columns/descriptions/synonyms/expressions, applies per-column reviewed changes with `--no-create-new`, and surfaces /ts-object-model-coach handoff. `ai_context` and Instructions are never touched. Step 1.5 menu updated to A/B/C. |
 | 1.3.0 | 2026-04-28 | Add Step 9.5 — confirm Spotter (AI search) enablement before import. Default Y; preserves existing setting on in-place updates. |

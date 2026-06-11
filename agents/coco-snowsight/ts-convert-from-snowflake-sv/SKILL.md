@@ -628,6 +628,11 @@ Apply all column, formula, and join mappings from
 [../../shared/mappings/ts-snowflake/ts-from-snowflake-rules.md](../../shared/mappings/ts-snowflake/ts-from-snowflake-rules.md) to build
 the model TML dict. Serialise to a YAML string.
 
+> **MANDATORY (I7) — before classifying any metric as untranslatable, open
+> [../../shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md](../../shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md)
+> and check the reverse-translation tables. Do not decide from SQL syntax alone.**
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I7).
+
 For each metric in the semantic view:
 - Simple `SUM/COUNT/AVG/MIN/MAX(table.col)` → `MEASURE` column in `columns[]`
 - `COUNT(DISTINCT table.col)` → **always** a formula in `formulas[]`, never a MEASURE column:
@@ -641,7 +646,8 @@ For each metric in the semantic view:
 - Complex expression → **read [../../shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md](../../shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md) first**, then translate SQL to ThoughtSpot formula using the Snowflake → ThoughtSpot reverse-translation sections; add to `formulas[]`. Do not classify as untranslatable based on SQL syntax recognition alone — patterns like `NON ADDITIVE BY`, `OVER (PARTITION BY ...)`, and `PARTITION BY EXCLUDING` all have documented ThoughtSpot equivalents.
 - Untranslatable (confirmed after consulting reference) → omit and log in report
 
-**Model name:** `TEST_SV_{semantic_view_name}` (or user-specified).
+**Model name:** `{semantic_view_name}` (or user-specified). Do not add a `TEST_SV_` or
+other prefix — see `../../shared/schemas/ts-model-conversion-invariants.md` (N1).
 
 **CRITICAL — Never normalise names from API responses.** Names that came from
 `TS_EXPORT_TML` (join names, column names, table names) or from import response GUIDs
@@ -688,7 +694,7 @@ preserve the existing value rather than overwriting with a default.
 After all checks pass, show the user:
 
 ```
-Model ready to import: TEST_SV_{view_name}
+Model ready to import: {view_name}
 
 Self-validation: all checks passed
 
@@ -785,7 +791,7 @@ line, BEFORE the `model:` key:
 ```yaml
 guid: "{existing_model_guid}"   # MUST be at document root — NOT inside model:
 model:
-  name: "TEST_SV_{view_name}"
+  name: "{view_name}"
   model_tables:
   # ...
 ```
@@ -850,7 +856,7 @@ if you reimport to fix any errors.
 ```
 ## Model Import Complete
 
-**Model:** TEST_SV_{view_name}
+**Model:** {view_name}
 **GUID:** {guid}
 **ThoughtSpot URL:** {base_url}/#/model/{guid}
 
@@ -989,6 +995,7 @@ After completing one conversion, offer to convert additional views.
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.3.1 | 2026-06-11 | Drop `TEST_SV_` model-name prefix (N1) and add the mandatory formula-reference gate (I7), citing `ts-model-conversion-invariants.md` — mirrors the CLI skill v1.5.0. |
 | 1.3.0 | 2026-05-05 | Add A/B/C mode menu (Step 1.5) and Mode C workflow (update existing ThoughtSpot Model from changed SV) using TS_EXPORT_TML / TS_IMPORT_TML stored procedures. |
 | 1.2.0 | 2026-04-28 | Add Spotter-enablement confirmation step (default Y) before the review checkpoint. |
 | 1.1.0 | 2026-04-28 | Map SV synonyms/descriptions/table-comments to TS Model + Table TMLs. Add `non additive by ... desc` → `first_value` mapping. Note `count_distinct(...)` and `+` string-concat are invalid TS formula syntax. |
