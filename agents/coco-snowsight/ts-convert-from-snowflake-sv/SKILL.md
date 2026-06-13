@@ -4,6 +4,7 @@ description: Convert a Snowflake Semantic View into a ThoughtSpot Model by readi
 ---
 
 # Snowflake Semantic View → ThoughtSpot Model
+<!-- synced-from: agents/cli/ts-convert-from-snowflake-sv/SKILL.md @ v1.7.1 on 2026-06-13 -->
 
 Converts a Snowflake Semantic View into a ThoughtSpot Model. Reads the semantic
 view DDL via `GET_DDL`, maps tables, relationships, dimensions, and metrics to
@@ -599,7 +600,7 @@ Parse each returned `edoc` YAML string. Find in the `joins_with` section the ent
    formulas:
    - id: formula_Num Orders
      name: "Num Orders"
-     expr: "count_distinct ( [DM_ORDER::ORDER_ID] )"
+     expr: "unique count ( [DM_ORDER::ORDER_ID] )"
      properties:
        column_type: MEASURE
    ```
@@ -644,6 +645,7 @@ For each metric in the semantic view:
   cause a **duplicate column_id** error — even though the `column_type` values differ.
   Using a formula avoids this entirely since formulas don't carry a `column_id`.
 - Complex expression → **read [../../shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md](../../shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md) first**, then translate SQL to ThoughtSpot formula using the Snowflake → ThoughtSpot reverse-translation sections; add to `formulas[]`. Do not classify as untranslatable based on SQL syntax recognition alone — patterns like `NON ADDITIVE BY`, `OVER (PARTITION BY ...)`, and `PARTITION BY EXCLUDING` all have documented ThoughtSpot equivalents.
+- No native TS equivalent but warehouse has the SQL function → use a ThoughtSpot pass-through (`sql_*_op`). **Scalar** pass-throughs (`sql_string_op`, `sql_int_op`, `sql_double_op`, etc.) are row-level and reliable — use freely. **Aggregate** pass-throughs (`sql_*_aggregate_op`) interact with TS query-time grouping — always flag for review. See `../../shared/schemas/ts-model-conversion-invariants.md` (PT1).
 - Untranslatable (confirmed after consulting reference) → omit and log in report
 
 **Model name:** `{semantic_view_name}` (or user-specified). Do not add a `TEST_SV_` or
@@ -995,6 +997,7 @@ After completing one conversion, offer to convert additional views.
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.4.0 | 2026-06-13 | Add PT1 pass-through policy; fix `count_distinct` example → `unique count` (I5); sync to CLI v1.7.0. |
 | 1.3.1 | 2026-06-11 | Drop `TEST_SV_` model-name prefix (N1) and add the mandatory formula-reference gate (I7), citing `ts-model-conversion-invariants.md` — mirrors the CLI skill v1.5.0. |
 | 1.3.0 | 2026-05-05 | Add A/B/C mode menu (Step 1.5) and Mode C workflow (update existing ThoughtSpot Model from changed SV) using TS_EXPORT_TML / TS_IMPORT_TML stored procedures. |
 | 1.2.0 | 2026-04-28 | Add Spotter-enablement confirmation step (default Y) before the review checkpoint. |
