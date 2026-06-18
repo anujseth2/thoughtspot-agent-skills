@@ -176,6 +176,7 @@ is deliberate, while "test" in a name is ambiguous.
 | P8 | Column sprawl | > 75 columns: wider GROUP BY, more complex plans beyond the Spotter impact. | Model: `len(columns[])` | Count | MEDIUM if > 75 |
 | P9 | High-cardinality attribute indexing | GUIDs, transaction IDs indexed as ATTRIBUTEs — wastes storage, pollutes Spotter suggestions with meaningless values. ID columns stored as numbers should be ATTRIBUTEs (not MEASUREs) — the issue is the indexing. | Model: `columns[].properties.index_type` + name regex (`_id$`, `_guid$`, `_uuid$`, `transaction_id`, `row_id`, `surrogate_key`) | Count | MEDIUM |
 | P10 | RLS bypass as exception | `is_bypass_rls: true` disables Row-Level Security. Legitimate use cases exist (aggregate-only models) but should be the exception. | Model: `model.properties.is_bypass_rls` | Boolean | MEDIUM (flag as exception) |
+| P11 | Secure suggestions overhead | Many indexed columns on a Spotter-enabled model. Each indexed column adds a DB lookup for suggestions. Informational — indexing is correct for searchable columns. | Model: `columns[].properties.index_type` + `model.properties.spotter_config.is_spotter_enabled` | Count of indexed columns | INFO (> 30 indexed on Spotter model) |
 | P11 | Secure suggestions overhead | Many indexed columns on a Spotter-enabled model. Each indexed column adds a DB lookup for suggestions. Informational — indexing is correct for searchable columns. | Model: `columns[].properties.index_type` + `model.spotter_config.is_spotter_enabled` | Count of indexed columns | INFO (> 30 indexed on Spotter model) |
 
 ### Scalar formula thresholds
@@ -198,6 +199,8 @@ is deliberate, while "test" in a name is ambiguous.
 | S4 | RLS bypass + PII | `is_bypass_rls: true` AND model contains PII columns. All users see all rows including PII. | Model: `model.properties.is_bypass_rls` + S1 | Boolean (bypass + PII) | HIGH |
 | S5 | Credentials in analytics | Columns matching credential patterns (`password`, `secret_key`, `api_key`, `token`). Should never be in an analytics model. | Model: `columns[].name` (credential regex) | Count | CRITICAL |
 | S6 | Conformed dimension divergence | Same `db_column_name` across models maps to different `column_type`. Inconsistent classification can cause different access behaviour for the same data. | Model: group `columns[].db_column_name` across all models, check `column_type` | Count of divergent columns | MEDIUM |
+| S8 | RLS column data type quality | RLS rules filtering on VARCHAR columns are 2–5× slower than integer filters. Identifies tables where RLS expressions reference string-type columns. | Table: `table.rls_rules.rules[].expr` column references → `table.columns[].db_column_properties.data_type` | Count of VARCHAR RLS columns | MEDIUM |
+| S9 | RLS expression complexity | Functions wrapping columns in RLS expressions (e.g. `UPPER([path::col])`) prevent filter pushdown to the database engine. The function must evaluate row-by-row in ThoughtSpot. | Table: `table.rls_rules.rules[].expr` checked for function calls (`UPPER`, `TRIM`, `CAST`, etc.) | Count of function-wrapped RLS expressions | HIGH |
 
 ### PII regex patterns (case-insensitive)
 
@@ -224,6 +227,8 @@ Some data surfaces in two angles with different framing:
 | VARCHAR join keys | D2 (modeling quality) | P6 (query speed) |
 | Join depth | D1 metric (complexity) | P7 (query plan degradation) |
 | RLS bypass | P10 (exception review) | S4 (PII + bypass = risk) |
+| RLS column type | S8 (VARCHAR = slow filter) | S2 (PII indexed + no RLS) |
+| RLS expression | S9 (function prevents pushdown) | S8 (column type quality) |
 
 ---
 
@@ -265,6 +270,17 @@ model list.
 
 | # | Item | Status |
 |---|---|---|
+| OI-1 | `ts metadata search --all` — 1855 models in 3m05s on champ-staging. No throttling. | VERIFIED |
+| OI-2 | Bulk TML export — avg 2.9s/model sequential, no failures. 4-way parallel untested. | PARTIALLY VERIFIED |
+| OI-3 | `ts metadata dependents` — returns typed list, empty = orphan. One call per object. | VERIFIED |
+| OI-4 | `is_bypass_rls` at `model.properties.is_bypass_rls` (boolean). `spotter_config` nested inside `properties`. | VERIFIED |
+| OI-5 | `data_model_instructions` at `model.model_instructions.data_model_instructions` | VERIFIED |
+| OI-6 | `constant_folding` — does NOT exist as a TML property. Column-picker formulas (IF parameter patterns) have no known TML flag. | PARKED |
+| OI-7 | `is_spotter_enabled` at `model.properties.spotter_config.is_spotter_enabled` | VERIFIED |
+| OI-8 | `apply_on_tables` on model filters — confirmed as progressive filter mechanism | VERIFIED |
+| OI-9 | `join_progressive` at `model.properties.join_progressive` | VERIFIED |
+| OI-10 | Column Level Security — not in standard TML export. Beta flag `export_column_security_rules` unverified. | OPEN |
+| OI-11 | NL Instructions API — WORKS. Param: `data_source_identifier`. Returns `nl_instructions_info[].instructions[]` with `scope`. | VERIFIED |
 | OI-1 | `ts metadata search --all` performance on 1000+ models | OPEN |
 | OI-2 | API throttling on 4-way parallel TML export | OPEN |
 | OI-3 | `ts metadata dependents` — counts without full export? | OPEN |
