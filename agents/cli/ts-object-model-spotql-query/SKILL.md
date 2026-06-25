@@ -16,6 +16,24 @@ onboarding tutorial, a drop-in for your own agent, or the per-question engine of
 accuracy / regression / feature test suite. See `references/use-cases.md` for those
 compositions — they are *uses* of this skill, not built into it.
 
+## What this skill does
+
+If asked "what can you do?", this is the answer. Given a question about a ThoughtSpot Model
+I can:
+
+- **Answer it** — write the SpotQL, compile it to the warehouse SQL ThoughtSpot runs,
+  execute it, and return the rows as a table.
+- **Show the work** — the SpotQL, the generated warehouse SQL, the raw JSON, or just the
+  data table, at whatever depth you want.
+- **Help you integrate** — hand you ready-to-paste API request bodies and point you at
+  `references/integration.md` (auth, endpoints, response parsing) to call SpotQL from your
+  own product or agent.
+- **Explain the rules** — what SpotQL can and can't express: aggregation (`SUM` vs `AGG`),
+  the date/time UDFs, query patterns (top-N, year-over-year, semi-additive measures), and
+  the known limitations.
+
+The one requirement is below: the Model must be backed by an external cloud data warehouse.
+
 > **SpotQL requires an external cloud data warehouse.** The SpotQL endpoints only work on
 > Models backed by Snowflake / Databricks / BigQuery / etc. A Model over Falcon, imported
 > data, or system data (`DEFAULT` datasource) is rejected with *"This API only supports
@@ -33,6 +51,7 @@ compositions — they are *uses* of this skill, not built into it.
 | [references/patterns.md](references/patterns.md) | Complex shapes: last-N-periods, year-over-year, top-N / top-N-per-group, period-over-period, anomaly detection. |
 | [references/limitations.md](references/limitations.md) | **What SpotQL can't do** — hard-unsupported constructs, silent wrong-answer traps (e.g. `UNION` drops a branch), and what's been *fixed* on current builds. Read before telling a user something can't be done, and for the known-limitation-retest use case. |
 | [references/use-cases.md](references/use-cases.md) | When the user wants to *build on* this skill — tutorial, agent building-block, accuracy/regression/feature/limitation testing. |
+| [references/integration.md](references/integration.md) | When the user wants to call SpotQL directly from their own product/agent — auth options, the callosum endpoints, request bodies, the raw columnar response format and a parser. |
 | [references/open-items.md](references/open-items.md) | Verification status of the API behaviour this skill relies on. |
 | [../ts-profile-thoughtspot/SKILL.md](../ts-profile-thoughtspot/SKILL.md) | If no ThoughtSpot profile is configured yet. |
 
@@ -62,31 +81,62 @@ Pick the depth from how the user framed the request:
 
 ### Step 1 — Pick the profile and the Model
 
-If multiple profiles exist in `~/.claude/thoughtspot-profiles.json`, ask which to use.
-Confirm it authenticates and find the Model:
+If multiple profiles exist in `~/.claude/thoughtspot-profiles.json`, ask which to use, then
+confirm it authenticates:
 
 ```bash
 source ~/.zshenv && ts auth whoami --profile "{profile}"
-source ~/.zshenv && ts metadata search --subtype WORKSHEET --name "%{search}%" --profile "{profile}"
 ```
 
-Models are `LOGICAL_TABLE` with header `type: WORKSHEET`. Save the `metadata_id` (GUID) —
-that is the `--model` identifier for SpotQL. Save the Model's display name too; you need
-it for the `FROM` clause.
+**Always ask the user which Model to query.** Accept any of these — you do not need a name
+to search for if you already have an identifier:
+
+- **A GUID** — use it directly as `{model_guid}`.
+- **A ThoughtSpot URL** — extract the GUID from the path. Users often have the Model open in
+  a browser, e.g. `…/#/data/tables/4da3a07f-…` or `…/#/data/embrace/4da3a07f-…` — the GUID
+  is the path segment after `tables/` / `embrace/`.
+- **A name, or nothing** — fall back to search and let the user pick:
+
+  ```bash
+  source ~/.zshenv && ts metadata search --subtype WORKSHEET --name "%{search}%" --profile "{profile}"
+  ```
+
+  Present matches with **name + GUID + owner + modified date** so the user can disambiguate.
+
+Models are `LOGICAL_TABLE` with header `type: WORKSHEET`. Whichever path you took, **confirm
+the resolved Model display name** back to the user — you need it verbatim for the `FROM`
+clause in Step 3.
 
 ### Step 2 — Learn the schema
 
-Export the Model's TML to see its columns (names, `column_type` ATTRIBUTE/MEASURE,
-datatypes):
+Export the Model's TML to see its columns:
 
 ```bash
 source ~/.zshenv && ts tml export {model_guid} --profile "{profile}"
 ```
 
-The TML body is in the `edoc` field (YAML). Read the `columns:` list — column `name`
-values are the **exact** identifiers you must use in SpotQL (case-sensitive), and
-`column_type` tells you which are measures (aggregate them) vs attributes (group by them).
-If TML export is FORBIDDEN, you lack access to that Model — pick another or ask the user.
+The TML body is in the `edoc` field. It is a structured document — JSON or YAML depending on
+build (`yaml.safe_load` parses both; `ts tml export … --parse` returns it already parsed).
+For a Model it is rooted at `model:` with these parts:
+
+- **`model.columns[]`** — each entry's `name` is the **exact** identifier you must use in
+  SpotQL (case-sensitive). The column kind is at **`properties.column_type`** (ATTRIBUTE or
+  MEASURE) — note it is **nested under `properties`**, not a direct child of the column.
+- **`model.formulas[]`** — formula definitions. A formula column references one by carrying a
+  **`formula_id`** that matches a `formulas[].id`; that formula's **`expr`** is where the
+  aggregation logic lives.
+
+**Classify every column** — this drives the `SUM`-vs-`AGG` decision in Step 3:
+
+| Column | How to tell | In SpotQL |
+|---|---|---|
+| **Attribute** | `properties.column_type: ATTRIBUTE` | group by it |
+| **Raw measure** | `properties.column_type: MEASURE`, **no** aggregating formula (a plain `column_id`, or a `formula_id` whose `expr` has no aggregate) | `SUM`/`AVG`/`MIN`/`MAX` |
+| **Aggregate-formula measure** | `properties.column_type: MEASURE` **and** its `formulas[].expr` contains an aggregate — `sum`, `count`, `group_aggregate`, `last_value`, `first_value`, … | **`AGG(...)`** — never `SUM` (errors `NESTED_AGGREGATE_NOT_SUPPORTED`) |
+
+See `spotql-rules.md` § Aggregation for the full rule and the "compile-it-to-check" probe if
+a column is ambiguous. If TML export is FORBIDDEN, you lack access to that Model — pick
+another or ask the user.
 
 ### Step 3 — Write the SpotQL
 
@@ -136,6 +186,18 @@ Present the result at the depth from the top of this section:
   emit JSON; you make it readable.
 - **🧠 Generated SpotQL** (developer): the statement you wrote.
 - **🗄️ Warehouse SQL** (developer): `executable_sql` from Step 4.
+- **📋 Request bodies** (developer): the ready-to-paste API bodies for the session's query,
+  pre-filled with the SpotQL you wrote and the Model GUID — so the user can run it from the
+  REST playground or their own code. (See `references/integration.md` for auth and response
+  parsing.)
+
+  ```text
+  POST /callosum/v1/v2/data/spotql/generate-sql
+  { "spotql_query": "<the SpotQL from Step 3>", "model_identifier": "<model_guid>" }
+
+  POST /callosum/v1/v2/data/spotql/fetch-data
+  { "spotql_query": "<the SpotQL from Step 3>", "model_identifier": "<model_guid>" }
+  ```
 - **❌ Errors:** if any `status` was not `SUCCESS`, show the code + message and what you
   changed (or why it can't be answered).
 
@@ -159,4 +221,5 @@ without re-deriving the query mechanics.
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.1.0 | 2026-06-25 | Add `references/integration.md` (raw SpotQL API for non-CLI consumers); Step 6 emits paste-ready request bodies; fix Step 2 TML parsing (`properties.column_type`, `formulas[]` via `formula_id`) with deterministic raw-vs-aggregate-formula classification; add capability summary; Step 1 accepts Model GUID/URL with search as fallback. |
 | 1.0.0 | 2026-06-25 | Initial release — query a Model with SpotQL via `ts spotql`; generate-sql + fetch-data + review. |
