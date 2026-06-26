@@ -1453,6 +1453,56 @@ Interactive recipe that collects inputs and generates all artifacts:
 
 ---
 
+## BL-043 — Evaluate two-phase import and formula translation pipeline for other conversion skills
+
+**Source:** `ts-convert-from-tableau` v1.16.0 (feat/tableau-translate-formulas)
+**Affects:** ts-convert-from-snowflake-sv, ts-convert-from-databricks-mv, ts-convert-to-snowflake-sv, ts-convert-to-databricks-mv
+**Status:** Not started
+
+### Problem
+
+The Tableau conversion skill now has three patterns that significantly improved migration
+reliability and accuracy:
+
+1. **Two-phase model import** — Phase 1 imports the base model (tables, columns, joins,
+   parameters, no formulas) for guaranteed success; Phase 2 adds formulas via GUID-pinned
+   update with iterative error recovery. One bad formula no longer blocks the entire model.
+2. **Deterministic formula translation pipeline** — a CLI command (`ts tableau translate-formulas`)
+   applies all transforms in a strict order instead of relying on ad-hoc LLM reasoning.
+   Closed a 47%→90%+ migration gap on real workbooks.
+3. **Cross-reference depth reporting** — audit mode reports formula dependency depth
+   (Level 0/1/2+/circular) alongside syntax-level tier classification, giving an honest
+   "effective migration coverage" number.
+
+The other conversion skills (`from-snowflake-sv`, `from-databricks-mv`, and the `to-*`
+directions) may benefit from the same patterns — particularly the two-phase import, which
+is platform-agnostic. The formula pipeline is Tableau-specific, but the concept of a
+deterministic transform sequence (vs LLM reasoning) may apply to Snowflake Semantic View
+and Databricks Metric View formula translation.
+
+### Proposed approach
+
+1. **Two-phase import** — evaluate for `from-snowflake-sv` and `from-databricks-mv`. Both
+   skills currently import the full model in one pass. The two-phase pattern is most
+   valuable when formula counts are high and cross-references are common. Snowflake SVs
+   have `metrics` (which can reference other metrics) and Databricks MVs have `measures`
+   (which can reference dimensions). Check whether these create the same failure mode.
+2. **Formula translation pipeline** — assess whether the Snowflake and Databricks formula
+   mappings (in `agents/shared/mappings/`) are complex enough to warrant a deterministic
+   CLI pipeline vs the current inline mapping approach. The Tableau pipeline was justified
+   by 14 ordered transforms with cross-reference resolution; Snowflake/Databricks may have
+   fewer transforms and simpler dependency graphs.
+3. **Cross-reference depth reporting** — add to both `from-*` audit modes if the formula
+   dependency analysis applies. Snowflake SVs have metric-references-metric chains;
+   Databricks MVs have measure-references-dimension chains.
+4. **Join confirmation** — less applicable since SVs and MVs define joins explicitly in
+   their source format (unlike Tableau published datasources where joins are server-side).
+
+Start with a review of recent migration failures in the other skills to determine
+whether the same gap (audit overpromises vs actual migration rate) exists.
+
+---
+
 ## BL-042 — Tableau REST API integration: live-instance testing
 
 **Source:** Design spec `docs/superpowers/specs/2026-06-26-tableau-api-integration-design.md`

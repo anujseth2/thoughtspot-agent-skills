@@ -511,3 +511,93 @@ def download(
     client = TableauClient(p)
     result = client.download_datasource(datasource_id, Path(output_dir))
     print(json.dumps(result, indent=2))
+
+
+@app.command("translate-formulas")
+def translate_formulas_cmd(
+    input_file: str = typer.Option(..., "--input", "-i",
+                                    help="classification.json from TWB parse"),
+    output_file: str = typer.Option(..., "--output", "-o",
+                                     help="Output translated formulas JSON"),
+    tables: Optional[str] = typer.Option(None, "--tables", "-t",
+                                          help="Comma-separated table names for this model"),
+    table_columns: Optional[str] = typer.Option(None, "--table-columns",
+                                                 help="JSON file mapping column→table"),
+    parameters_file: Optional[str] = typer.Option(None, "--parameters",
+                                                   help="JSON file with parameter definitions"),
+    param_map_file: Optional[str] = typer.Option(None, "--param-map",
+                                                  help="JSON file mapping internal param names→captions"),
+    calc_map_file: Optional[str] = typer.Option(None, "--calc-map",
+                                                 help="JSON file mapping [Calculation_NNN]→caption"),
+    datasource: Optional[str] = typer.Option(None, "--datasource", "-d",
+                                              help="Filter to a single datasource name"),
+) -> None:
+    """Translate Tableau calculated fields to ThoughtSpot formula syntax.
+
+    Reads classification.json (from the TWB parse), applies the ordered translation
+    pipeline, resolves cross-references via dependency DAG, and outputs a JSON file
+    with translated formulas ready for TML generation.
+    """
+    from ts_cli.tableau_translate import translate_formulas
+
+    input_path = Path(input_file)
+    if not input_path.exists():
+        typer.echo(f"Input file not found: {input_file}", err=True)
+        raise SystemExit(1)
+
+    classification = json.loads(input_path.read_text())
+
+    # Filter to datasource if specified
+    if datasource:
+        classification = [f for f in classification if f.get("datasource") == datasource]
+        typer.echo(f"Filtered to datasource '{datasource}': {len(classification)} formulas", err=True)
+
+    # Load scoped columns map
+    scoped_columns: dict[str, str] = {}
+    if table_columns:
+        tc_path = Path(table_columns)
+        if tc_path.exists():
+            scoped_columns = json.loads(tc_path.read_text())
+    elif tables:
+        typer.echo("Warning: --tables without --table-columns; column scoping disabled", err=True)
+
+    # Load parameters
+    parameters: list[dict] = []
+    if parameters_file:
+        p_path = Path(parameters_file)
+        if p_path.exists():
+            parameters = json.loads(p_path.read_text())
+
+    # Load param name map (internal name → caption)
+    param_map: dict[str, str] = {}
+    if param_map_file:
+        pm_path = Path(param_map_file)
+        if pm_path.exists():
+            param_map = json.loads(pm_path.read_text())
+
+    # Load calc ID map ([Calculation_NNN] → caption)
+    calc_id_map: dict[str, str] | None = None
+    if calc_map_file:
+        cm_path = Path(calc_map_file)
+        if cm_path.exists():
+            calc_id_map = json.loads(cm_path.read_text())
+
+    result = translate_formulas(
+        formulas=classification,
+        scoped_columns=scoped_columns,
+        param_map=param_map,
+        parameters=parameters,
+        calc_id_map=calc_id_map,
+    )
+
+    output_path = Path(output_file)
+    output_path.write_text(json.dumps(result, indent=2))
+
+    typer.echo(
+        f"Translated: {result['stats']['translated']}/{result['stats']['total']} formulas\n"
+        f"Skipped: {result['stats']['skipped']} "
+        f"(levels: {json.dumps(result['stats']['levels'])})",
+        err=True,
+    )
+
+    print(json.dumps(result["stats"]))

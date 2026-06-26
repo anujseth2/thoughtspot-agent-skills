@@ -194,6 +194,83 @@ formula. For example, if formula B references formula A:
 then add dependent formulas via a second import with the exported JSON format. This is
 slower but avoids expression duplication.
 
+### Cross-reference resolution (formula dependency graph)
+
+Tableau formulas reference other calculated fields by internal ID
+(`[Calculation_6076974422807080981]`). These must be resolved before TML generation.
+
+**Resolution algorithm:**
+1. Build a map: internal_id → {display_name, translated_expression, dependencies[]}
+2. Topological sort by dependency depth:
+   - Level 0: no cross-references (translate directly)
+   - Level 1: references only Level 0 formulas
+   - Level N: references Level N-1 formulas
+3. For each level, resolve references by inlining:
+   - Replace `[Calculation_*]` with the referenced formula's translated expression
+   - Or replace with `[Display Name]` if using multi-pass import
+4. Circular dependencies → skip and log
+
+The `ts tableau translate-formulas` CLI command implements this automatically when given
+a `--calc-map` file (mapping `[Calculation_NNN]` → caption).
+
+**Multi-pass import alternative:**
+Import Level 0 formulas first. Export the model to get server-assigned names. Then
+import Level 1 formulas with bracket references to Level 0 by display name. Continue
+for each level. Slower but avoids expression inlining.
+
+### Column scoping — per-model table set only
+
+When scoping column references (`[COL]` → `[TABLE::COL]`), resolve against ONLY the
+tables in the specific model being built. A workbook with two datasources (prod: 9
+tables, tentpole: 3 tables) produces two models — each formula must reference columns
+from its own model's tables only.
+
+Build a per-model `scoped_columns` map:
+
+```json
+{ "COLUMN_NAME": "TABLE_NAME" }
+```
+
+Feed this to `ts tableau translate-formulas --table-columns`. When a column name exists
+in multiple tables within the same model, disambiguate by Tableau's `parent-name`
+metadata (which table the field belongs to in Tableau).
+
+### Two-phase model import (recommended)
+
+**Phase 1 — Base model (no formulas):**
+Import `model_tables[]`, physical `columns[]`, `joins[]`, and `parameters[]` only.
+No `formulas[]` section. This is guaranteed to succeed if table TMLs are clean.
+Record the returned GUID.
+
+**Phase 2 — Add formulas:**
+Pin the GUID from Phase 1. Add `formulas[]` and formula `columns[]` entries.
+Import with `--no-create-new`. If import fails, parse the error to identify the
+failing formula(s), remove them, and retry (up to 5 cycles).
+
+This pattern ensures the model always exists and formula errors are isolated rather
+than blocking the entire import. It replaces the previous all-at-once approach that
+required 20+ import attempts in the CPG Merch migration.
+
+### Range join alternative for date-range filter patterns
+
+When detected: a Tableau workbook has calculated fields implementing date-range
+membership tests (`[DATE] >= [START_DATE] AND [DATE] <= [END_DATE]`) used as boolean
+filters, and separate fact and dimension tables with start/end date columns.
+
+ThoughtSpot model TML supports range/inequality joins natively:
+
+```yaml
+joins:
+- with: DIM_PERIOD
+  on: "[FACT::EVENT_DATE] >= [DIM_PERIOD::START_DATE] and [FACT::EVENT_DATE] < [DIM_PERIOD::END_DATE]"
+  type: LEFT_OUTER
+  cardinality: MANY_TO_ONE
+```
+
+**Recommendation:** surface this as an option during join confirmation (Step 3.6). A
+range join is more efficient than a filter formula and produces cleaner query semantics.
+Tableau does not support range joins natively — it uses calculated field filters instead.
+
 ### Formula ID convention
 
 `id: formula_<display_name>` — spaces allowed in formula IDs.

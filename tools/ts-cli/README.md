@@ -842,6 +842,75 @@ Each CSV in `data_files` includes a `validation` object:
 
 ---
 
+### `ts tableau translate-formulas`
+
+Translate Tableau calculated fields to ThoughtSpot formula syntax. Reads the
+classification JSON from the TWB parse, applies an ordered translation pipeline,
+resolves cross-references via dependency DAG, and outputs formulas ready for TML
+generation.
+
+```bash
+ts tableau translate-formulas \
+  --input classification.json \
+  --output formulas_translated.json \
+  --datasource cpg_merch_promotion_prod \
+  --table-columns table_columns.json \
+  --parameters parameters.json \
+  --param-map param_map.json \
+  --calc-map calc_map.json
+```
+
+**Options:**
+
+| Flag | Required | Description |
+|---|---|---|
+| `--input`, `-i` | yes | classification.json from TWB parse (Step 3 output) |
+| `--output`, `-o` | yes | Output file for translated formulas JSON |
+| `--datasource`, `-d` | no | Filter to a single datasource name |
+| `--tables`, `-t` | no | Comma-separated table names for this model |
+| `--table-columns` | no | JSON file mapping column name → table name (for scoping) |
+| `--parameters` | no | JSON file with parameter definitions |
+| `--param-map` | no | JSON file mapping internal param names → captions |
+| `--calc-map` | no | JSON file mapping `[Calculation_NNN]` → caption |
+
+**Input file formats:**
+
+- `classification.json`: `[{caption, formula, datatype, role, datasource, tier, detail}]`
+- `table_columns.json`: `{"COLUMN_NAME": "TABLE_NAME", ...}`
+- `parameters.json`: `[{caption, name, ...}]`
+- `param_map.json`: `{"Parameter 3 1": "Metric", ...}`
+- `calc_map.json`: `{"[Calculation_123]": "Sales Total", ...}`
+
+**Output:** JSON file with:
+
+```json
+{
+  "translated": [{"name": "...", "expr": "...", "column_type": "MEASURE", "level": 0}],
+  "skipped": [{"name": "...", "reason": "...", "level": 1}],
+  "stats": {"total": 163, "translated": 107, "skipped": 56, "levels": {"0": 107, "1": 56}}
+}
+```
+
+**Translation pipeline (14 ordered steps):**
+1. Strip `[Parameters].[X]` → `[X]`
+2. Map internal parameter names to captions
+3. Resolve `[Calculation_*]` cross-references (dependency DAG, topological sort)
+4. LOD expressions → `group_aggregate()`
+5. `TOTAL()` → `group_aggregate(..., {}, query_filters())`
+6. `CASE/WHEN` → `if/else if` chain
+7. `IIF(test,a,b)` → `if(test) then a else b`
+8. `IF/THEN/END` → `if()/then/else` (strip END, wrap conditions)
+9. `INT()` → floor/ceil composite
+10. Function mapping (ZN→ifnull, COUNTD→unique count, etc.)
+11. Date functions (DATETRUNC→start_of_*, DATEDIFF→diff_*, etc.)
+12. String concatenation (`+` → `concat()`)
+13. Column scoping (`[COL]` → `[TABLE::COL]`)
+14. Mandatory else clause (type-matched)
+
+Stdout prints the stats summary JSON; the full result goes to `--output`.
+
+---
+
 ## Piping and scripting
 
 All commands write JSON to stdout, making them easy to pipe into `jq` or Python:
