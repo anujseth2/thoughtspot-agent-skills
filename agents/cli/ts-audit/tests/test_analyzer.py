@@ -22,6 +22,7 @@ from analyzer import (
     check_d6,
     check_d9,
     check_d10,
+    check_d11,
     check_d7,
     check_d8,
     check_h1,
@@ -35,6 +36,12 @@ from analyzer import (
     check_p9,
     check_p10,
     check_p11,
+    check_p13,
+    check_p14,
+    check_p15,
+    check_p16,
+    check_p17,
+    check_p18,
     check_s1,
     check_s8,
     check_s4,
@@ -47,6 +54,10 @@ from analyzer import (
     _detect_stale,
     _normalise_expr,
     _join_depth,
+    _count_if_nesting,
+    _formula_chain_depth,
+    _classify_table_role,
+    _check_fanout_mitigations,
 )
 
 
@@ -130,6 +141,17 @@ def _tbl_col(name, data_type="INT64", db_column_name=None):
         "db_column_name": db_column_name or name,
         "db_column_properties": {"data_type": data_type},
     }
+
+
+def _tbl_col_with_casing(name, data_type="VARCHAR", db_column_name=None, value_casing=None):
+    c = {
+        "name": name,
+        "db_column_name": db_column_name or name,
+        "db_column_properties": {"data_type": data_type},
+    }
+    if value_casing is not None:
+        c.setdefault("properties", {})["value_casing"] = value_casing
+    return c
 
 
 def _mt(name, fqn=None, joins=None):
@@ -569,6 +591,292 @@ class TestSChecks:
 
 
 # ---------------------------------------------------------------------------
+# P13
+# ---------------------------------------------------------------------------
+
+class TestP13:
+    def test_p13_many_rls_rules(self):
+        tbl = _table_tml("Sales", rls_rules={
+            "rules": [
+                {"expr": "[Sales::region] = ts_username"},
+                {"expr": "[Sales::country] = ts_username"},
+                {"expr": "[Sales::division] = ts_username"},
+                {"expr": "[Sales::team] = ts_username"},
+            ],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p13(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].check_id == "P13"
+        assert findings[0].severity == "MEDIUM"
+        assert "4" in findings[0].title
+
+    def test_p13_high_severity(self):
+        rules = [{"expr": f"[Sales::col{i}] = ts_username"} for i in range(7)]
+        tbl = _table_tml("Sales", rls_rules={"rules": rules})
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p13(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].severity == "HIGH"
+
+    def test_p13_few_rules_no_finding(self):
+        tbl = _table_tml("Sales", rls_rules={
+            "rules": [
+                {"expr": "[Sales::region] = ts_username"},
+                {"expr": "[Sales::country] = ts_username"},
+            ],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p13(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 0
+
+    def test_p13_no_rls_no_finding(self):
+        tbl = _table_tml("Sales")
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p13(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# P14
+# ---------------------------------------------------------------------------
+
+class TestP14:
+    def test_p14_if_in_rls(self):
+        tbl = _table_tml("Sales", rls_rules={
+            "rules": [{"expr": "if(is_group_member('admin'), true, [Sales::region] = ts_username)"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p14(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].check_id == "P14"
+        assert findings[0].severity == "MEDIUM"
+        assert "IF" in findings[0].title.upper() or "if" in findings[0].title
+
+    def test_p14_contains_in_rls(self):
+        tbl = _table_tml("Sales", rls_rules={
+            "rules": [{"expr": "contains([Sales::email], ts_username)"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p14(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 1
+
+    def test_p14_simple_rls_no_finding(self):
+        tbl = _table_tml("Sales", rls_rules={
+            "rules": [{"expr": "[Sales::region] = ts_username"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p14(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 0
+
+    def test_p14_no_rls_no_finding(self):
+        tbl = _table_tml("Sales")
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p14(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# P15
+# ---------------------------------------------------------------------------
+
+class TestP15:
+    def test_p15_varchar_rls_unknown_casing(self):
+        tbl = _table_tml("Sales", columns=[
+            _tbl_col_with_casing("region", data_type="VARCHAR", value_casing="UNKNOWN"),
+        ], rls_rules={
+            "rules": [{"expr": "[Sales::region] = ts_username"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p15(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].check_id == "P15"
+        assert findings[0].severity == "MEDIUM"
+
+    def test_p15_varchar_rls_no_casing(self):
+        tbl = _table_tml("Sales", columns=[
+            _tbl_col_with_casing("region", data_type="VARCHAR"),
+        ], rls_rules={
+            "rules": [{"expr": "[Sales::region] = ts_username"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p15(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 1
+
+    def test_p15_varchar_rls_upper_no_finding(self):
+        tbl = _table_tml("Sales", columns=[
+            _tbl_col_with_casing("region", data_type="VARCHAR", value_casing="UPPER"),
+        ], rls_rules={
+            "rules": [{"expr": "[Sales::region] = ts_username"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p15(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 0
+
+    def test_p15_int_rls_no_finding(self):
+        tbl = _table_tml("Sales", columns=[
+            _tbl_col("user_id", data_type="INT64"),
+        ], rls_rules={
+            "rules": [{"expr": "[Sales::user_id] = ts_username"}],
+        })
+        m = _model(model_tables=[_mt("Sales", fqn="tbl-guid-1")])
+        corpus = Corpus(models=[m], table_tmls_by_model={"guid-1": [tbl]})
+        findings = check_p15(m, corpus, SPOTTER_CFG)
+        assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# P16
+# ---------------------------------------------------------------------------
+
+class TestP16:
+    def test_count_if_nesting_deep(self):
+        expr = "if(a, if(b, if(c, if(d, 1, 2), 3), 4), 5)"
+        assert _count_if_nesting(expr) == 4
+
+    def test_count_if_nesting_none(self):
+        assert _count_if_nesting("sum([Sales::Revenue])") == 0
+
+    def test_p16_deep_nesting_info(self):
+        expr = "if(a, if(b, if(c, if(d, 1, 2), 3), 4), 5)"
+        m = _model(formulas=[_formula("Deep Formula", expr)])
+        findings = check_p16(m, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].check_id == "P16"
+        assert findings[0].severity == "INFO"
+        assert "Deep Formula" in findings[0].title
+
+    def test_p16_very_deep_nesting_low(self):
+        expr = "if(a, if(b, if(c, if(d, if(e, if(f, 1, 2), 3), 4), 5), 6), 7)"
+        m = _model(formulas=[_formula("Very Deep", expr)])
+        findings = check_p16(m, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].severity == "LOW"
+
+    def test_p16_shallow_no_finding(self):
+        expr = "if(a, if(b, if(c, 1, 2), 3), 4)"
+        m = _model(formulas=[_formula("Shallow", expr)])
+        findings = check_p16(m, SPOTTER_CFG)
+        assert len(findings) == 0
+
+    def test_p16_no_formulas_no_finding(self):
+        m = _model()
+        findings = check_p16(m, SPOTTER_CFG)
+        assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# P17
+# ---------------------------------------------------------------------------
+
+class TestP17:
+    def test_formula_chain_depth_3(self):
+        formulas = [
+            _formula("A", "[B] + 1"),
+            _formula("B", "[C] * 2"),
+            _formula("C", "sum([Sales::Revenue])"),
+        ]
+        depth, chain = _formula_chain_depth(formulas)
+        assert depth == 3
+        assert len(chain) == 3
+
+    def test_formula_chain_depth_1(self):
+        formulas = [
+            _formula("A", "sum([Sales::Revenue])"),
+        ]
+        depth, chain = _formula_chain_depth(formulas)
+        assert depth == 1
+
+    def test_formula_chain_no_cross_refs(self):
+        formulas = [
+            _formula("A", "[Sales::col1] + 1"),
+            _formula("B", "[Sales::col2] * 2"),
+        ]
+        depth, chain = _formula_chain_depth(formulas)
+        assert depth == 1
+
+    def test_p17_deep_chain_info(self):
+        formulas = [
+            _formula("A", "[B] + 1"),
+            _formula("B", "[C] * 2"),
+            _formula("C", "sum([Sales::Revenue])"),
+        ]
+        m = _model(formulas=formulas)
+        findings = check_p17(m, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].check_id == "P17"
+        assert findings[0].severity == "INFO"
+        assert "3" in findings[0].title
+
+    def test_p17_very_deep_chain_low(self):
+        formulas = [
+            _formula("A", "[B] + 1"),
+            _formula("B", "[C] * 2"),
+            _formula("C", "[D] + 3"),
+            _formula("D", "sum([Sales::Revenue])"),
+        ]
+        m = _model(formulas=formulas)
+        findings = check_p17(m, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].severity == "LOW"
+
+    def test_p17_short_chain_no_finding(self):
+        formulas = [
+            _formula("A", "[B] + 1"),
+            _formula("B", "sum([Sales::Revenue])"),
+        ]
+        m = _model(formulas=formulas)
+        findings = check_p17(m, SPOTTER_CFG)
+        assert len(findings) == 0
+
+
+class TestP18:
+    def test_p18_count_distinct(self):
+        m = _model(columns=[
+            _col("Unique Customers", column_id="Sales::customer_id",
+                 column_type="MEASURE", aggregation="COUNT_DISTINCT"),
+            _col("Revenue", column_id="Sales::revenue",
+                 column_type="MEASURE", aggregation="SUM"),
+        ])
+        findings = check_p18(m, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].check_id == "P18"
+        assert findings[0].severity == "INFO"
+        assert "1" in findings[0].title
+        assert "Unique Customers" in findings[0].detail
+
+    def test_p18_multiple_count_distinct(self):
+        m = _model(columns=[
+            _col("Unique Customers", column_id="Sales::cust_id",
+                 column_type="MEASURE", aggregation="COUNT_DISTINCT"),
+            _col("Unique Products", column_id="Sales::prod_id",
+                 column_type="MEASURE", aggregation="COUNT_DISTINCT"),
+        ])
+        findings = check_p18(m, SPOTTER_CFG)
+        assert len(findings) == 1
+        assert findings[0].score == 2
+
+    def test_p18_no_count_distinct(self):
+        m = _model(columns=[
+            _col("Revenue", column_id="Sales::revenue",
+                 column_type="MEASURE", aggregation="SUM"),
+        ])
+        findings = check_p18(m, SPOTTER_CFG)
+        assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
 # Integration
 # ---------------------------------------------------------------------------
 
@@ -611,3 +919,152 @@ class TestIntegration:
         angles = {f.angle for f in findings}
         assert "A" not in angles
         assert "D" not in angles
+
+
+# ---------------------------------------------------------------------------
+# D11 — Fan-out join risk
+# ---------------------------------------------------------------------------
+
+class TestD11:
+    def test_d11_fact_to_dim_no_finding(self):
+        """Correct star schema: fact sources join to dimension (MANY_TO_ONE)."""
+        m = _model(
+            columns=[
+                _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+                _col("Quantity", column_id="Sales::qty", column_type="MEASURE"),
+                _col("Discount", column_id="Sales::disc", column_type="MEASURE"),
+                _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+                _col("Region", column_id="Region::name", column_type="ATTRIBUTE"),
+            ],
+            model_tables=[
+                _mt("Sales", joins=[{"with": "Region", "type": "LEFT_OUTER",
+                                     "cardinality": "MANY_TO_ONE",
+                                     "on": "[Sales::region_id] = [Region::id]"}]),
+                _mt("Region"),
+            ],
+        )
+        findings = check_d11(m, SPOTTER_CFG)
+        assert len(findings) == 0
+
+    def test_d11_dim_to_fact_reversed(self):
+        """Reversed: dimension sources join to fact."""
+        m = _model(
+            columns=[
+                _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+                _col("Quantity", column_id="Sales::qty", column_type="MEASURE"),
+                _col("Discount", column_id="Sales::disc", column_type="MEASURE"),
+                _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+                _col("Region", column_id="Region::name", column_type="ATTRIBUTE"),
+            ],
+            model_tables=[
+                _mt("Sales"),
+                _mt("Region", joins=[{"with": "Sales", "type": "LEFT_OUTER",
+                                      "cardinality": "ONE_TO_MANY",
+                                      "on": "[Region::id] = [Sales::region_id]"}]),
+            ],
+        )
+        findings = check_d11(m, SPOTTER_CFG)
+        assert len(findings) >= 1
+        assert any(f.severity == "MEDIUM" for f in findings)
+
+    def test_d11_one_to_many_cardinality(self):
+        """ONE_TO_MANY is explicit fan-out regardless of table roles."""
+        m = _model(
+            columns=[
+                _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+                _col("Quantity", column_id="Sales::qty", column_type="MEASURE"),
+                _col("Discount", column_id="Sales::disc", column_type="MEASURE"),
+                _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+                _col("Rate", column_id="Rates::rate", column_type="ATTRIBUTE"),
+            ],
+            model_tables=[
+                _mt("Sales", joins=[{"with": "Rates", "type": "LEFT_OUTER",
+                                     "cardinality": "ONE_TO_MANY",
+                                     "on": "[Sales::currency] = [Rates::source]"}]),
+                _mt("Rates"),
+            ],
+        )
+        findings = check_d11(m, SPOTTER_CFG)
+        assert len(findings) >= 1
+        assert any(f.check_name == "FANOUT_CARDINALITY" for f in findings)
+
+    def test_d11_fanout_name_match(self):
+        """Target table with conversion/rate naming pattern."""
+        m = _model(
+            columns=[
+                _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+                _col("Quantity", column_id="Sales::qty", column_type="MEASURE"),
+                _col("Discount", column_id="Sales::disc", column_type="MEASURE"),
+                _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+                _col("Rate", column_id="Currency_Rate::rate", column_type="ATTRIBUTE"),
+            ],
+            model_tables=[
+                _mt("Sales", joins=[{"with": "Currency_Rate", "type": "LEFT_OUTER",
+                                     "cardinality": "MANY_TO_ONE",
+                                     "on": "[Sales::ccy] = [Currency_Rate::source]"}]),
+                _mt("Currency_Rate"),
+            ],
+        )
+        findings = check_d11(m, SPOTTER_CFG)
+        assert len(findings) >= 1
+        assert any(f.check_name == "FANOUT_NAME" for f in findings)
+
+    def test_d11_fanout_mitigated_by_filter(self):
+        """Fan-out name match but model has a filter on the target table — severity reduced."""
+        m = _model(
+            columns=[
+                _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+                _col("Quantity", column_id="Sales::qty", column_type="MEASURE"),
+                _col("Discount", column_id="Sales::disc", column_type="MEASURE"),
+                _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+                _col("Rate", column_id="Currency_Rate::rate", column_type="ATTRIBUTE"),
+                _col("Target CCY", column_id="Currency_Rate::target_ccy", column_type="ATTRIBUTE"),
+            ],
+            model_tables=[
+                _mt("Sales", joins=[{"with": "Currency_Rate", "type": "LEFT_OUTER",
+                                     "cardinality": "ONE_TO_MANY",
+                                     "on": "[Sales::ccy] = [Currency_Rate::source]"}]),
+                _mt("Currency_Rate"),
+            ],
+            filters=[{"column": "Currency_Rate::target_ccy", "oper": "EQ", "values": ["USD"]}],
+        )
+        findings = check_d11(m, SPOTTER_CFG)
+        mitigated = [f for f in findings if "mitigated" in f.detail.lower()]
+        assert len(mitigated) >= 1
+        assert all(f.severity == "INFO" for f in mitigated)
+
+    def test_d11_fact_to_fact(self):
+        """Two fact tables joined — risk of row multiplication."""
+        m = _model(
+            columns=[
+                _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+                _col("Quantity", column_id="Sales::qty", column_type="MEASURE"),
+                _col("Discount", column_id="Sales::disc", column_type="MEASURE"),
+                _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+                _col("Amount", column_id="Orders::amount", column_type="MEASURE"),
+                _col("Shipping", column_id="Orders::shipping", column_type="MEASURE"),
+                _col("Total", column_id="Orders::total", column_type="MEASURE"),
+                _col("Fee", column_id="Orders::fee", column_type="MEASURE"),
+            ],
+            model_tables=[
+                _mt("Sales", joins=[{"with": "Orders", "type": "LEFT_OUTER",
+                                     "cardinality": "MANY_TO_ONE",
+                                     "on": "[Sales::order_id] = [Orders::id]"}]),
+                _mt("Orders"),
+            ],
+        )
+        findings = check_d11(m, SPOTTER_CFG)
+        assert any(f.check_name == "FANOUT_FACT_TO_FACT" for f in findings)
+        assert any(f.severity == "MEDIUM" for f in findings)
+
+    def test_d11_classify_table_role(self):
+        m = _model(columns=[
+            _col("Revenue", column_id="Sales::revenue", column_type="MEASURE"),
+            _col("Qty", column_id="Sales::qty", column_type="MEASURE"),
+            _col("Disc", column_id="Sales::disc", column_type="MEASURE"),
+            _col("Tax", column_id="Sales::tax", column_type="MEASURE"),
+            _col("Region", column_id="Region::name", column_type="ATTRIBUTE"),
+        ])
+        roles = _classify_table_role(m)
+        assert roles["Sales"] == "fact"
+        assert roles["Region"] == "dimension"

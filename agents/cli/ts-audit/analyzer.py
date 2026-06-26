@@ -239,6 +239,11 @@ SQL_PASSTHROUGH_RE = re.compile(
     r"sql_(int|string|bool|date|double)_aggregate_op", re.I
 )
 
+FANOUT_NAME_RE = re.compile(
+    r"(RATE|CURRENCY|EXCHANGE|FX|CONVERSION|XREF|CROSS_REF|BRIDGE|MAPPING)",
+    re.I,
+)
+
 
 def _detect_pii(name: str) -> tuple[str, str] | None:
     lower = name.lower()
@@ -744,6 +749,142 @@ def check_d10(model: dict, _config: AuditConfig) -> list[Finding]:
     return findings
 
 
+def _classify_table_role(model: dict) -> dict[str, str]:
+    """Classify each table as 'fact', 'dimension', or 'unknown' using D6 heuristic."""
+    cbt = _columns_by_table(model)
+    roles: dict[str, str] = {}
+    for tname, cols in cbt.items():
+        measures = sum(
+            1 for c in cols
+            if (c.get("properties", {}) or {}).get("column_type", "") == "MEASURE"
+        )
+        if measures > 3:
+            roles[tname] = "fact"
+        elif cols:
+            roles[tname] = "dimension"
+        else:
+            roles[tname] = "unknown"
+    for mt in _get_model_tables(model):
+        tname = mt.get("name", "")
+        if tname not in roles:
+            roles[tname] = "unknown"
+    return roles
+
+
+def _refs_table(column_ref: str, table_name: str) -> bool:
+    """Return True if column_ref is a ThoughtSpot Table::Column reference for table_name."""
+    return column_ref.startswith(f"{table_name}::")
+
+
+def _check_fanout_mitigations(model: dict, target_table: str) -> bool:
+    """Check if the model has parameters/filters/formulas that constrain a target table."""
+    m = model.get("model", {})
+    params = m.get("parameters", [])
+    filters = m.get("filters", [])
+    formulas = m.get("formulas", [])
+
+    # Use prefix-aware matching: ThoughtSpot column refs are "Table::Column"
+    filter_refs_target = any(
+        _refs_table(f.get("column", "") or "", target_table)
+        for f in filters
+    )
+    if filter_refs_target:
+        return True
+
+    if params:
+        # Formula expressions use [Table::Column] syntax — substring match is acceptable
+        all_exprs = " ".join(f.get("expr", "") for f in formulas)
+        # Filter column refs use prefix-aware check to avoid false positives
+        all_filter_cols = " ".join(f.get("column", "") or "" for f in filters)
+        filter_col_refs_target = any(
+            _refs_table(f.get("column", "") or "", target_table)
+            for f in filters
+        )
+        if target_table in all_exprs or filter_col_refs_target:
+            return True
+
+    return False
+
+
+def check_d11(model: dict, _config: AuditConfig) -> list[Finding]:
+    """D11: Fan-out join risk — direction, cardinality, naming + mitigation."""
+    findings = []
+    name = _model_name(model)
+    guid = _model_guid(model)
+    roles = _classify_table_role(model)
+
+    for src_table, join in _all_joins(model):
+        target = join.get("with", "")
+        cardinality = join.get("cardinality", "")
+        src_role = roles.get(src_table, "unknown")
+        tgt_role = roles.get(target, "unknown")
+        mitigated = _check_fanout_mitigations(model, target)
+
+        if cardinality == "ONE_TO_MANY":
+            severity = "INFO" if mitigated else "MEDIUM"
+            detail = (f"ONE_TO_MANY join: {src_table} → {target}. "
+                      f"Each source row produces multiple output rows.")
+            if mitigated:
+                detail += " Fan-out risk appears mitigated by parameter/filter — confirm."
+            else:
+                detail += " No visible constraint — confirm users select a single value."
+            findings.append(Finding(
+                angle="D", check_id="D11", check_name="FANOUT_CARDINALITY",
+                severity=severity,
+                title=f"ONE_TO_MANY join: {src_table} → {target}",
+                detail=detail,
+                model_name=name, model_guid=guid,
+                recommendation="Add a parameter or filter to constrain the target table to a single value",
+            ))
+
+        if src_role == "dimension" and tgt_role == "fact":
+            severity = "INFO" if mitigated else "MEDIUM"
+            detail = (f"Reversed join direction: dimension '{src_table}' sources join to "
+                      f"fact '{target}'. Star schema joins should go fact → dimension.")
+            if mitigated:
+                detail += " Fan-out risk appears mitigated by parameter/filter — confirm."
+            findings.append(Finding(
+                angle="D", check_id="D11", check_name="FANOUT_REVERSED_DIRECTION",
+                severity=severity,
+                title=f"Reversed join: {src_table} (dim) → {target} (fact)",
+                detail=detail,
+                model_name=name, model_guid=guid,
+                recommendation="Review join direction — facts should source joins to dimensions",
+            ))
+
+        if src_role == "fact" and tgt_role == "fact":
+            severity = "INFO" if mitigated else "MEDIUM"
+            findings.append(Finding(
+                angle="D", check_id="D11", check_name="FANOUT_FACT_TO_FACT",
+                severity=severity,
+                title=f"Fact-to-fact join: {src_table} → {target}",
+                detail=f"Two fact tables joined — risk of row multiplication. "
+                       f"{'Fan-out appears mitigated.' if mitigated else 'No visible constraint.'}",
+                model_name=name, model_guid=guid,
+                recommendation="Review whether an intermediate dimension or bridge table is needed",
+            ))
+
+        if FANOUT_NAME_RE.search(target):
+            name_mitigated = _check_fanout_mitigations(model, target)
+            already_flagged = any(
+                f.check_id == "D11" and target in f.title
+                for f in findings
+            )
+            # Suppress entirely when mitigated and no other D11 signal already flagged this target
+            if not already_flagged and not name_mitigated:
+                findings.append(Finding(
+                    angle="D", check_id="D11", check_name="FANOUT_NAME",
+                    severity="INFO",
+                    title=f"Potential conversion/rate table: {target}",
+                    detail=f"Join to '{target}' — if this is a conversion/rate table, "
+                           f"confirm a parameter or filter constrains it to a single target value",
+                    model_name=name, model_guid=guid,
+                    recommendation="Add a parameter for target value selection if not already present",
+                ))
+
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # H — Human Readiness checks
 # ---------------------------------------------------------------------------
@@ -1153,6 +1294,221 @@ def check_p11(model: dict, _config: AuditConfig) -> list[Finding]:
     )]
 
 
+def check_p13(model: dict, corpus: Corpus, _config: AuditConfig) -> list[Finding]:
+    """P13: RLS rule density — many rules per table compound query cost."""
+    findings = []
+    name = _model_name(model)
+    guid = _model_guid(model)
+    table_tmls = corpus.table_tmls_by_model.get(guid or "", [])
+
+    for ttl in table_tmls:
+        tbl_name = ttl.get("table", {}).get("name", "?")
+        rls = ttl.get("table", {}).get("rls_rules", {})
+        if not rls:
+            continue
+        rule_count = len(rls.get("rules", []))
+        if rule_count <= 3:
+            continue
+        severity = "HIGH" if rule_count > 6 else "MEDIUM"
+        findings.append(Finding(
+            angle="P", check_id="P13", check_name="RLS_RULE_DENSITY",
+            severity=severity,
+            title=f"{rule_count} RLS rules on table {tbl_name}",
+            detail="Each RLS rule evaluates independently on every query — cost compounds linearly",
+            score=rule_count,
+            model_name=name, model_guid=guid,
+            recommendation="Review whether rules can be consolidated or simplified",
+        ))
+    return findings
+
+
+def check_p14(model: dict, corpus: Corpus, _config: AuditConfig) -> list[Finding]:
+    """P14: RLS formula complexity — functions prevent index/partition use."""
+    findings = []
+    name = _model_name(model)
+    guid = _model_guid(model)
+    table_tmls = corpus.table_tmls_by_model.get(guid or "", [])
+
+    for ttl in table_tmls:
+        tbl_name = ttl.get("table", {}).get("name", "?")
+        rls = ttl.get("table", {}).get("rls_rules", {})
+        if not rls:
+            continue
+        for rule in rls.get("rules", []):
+            expr = rule.get("expr", "")
+            match = RLS_PERF_FUNCTION_RE.search(expr)
+            if match:
+                func_name = match.group(1).upper()
+                findings.append(Finding(
+                    angle="P", check_id="P14", check_name="RLS_FUNCTION_PERF",
+                    severity="MEDIUM",
+                    title=f"Function {func_name}() in RLS on {tbl_name}",
+                    detail=f"Expression: {expr[:120]}. Functions in RLS prevent index/partition pruning.",
+                    model_name=name, model_guid=guid,
+                    recommendation="Materialise the function result as a warehouse column and filter on that",
+                ))
+    return findings
+
+
+STRING_TYPES = {"VARCHAR", "CHAR", "TEXT", "STRING", "NVARCHAR", "NCHAR"}
+
+
+def _get_table_col_casing(table_tml: dict) -> dict[str, str | None]:
+    """Build {column_name: value_casing or None} for string columns."""
+    tbl = table_tml.get("table", {})
+    result = {}
+    for c in tbl.get("columns", []):
+        col_name = c.get("db_column_name", c.get("name", ""))
+        dtype = (c.get("db_column_properties", {}) or {}).get("data_type", "")
+        if dtype.upper() in STRING_TYPES:
+            casing = (c.get("properties", {}) or {}).get("value_casing")
+            result[col_name] = casing
+    return result
+
+
+def check_p15(model: dict, corpus: Corpus, _config: AuditConfig) -> list[Finding]:
+    """P15: RLS column casing — VARCHAR RLS columns without UPPER/LOWER casing."""
+    findings = []
+    name = _model_name(model)
+    guid = _model_guid(model)
+    table_tmls = corpus.table_tmls_by_model.get(guid or "", [])
+
+    for ttl in table_tmls:
+        tbl_name = ttl.get("table", {}).get("name", "?")
+        rls_cols = _extract_rls_columns(ttl)
+        if not rls_cols:
+            continue
+        col_casing = _get_table_col_casing(ttl)
+        for col_name, _expr in rls_cols:
+            if col_name not in col_casing:
+                continue
+            casing = col_casing[col_name]
+            if casing in ("UPPER", "LOWER"):
+                continue
+            casing_display = casing if casing else "absent"
+            findings.append(Finding(
+                angle="P", check_id="P15", check_name="RLS_COLUMN_CASING",
+                severity="MEDIUM",
+                title=f"RLS on VARCHAR column {tbl_name}.{col_name} (value_casing={casing_display})",
+                detail="Without UPPER or LOWER casing, the database cannot use indexes efficiently for RLS filtering",
+                model_name=name, model_guid=guid,
+                recommendation="Set value_casing to UPPER or LOWER on the underlying table column",
+            ))
+    return findings
+
+
+IF_RE = re.compile(r"\bif\s*\(", re.I)
+
+
+def _count_if_nesting(expr: str) -> int:
+    """Count if() occurrences as a proxy for nesting depth."""
+    return len(IF_RE.findall(expr))
+
+
+def check_p16(model: dict, _config: AuditConfig) -> list[Finding]:
+    """P16: Formula nesting depth — deeply nested if() conditionals."""
+    findings = []
+    formulas = _get_formulas(model)
+    if not formulas:
+        return findings
+    for f in formulas:
+        fname = f.get("name", "?")
+        expr = f.get("expr", "")
+        depth = _count_if_nesting(expr)
+        if depth <= 3:
+            continue
+        severity = "LOW" if depth > 5 else "INFO"
+        findings.append(Finding(
+            angle="P", check_id="P16", check_name="FORMULA_NESTING_DEPTH",
+            severity=severity,
+            title=f"Formula '{fname}' has {depth} levels of if() nesting",
+            detail="Each nesting level adds branching in the ThoughtSpot calculation engine at query time",
+            score=depth,
+            model_name=_model_name(model), model_guid=_model_guid(model),
+            recommendation="Consider a CASE-style approach or materialising the logic in the warehouse",
+        ))
+    return findings
+
+
+BRACKET_REF_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def _formula_chain_depth(formulas: list[dict]) -> tuple[int, list[str]]:
+    """Find the longest formula-references-formula chain. Returns (depth, chain_names)."""
+    formula_names = {f.get("name", "") for f in formulas}
+    deps: dict[str, set[str]] = {}
+    for f in formulas:
+        fname = f.get("name", "")
+        expr = f.get("expr", "")
+        refs = set()
+        for ref in BRACKET_REF_RE.findall(expr):
+            if "::" not in ref and ref in formula_names and ref != fname:
+                refs.add(ref)
+        deps[fname] = refs
+
+    max_depth = 0
+    max_chain: list[str] = []
+    for start in formula_names:
+        visited: set[str] = set()
+        stack: list[tuple[str, list[str]]] = [(start, [start])]
+        while stack:
+            node, path = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            if len(path) > max_depth:
+                max_depth = len(path)
+                max_chain = path[:]
+            for dep in deps.get(node, set()):
+                if dep not in visited:
+                    stack.append((dep, path + [dep]))
+
+    return max_depth, max_chain
+
+
+def check_p17(model: dict, _config: AuditConfig) -> list[Finding]:
+    """P17: Formula reference chains — formulas referencing formulas."""
+    formulas = _get_formulas(model)
+    if not formulas:
+        return []
+    depth, chain = _formula_chain_depth(formulas)
+    if depth <= 2:
+        return []
+    severity = "LOW" if depth > 3 else "INFO"
+    chain_str = " → ".join(chain)
+    return [Finding(
+        angle="P", check_id="P17", check_name="FORMULA_CHAIN_DEPTH",
+        severity=severity,
+        title=f"Formula chain {depth} deep: {chain_str}",
+        detail="Each link adds a computation layer at query time",
+        score=depth,
+        model_name=_model_name(model), model_guid=_model_guid(model),
+        recommendation="Consider inlining or materialising intermediate steps in the warehouse",
+    )]
+
+
+def check_p18(model: dict, _config: AuditConfig) -> list[Finding]:
+    """P18: COUNT_DISTINCT measures — most expensive aggregation type."""
+    columns = _get_columns(model)
+    cd_cols = [
+        c.get("name", "?") for c in columns
+        if (c.get("properties", {}) or {}).get("aggregation") == "COUNT_DISTINCT"
+    ]
+    if not cd_cols:
+        return []
+    col_list = ", ".join(cd_cols[:5])
+    suffix = f" (+{len(cd_cols) - 5} more)" if len(cd_cols) > 5 else ""
+    return [Finding(
+        angle="P", check_id="P18", check_name="COUNT_DISTINCT_MEASURES",
+        severity="INFO",
+        title=f"{len(cd_cols)} column(s) use COUNT_DISTINCT",
+        detail=f"Columns: {col_list}{suffix}. Most expensive aggregation on most warehouses.",
+        score=len(cd_cols),
+        model_name=_model_name(model), model_guid=_model_guid(model),
+        recommendation="Review whether approximate distinct (HLL) or pre-aggregation is viable",
+    )]
+
+
 # ---------------------------------------------------------------------------
 # S — Security checks
 # ---------------------------------------------------------------------------
@@ -1283,6 +1639,13 @@ RLS_FUNCTION_RE = re.compile(
     re.I,
 )
 
+RLS_PERF_FUNCTION_RE = re.compile(
+    r"\b(UPPER|LOWER|TRIM|SUBSTR|SUBSTRING|CONCAT|REPLACE|CAST|CONVERT|"
+    r"COALESCE|NVL|IFNULL|TO_CHAR|TO_VARCHAR|TO_NUMBER|TO_DATE|DATE_TRUNC|"
+    r"LEFT|RIGHT|CONTAINS|STARTS_WITH|ENDS_WITH|IF|IN)\s*\(",
+    re.I,
+)
+
 
 def check_s8(model: dict, corpus: Corpus, _config: AuditConfig) -> list[Finding]:
     """S8: RLS column data type quality — VARCHAR filters are slower than integer."""
@@ -1397,6 +1760,7 @@ def run_audit(corpus: Corpus, config: AuditConfig) -> list[Finding]:
             findings.extend(check_d6(m, config))
             findings.extend(check_d9(m, config))
             findings.extend(check_d10(m, config))
+            findings.extend(check_d11(m, config))
 
         if "H" in angles:
             findings.extend(check_h1(m, config))
@@ -1412,6 +1776,12 @@ def run_audit(corpus: Corpus, config: AuditConfig) -> list[Finding]:
             findings.extend(check_p9(m, config))
             findings.extend(check_p10(m, config))
             findings.extend(check_p11(m, config))
+            findings.extend(check_p13(m, corpus, config))
+            findings.extend(check_p14(m, corpus, config))
+            findings.extend(check_p15(m, corpus, config))
+            findings.extend(check_p16(m, config))
+            findings.extend(check_p17(m, config))
+            findings.extend(check_p18(m, config))
 
         if "S" in angles:
             findings.extend(check_s2(m, corpus, config))
