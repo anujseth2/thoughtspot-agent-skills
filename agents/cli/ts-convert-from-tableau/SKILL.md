@@ -128,12 +128,16 @@ When the user picks **M**, immediately ask **what to migrate** — this decides 
       calculated fields, blend relationships,
       table-calc addressing ............................ auto
   3.5 Resolve published datasources (sqlproxy → API) ... auto/you choose  [scope 1,2]
+  3.6 Confirm joins (present/suggest/range join option) . you confirm   [scope 1,2]
   4.  Confirm source tables (reuse/GUID/create/search) ..... you choose  [scope 1,2]
   4.5 Select ThoughtSpot connection (create path only) .... you choose  [scope 1,2]
   5.  Generate TML files (table + sql_view + model) ...... auto          [scope 1,2]
+      5b includes: ts tableau translate-formulas (CLI pipeline)
   5.5 Confirm Spotter (AI search) enablement (default Y) .. you choose   [scope 1,2]
   6.  Validate against ThoughtSpot (up to 10 fix cycles) .. auto         [scope 1,2]
-  7.  Review checkpoint (formula map + omissions) + import  you confirm  [scope 1,2]
+  7.  Review checkpoint + two-phase import:               you confirm   [scope 1,2]
+      Phase 1: base model (tables, columns, joins, params — NO formulas)
+      Phase 2: add formulas (GUID-pinned update, iterative error recovery)
   7.5 Confirm the model is correct (test in Search/Spotter)  you confirm [scope 1,2]
   8.  Migrate dashboards? + separate vs single-tabbed (2+) . you choose (skip → Step 12) [scope 1,3]
   9.  Parse dashboard layout and map to grid ............... auto
@@ -147,7 +151,7 @@ When the user picks **M**, immediately ask **what to migrate** — this decides 
  11.5 Formula coverage answers (every formula testable) ... auto
  12.  Migration report (outcomes + links + formula map) ... auto
 
-Confirmation required: Steps 1.5, 4.5, 5.5, 7, 7.5, 8, 9d, 11
+Confirmation required: Steps 1.5, 3.6, 4.5, 5.5, 7, 7.5, 8, 9d, 11
 Auto-executed: Steps 1, 3, 5, 6, 9, 10, 12
 Scope 3 (LB only) skips 4–7.5; scope 2 (Models only) skips 8–11.
 
@@ -320,6 +324,26 @@ Audit: {workbook_name}
   │ Geospatial (omit+log)   {N}     {%}   MAKEPOINT     │
   │ Untranslatable          {N}     {%}   INDEX(ambig)  │
   └──────────────────────────────────────────────────────┘
+
+  Cross-reference depth (formula-to-formula dependencies):
+  ┌──────────────────────────────────────────────────────┐
+  │ Depth                   Count    %     Note          │
+  ├──────────────────────────────────────────────────────┤
+  │ Level 0 (self-contained) {N}    {%}   Translate directly │
+  │ Level 1 (refs Level 0)   {N}    {%}   Inline from Level 0 │
+  │ Level 2+ (deep chains)   {N}    {%}   Multi-level inlining │
+  │ Circular dependencies    {N}    {%}   Cannot resolve │
+  └──────────────────────────────────────────────────────┘
+
+  Effective migration coverage:
+    Single-pass (Level 0+1): {N}/{total} ({%}%) — achievable without multi-pass
+    All levels (0–N):        {N}/{total} ({%}%) — achievable with dependency resolution
+    Circular (unresolvable): {N} — will be omitted
+
+  ⚠ The tier classification above reports SYNTAX-LEVEL translatability.
+  Cross-reference depth determines what ACTUALLY migrates. A formula classified
+  "Native" may still require dependency resolution if it references other
+  calculated fields. Effective migration coverage is the realistic number.
 
   Tableau Sets (top-level <group> elements — separate from calculated fields):
   ┌──────────────────────────────────────────────────────┐
@@ -910,7 +934,66 @@ not in the file.
 ### Prerequisites
 
 - Tableau profile configured via `/ts-profile-tableau` (optional — skill degrades gracefully)
-- `ts` CLI v0.15.0+ (includes `ts tableau` commands including `download`)
+- `ts` CLI v0.16.0+ (includes `ts tableau` commands including `download` and `translate-formulas`)
+
+---
+
+## Step 3.6 — Join Confirmation
+
+Joins define the model's query behavior — **never silently add joins that aren't in the TWB**.
+
+### When the TWB parse found joins (from `<relation type="join">` or `<object-graph><relationships>`)
+
+Present them to the user for confirmation:
+
+```
+Joins found in workbook ({N} total):
+  1. TABLE_A LEFT JOIN TABLE_B ON TABLE_A.COL = TABLE_B.COL
+  2. TABLE_A LEFT JOIN TABLE_C ON TABLE_A.COL = TABLE_C.COL
+
+Do these look correct? (Y/N/Edit)
+```
+
+If the user edits, accept updated join definitions and continue.
+
+### When the TWB parse found NO joins (common with published datasources/sqlproxy)
+
+```
+⚠ No join definitions found in the workbook file.
+This is normal for published datasources — joins are defined server-side.
+
+Tables in this datasource: TABLE_A, TABLE_B, TABLE_C, ...
+
+To build the model, I need join definitions. Options:
+  D  Define joins — I'll suggest based on matching column names, you confirm
+  S  Skip joins — create separate single-table models (no multi-table queries)
+  P  Provide — paste or describe join definitions
+```
+
+If the user picks **D**, suggest joins based on shared column names between tables:
+
+```
+Suggested joins (based on shared column names):
+  TABLE_A.PROMOTION_ID = TABLE_B.PROMOTION_ID (LEFT_OUTER, MANY_TO_ONE)
+  TABLE_A.PROMOTION_ID = TABLE_C.PROMOTION_ID (LEFT_OUTER, MANY_TO_ONE)
+
+Accept suggested joins? (Y/N/Edit)
+```
+
+### Range join alternative
+
+When the parse detects date-range filter formulas (e.g., `[DATE] >= [START_DATE] AND
+[DATE] <= [END_DATE]`) AND separate fact/dimension tables with start/end date columns,
+surface an additional option:
+
+```
+💡 Detected date-range filter pattern. ThoughtSpot supports range joins:
+  FACT.DATE >= DIM.START_DATE and FACT.DATE < DIM.END_DATE
+
+This is more efficient than a filter formula. Use a range join instead? (Y/N)
+```
+
+See `tableau-tml-rules.md` "Range join alternative" for the TML syntax.
 
 ---
 
@@ -1467,6 +1550,69 @@ model:
       aggregation: SUM
       index_type: DONT_INDEX
 ```
+
+### Formula translation — CLI pipeline (`ts tableau translate-formulas`)
+
+Use the CLI command to translate Tableau calculated fields to ThoughtSpot formula syntax.
+This replaces ad-hoc translation and applies all 14 transforms from
+[`../../shared/mappings/tableau/tableau-formula-translation.md`](../../shared/mappings/tableau/tableau-formula-translation.md)
+in the mandatory execution order.
+
+**Inputs needed:**
+- `classification.json` — from the Step 3 TWB parse (formula name, caption, expression, datatype, role)
+- `table_columns.json` — `{"TABLE_NAME": ["COL1", "COL2", ...]}` map from Step 5a table generation
+- `parameters.json` — from the Step 3 parameter extraction (internal name → caption mapping)
+- `--tables` — comma-separated list of tables in THIS model (for column scoping)
+- `--calc-map` (optional) — `{"Calculation_NNN": "Display Caption"}` map from the TWB
+  `<column>` elements, needed when formulas reference other calculated fields by internal ID
+
+**Generate the calc-id map from TWB parse:**
+
+When the TWB parse (Step 3) extracts calculated fields, each `<column>` element has both
+a `name` attribute (e.g. `[Calculation_6076974422807080981]`) and a `caption` attribute
+(the display name). Build a JSON map from name → caption:
+
+```bash
+# calc_id_map.json: {"Calculation_6076974422807080981": "Revenue Growth %", ...}
+```
+
+Save to `{workdir}/calc_id_map.json`.
+
+**Run the translation:**
+
+```bash
+ts tableau translate-formulas \
+  --input {workdir}/classification.json \
+  --tables TABLE_A,TABLE_B,TABLE_C \
+  --table-columns {workdir}/table_columns.json \
+  --parameters {workdir}/parameters.json \
+  --param-map {workdir}/param_name_map.json \
+  --calc-map {workdir}/calc_id_map.json \
+  --datasource "{datasource_name}" \
+  --output {workdir}/formulas_translated.json
+```
+
+**Output** (`formulas_translated.json`):
+
+```json
+{
+  "translated": [
+    {"name": "Revenue Growth %", "expr": "...", "column_type": "MEASURE", "tier": "Native"}
+  ],
+  "skipped": [
+    {"name": "Complex Calc", "reason": "unresolved cross-reference: [Calculation_123]", "tier": "Native"}
+  ],
+  "stats": {
+    "total": 163, "translated": 107, "skipped": 56,
+    "cross_ref_stats": {"level_0": 85, "level_1": 18, "level_2_plus": 4, "circular": 0}
+  }
+}
+```
+
+Use `translated` entries to populate `formulas[]` and paired `columns[]` in the model TML.
+Review `skipped` entries — some may be recoverable with a `--calc-map` or by manual
+inlining. The `stats.cross_ref_stats` shows dependency depth (matches the audit
+cross-reference depth table from Step A3/A4).
 
 ### Parameter migration (Tableau → ThoughtSpot `parameters[]`)
 
@@ -2416,20 +2562,69 @@ If any sort resolution looks wrong, the user can override it or choose to omit t
 formula instead.
 
 Wait for confirmation. **no** cancels. **file** writes the TMLs and skips to Step 12
-(report only, no import). **yes** imports:
+(report only, no import). **yes** imports using the two-phase approach below.
 
-On confirmation, reuse the JSON payload from Step 6 (rebuild it if any TML changed). Pass
-`--create-new` because these are brand-new objects with no GUID — without it, the default
-`--no-create-new` only updates existing objects. (Do **not** pass `--create-new` if you
-are re-importing TML that already carries a GUID — that silently creates a duplicate.)
+### Two-phase import (recommended)
+
+Import in two phases so formula errors never block the base model. See
+[`../../shared/mappings/tableau/tableau-tml-rules.md`](../../shared/mappings/tableau/tableau-tml-rules.md)
+"Two-phase model import" for the rationale.
+
+**Phase 1 — Base model (no formulas):**
+
+Build the model TML with `model_tables[]`, physical `columns[]`, `joins[]`, and
+`parameters[]` only. **No `formulas[]` section and no formula `columns[]` entries.**
+This is guaranteed to succeed if the table TMLs bind correctly to the connection.
+
+Build the Phase 1 payload (tables + sql_views + base model + cohorts):
 
 ```bash
-cat /tmp/ts_tableau_mig/{workbook_name}_payload.json \
+cd /tmp/ts_tableau_mig/output/{workbook_name}
+python3 - > /tmp/ts_tableau_mig/{workbook_name}_phase1.json <<'PY'
+import json, glob
+order = sorted(glob.glob("*.table.tml")) + sorted(glob.glob("*.sql_view.tml")) + sorted(glob.glob("*.model.tml")) + sorted(glob.glob("*.cohort.tml"))
+print(json.dumps([open(f).read() for f in order]))
+PY
+```
+
+Import with `--create-new`:
+
+```bash
+cat /tmp/ts_tableau_mig/{workbook_name}_phase1.json \
   | ts tml import --policy ALL_OR_NONE --create-new --profile {profile_name}
 ```
 
-Parse the response. Extract the GUID for each imported object. On failure, show the
-error and stop.
+Parse the response. Extract the GUID for each imported object. On failure, fix the
+table/connection errors and retry — Phase 1 errors are always structural (wrong
+connection name, missing column), never formula syntax.
+
+**Phase 2 — Add formulas:**
+
+After Phase 1 succeeds, add all translated formulas to the model TML:
+
+1. Pin the model's GUID at the TML root (`guid:` field)
+2. Add `formulas[]` entries from the `ts tableau translate-formulas` output
+3. Add paired `columns[]` entries for each formula (with `formula_id:`, I1)
+4. Lint with `ts tml lint` (I1/I2/I4/I5/I8 checks)
+5. Import with `--no-create-new` (update in place):
+
+```bash
+python3 -c "import json,pathlib; print(json.dumps([pathlib.Path('{model_file}').read_text()]))" \
+  | ts tml import --policy ALL_OR_NONE --no-create-new --profile {profile_name}
+```
+
+If the Phase 2 import fails:
+1. Parse the error response to identify the failing formula(s)
+2. Remove the failing formula from `formulas[]` AND its paired `columns[]` entry
+3. Log the removal: `"Skipped: {name} — {error_message}"`
+4. Re-lint and re-import (up to 5 retry cycles)
+5. After all retries, report:
+   - Formulas successfully imported
+   - Formulas skipped with reasons
+   - Suggestion: review skipped formulas for manual fix
+
+This ensures the model ALWAYS exists after Phase 1, and formula errors are isolated
+rather than blocking the entire import.
 
 > **Updating something that already exists.** If Step 4.5 found an existing object, or a
 > first import already created one and you need to re-import (e.g. to set Spotter, fix a
@@ -3344,6 +3539,7 @@ in-product **Migration Summary** tab (Step 10g) and any `MIGRATION_LIMITATIONS.m
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.16.0 | 2026-06-27 | **Close the audit-vs-migration gap: CLI formula translation pipeline, two-phase import, join confirmation, cross-reference depth reporting.** (1) New Step 5b CLI reference: `ts tableau translate-formulas` (ts-cli 0.16.0) — deterministic 14-step Tableau→ThoughtSpot formula translation with dependency DAG, cross-reference resolution via inlining, column scoping, parameter conflict detection. Replaces ad-hoc LLM translation. (2) Step 7 two-phase model import: Phase 1 imports base model (tables, columns, joins, params — no formulas) for guaranteed success; Phase 2 adds formulas with GUID-pinned update and iterative error recovery (up to 5 cycles). One bad formula no longer blocks the entire import. (3) Step 3.6 join confirmation: detected joins presented for user confirmation; missing joins (common with published datasources/sqlproxy) suggested from shared column names with explicit D/S/P prompt — never silently added. (4) Step A3/A4 cross-reference depth reporting: Level 0/1/2+/circular counts plus "effective migration coverage" that distinguishes syntax-level translatability from what actually migrates after dependency resolution. Coverage matrix entries #113–#116. |
 | 1.15.0 | 2026-06-17 | Step 4.5 connection step now offers **E — use existing / C — create a new connection** (Snowflake-source only, key-pair auth via `ts connections create`). Adds the "Database does not exist in connection → role can't see it → create one" guidance and a credential-handling guardrail (private key by file path only; never pasted into chat). Non-Snowflake sources / password / OAuth remain out of scope → create in the UI and use the E path. Mirrors the connection-step change in ts-convert-from-snowflake-sv. |
 | 1.14.2 | 2026-06-17 | Replace the hand-written pre-import grep gate with `ts tml lint` (parser-based; now also catches **I8** duplicate `column_id`). From the full audit sweep (codification, angle 11). |
 | 1.14.1 | 2026-06-17 | **Measure-classification + string-parameter-type fixes (from the Catalog Health live migration).** (1) Step 5b parameter mapping: a string **parameter** must be `CHAR`, **not `VARCHAR`** — ThoughtSpot rejects a `VARCHAR` list parameter on import (table *columns* are unaffected). (2) New **MEASURE vs ATTRIBUTE classification** rule in Step 5b: a formula is a MEASURE if it *transitively* produces a number (own aggregate/ratio **or references another MEASURE formula** by `[formula_<id>]` — e.g. a dynamic `if [Param] then [formula_…Pct]` selector); a numeric physical column **defaults to MEASURE** unless it's clearly a dimension (`*_ID`/`*_NUM`/`*_NAME`/date) — Tableau's `role` under-tags counts; and **bare unbracketed column refs** must be qualified to `[TABLE::COL]`. Under-classifying as ATTRIBUTE makes KPIs/chart y-axes render empty. (Assumes PR #92 → v1.14.0 merges first; renumber if not.) |

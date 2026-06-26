@@ -6,6 +6,65 @@ Reference for converting Tableau calculated field expressions to ThoughtSpot TML
 
 ---
 
+## Translation Pipeline — Mandatory Execution Order
+
+Apply these transforms in sequence. Each step's output feeds the next. Skipping a step
+or reordering causes the errors documented in parentheses. The `ts tableau translate-formulas`
+CLI command implements this pipeline automatically.
+
+| Step | Transform | Error if skipped |
+|---|---|---|
+| 1 | **Parameter prefix strip**: `[Parameters].[X]` → `[X]` | "Search did not find 'Parameters'" |
+| 2 | **Internal parameter name mapping**: `[Parameter 6]` → `[Engagement Type]` (build mapping from TWB parse: internal name → caption) | Formula references invisible internal names |
+| 3 | **Cross-reference resolution**: `[Calculation_*]` → inline expression or display name (via dependency DAG — see tableau-tml-rules.md) | "Search did not find 'Calculation_...'" |
+| 4 | **LOD conversion**: `{FIXED ...}` → `group_aggregate()` (see LOD section below) | Raw `{FIXED}` syntax fails parse |
+| 5 | **TOTAL() conversion**: `TOTAL(SUM([x]))` → `group_aggregate(sum([x]), {}, query_filters())` | "Search did not find 'TOTAL'" |
+| 6 | **CASE/WHEN conversion**: `CASE [f] WHEN 'a' THEN x ... END` → `if ([f] = 'a') then x else if ...` | "Search did not find case" — ThoughtSpot has NO native CASE |
+| 7 | **IIF conversion**: `IIF(test,a,b)` → `if (test) then a else b` | "Search did not find 'IIF'" |
+| 8 | **IF/END conversion**: strip `END` keyword; `ELSEIF` → `else if`; wrap conditions in parens | "Search did not find end" — ThoughtSpot has NO `end` keyword |
+| 9 | **INT() conversion**: `INT(x)` → `if (x >= 0) then floor(x) else ceil(x)` | INT truncates toward zero; TS `to_integer` rounds to nearest |
+| 10 | **Function mapping**: apply the full function table below (ZN→ifnull, COUNTD→unique count, etc.) | Wrong function names fail |
+| 11 | **Date function mapping**: DATETRUNC→start_of_*, DATEDIFF→diff_* (reversed args), DATEADD→add_*, DATEPART→unit functions | Wrong function names + incorrect argument order |
+| 12 | **String concatenation**: `[a] + [b]` (string context) → `concat([a], [b])` | TS `+` is numeric-only — "Search did not find '+ ...'" |
+| 13 | **Column scoping**: `[COL]` → `[TABLE::COL]` per model's table set | "Search did not find 'col'" — unscoped refs fail |
+| 14 | **Mandatory else clause**: every `if/then` MUST have an `else` (type-matched: `else 0` for measures, `else ''` for attributes) | "Unknown data type" or "Expecting a Numeric token" |
+
+After all steps, **validate**: reject any formula still containing `END`, `CASE`, `WHEN`,
+`unique_count` (underscore), `date_trunc`, bare `+` on strings, or `ELSEIF`.
+
+### CLI command
+
+```bash
+ts tableau translate-formulas \
+  --input classification.json \
+  --output formulas_translated.json \
+  --datasource prod_ds \
+  --table-columns table_columns.json \
+  --parameters parameters.json \
+  --param-map param_map.json \
+  --calc-map calc_map.json
+```
+
+See `tools/ts-cli/README.md` for full option reference.
+
+---
+
+## Parameter Name Conflicts
+
+A ThoughtSpot model parameter name MUST NOT collide with any formula column name.
+When a parameter and formula share the same name (e.g., both called "Metric"):
+
+- If the formula is a **pass-through** (just returns the parameter value: `[Metric]`),
+  **omit the formula entirely** — consumers can reference the parameter directly.
+- If the formula is **substantive** (uses the parameter in a computation), **rename the
+  formula** by appending a suffix: `Metric Selection` or `Selected Metric`.
+
+Detect conflicts before TML generation and resolve them. An unresolved collision
+causes import failure with no clear error message. The `ts tableau translate-formulas`
+command detects pass-through conflicts automatically and skips them.
+
+---
+
 ## Function Mapping
 
 | Tableau | ThoughtSpot | Notes |

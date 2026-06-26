@@ -22,7 +22,7 @@ Use this as the canonical limitations reference.
 | 9 | Published datasource (`sqlproxy` connection) | Resolved to `dbname` from connection | |
 | 10 | Extract datasources | Resolved to underlying live source | Skipped if no source resolves |
 | 11 | `.twbx` archive extraction | Unzip to access inner `.twb` | |
-| 12 | Topological sort of calculated fields | Formulas emitted in dependency order | Level 0 first |
+| 12 | Topological sort of calculated fields | Formulas emitted in dependency order | Level 0 first; `ts tableau translate-formulas` resolves cross-references via DAG + inlining |
 
 ### Formula Translation — Scalar Functions
 
@@ -183,6 +183,10 @@ Use this as the canonical limitations reference.
 | 105 | Audit mode (A) — parse-only, no auth | Coverage report with per-tier formula classification |
 | 106 | Migrate mode (M) — full conversion + import | Full pipeline Steps 1–11 |
 | 107 | Multi-file audit | Directory scanning, per-file + combined summary |
+| 113 | CLI formula translation pipeline (`ts tableau translate-formulas`) | 14-step deterministic transform; cross-reference resolution via dependency DAG |
+| 114 | Two-phase model import | Phase 1: base model (no formulas) → guaranteed success; Phase 2: add formulas with iterative error recovery |
+| 115 | Join confirmation flow (Step 3.6) | Detected joins presented for confirmation; missing joins (sqlproxy) suggested from shared column names |
+| 116 | Cross-reference depth reporting (audit) | Level 0/1/2+/circular counts; effective migration coverage vs syntax-level coverage |
 
 ---
 
