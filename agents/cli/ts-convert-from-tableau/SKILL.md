@@ -576,8 +576,19 @@ merged unless a `<datasource-relationship>` explicitly links them. See Step 5b
 
 **Datasource type detection:**
 - If the datasource contains `<connection class="sqlproxy">`, it is a **Published
-  Datasource** (hosted on Tableau Server). The table name resolves to
-  `connection.get('dbname')`, not the literal `[sqlproxy]`.
+  Datasource** (hosted on Tableau Server). **Do NOT bind to `connection.get('dbname')`** —
+  for a sqlproxy that value is the published-datasource *contentUrl*, not the warehouse
+  table, so binding to it fails import with "table does not exist" (BL-027). Resolve it from
+  the server instead: run
+  `ts tableau resolve-published --workbook {twb_path} --profile {tableau_profile}`, which
+  matches the published datasource via its `<repository-location>` id, downloads its `.tdsx`,
+  and returns the real `database` / `schema` / `db_table` + typed columns. Use that spec for
+  the table TML in Step 5.
+- If the datasource references a **Virtual Connection** (`<connection class="publishedConnection">`
+  with a `resourceId`), the same `ts tableau resolve-published` command resolves it via the
+  Virtual Connection REST API (clean `qualifiedName`, columns, `dbClass`, and RLS policy
+  count). Use the returned spec the same way. Neither reference can be resolved by the
+  file-only parse — the real model lives server-side.
 - If the datasource contains `<extract>`, **do not blindly skip it.** An extract is a
   local snapshot, but it almost always wraps an *underlying* connection that names a real
   table — a file source (`textscan`/CSV, `excel-direct`), a database, etc. What matters
@@ -3539,6 +3550,7 @@ in-product **Migration Summary** tab (Step 10g) and any `MIGRATION_LIMITATIONS.m
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.17.0 | 2026-06-27 | **Published-datasource & Virtual-Connection resolution (Step 3b).** Replace the BL-027 mis-binding — a `sqlproxy` datasource was bound to `connection.dbname`, which is the published-DS *contentUrl*, not the warehouse table, so import failed with "table does not exist" — with `ts tableau resolve-published` (ts-cli 0.17.0). For `sqlproxy`, match the published datasource via its `<repository-location>` id, download its `.tdsx`, and parse the real `database`/`schema`/`db_table` + typed columns. For `publishedConnection` (**Virtual Connections — previously unhandled**), resolve via the Virtual Connection REST API (`qualifiedName`, columns, `dbClass`, RLS policy count). Coverage-matrix #9 corrected + #9a added. Verified live on a Databricks-backed published DS and Virtual Connection (Table + Model import + Answer render). |
 | 1.16.0 | 2026-06-27 | **Close the audit-vs-migration gap: CLI formula translation pipeline, two-phase import, join confirmation, cross-reference depth reporting.** (1) New Step 5b CLI reference: `ts tableau translate-formulas` (ts-cli 0.16.0) — deterministic 14-step Tableau→ThoughtSpot formula translation with dependency DAG, cross-reference resolution via inlining, column scoping, parameter conflict detection. Replaces ad-hoc LLM translation. (2) Step 7 two-phase model import: Phase 1 imports base model (tables, columns, joins, params — no formulas) for guaranteed success; Phase 2 adds formulas with GUID-pinned update and iterative error recovery (up to 5 cycles). One bad formula no longer blocks the entire import. (3) Step 3.6 join confirmation: detected joins presented for user confirmation; missing joins (common with published datasources/sqlproxy) suggested from shared column names with explicit D/S/P prompt — never silently added. (4) Step A3/A4 cross-reference depth reporting: Level 0/1/2+/circular counts plus "effective migration coverage" that distinguishes syntax-level translatability from what actually migrates after dependency resolution. Coverage matrix entries #113–#116. |
 | 1.15.0 | 2026-06-17 | Step 4.5 connection step now offers **E — use existing / C — create a new connection** (Snowflake-source only, key-pair auth via `ts connections create`). Adds the "Database does not exist in connection → role can't see it → create one" guidance and a credential-handling guardrail (private key by file path only; never pasted into chat). Non-Snowflake sources / password / OAuth remain out of scope → create in the UI and use the E path. Mirrors the connection-step change in ts-convert-from-snowflake-sv. |
 | 1.14.2 | 2026-06-17 | Replace the hand-written pre-import grep gate with `ts tml lint` (parser-based; now also catches **I8** duplicate `column_id`). From the full audit sweep (codification, angle 11). |

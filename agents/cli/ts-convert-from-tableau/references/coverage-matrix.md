@@ -19,7 +19,8 @@ Use this as the canonical limitations reference.
 | 6 | Column data types (string, integer, real, boolean, date, datetime) | VARCHAR, INT64, DOUBLE, BOOL, DATE, DATETIME | |
 | 7 | `db_column_name` from `remote-name` metadata | Physical column name in table TML | |
 | 8 | Connection binding by name | `connection.name` on every table/sql_view TML | Never GUID (invariant I6) |
-| 9 | Published datasource (`sqlproxy` connection) | Resolved to `dbname` from connection | |
+| 9 | Published datasource (`sqlproxy` connection) | Table TML over the **real** warehouse object | Resolve via `ts tableau resolve-published` — match by `<repository-location>` id → download the `.tdsx`. The sqlproxy `dbname` is the published-DS *contentUrl*, NOT the table; binding to it fails import (BL-027) |
+| 9a | Virtual Connection (`publishedConnection` + `resourceId`) | Table TML over the real warehouse object | Resolve via `ts tableau resolve-published` (Virtual Connection REST API): `qualifiedName` + columns + `dbClass` + RLS policy count |
 | 10 | Extract datasources | Resolved to underlying live source | Skipped if no source resolves |
 | 11 | `.twbx` archive extraction | Unzip to access inner `.twb` | |
 | 12 | Topological sort of calculated fields | Formulas emitted in dependency order | Level 0 first; `ts tableau translate-formulas` resolves cross-references via DAG + inlining |
