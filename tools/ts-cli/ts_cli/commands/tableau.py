@@ -601,3 +601,68 @@ def translate_formulas_cmd(
     )
 
     print(json.dumps(result["stats"]))
+
+
+@app.command("resolve-published")
+def resolve_published_cmd(
+    workbook: str = typer.Option(..., "--workbook", "-w",
+                                 help="Path to the consuming .twb/.twbx"),
+    profile: Optional[str] = _profile_option,
+    output_dir: str = typer.Option(".", "--output-dir", "-o",
+                                    help="Directory for downloaded .tdsx files"),
+) -> None:
+    """Resolve a consuming workbook's published-datasource / Virtual-Connection
+    references into TML-ready source specs (db / schema / table + typed columns).
+
+    sqlproxy  -> match the published datasource via its repository-location id and
+                 download its .tdsx (the workbook's sqlproxy dbname is the published-DS
+                 contentUrl, NOT the warehouse table).
+    publishedConnection -> resolve the Virtual Connection via the REST API
+                 (clean qualifiedName + columns + dbClass + RLS policy count).
+    """
+    from ts_cli.tableau_resolve import (
+        find_references, parse_tds_structure, parse_vc,
+        read_workbook_xml, read_tds_xml, caption_fallback,
+    )
+
+    twb = read_workbook_xml(Path(workbook))
+    if twb is None:
+        raise SystemExit(f"Could not read a .twb from {workbook}")
+    refs = find_references(twb)
+    out: dict = {"workbook": Path(workbook).name, "references": refs, "resolved": []}
+    if not refs:
+        print(json.dumps(out, indent=2))
+        return
+
+    p = _resolve_tableau_profile(profile)
+    client = TableauClient(p)
+    client.signin()
+    all_ds = client.datasources(None)
+    base = client._base_path()
+
+    for r in refs:
+        spec: dict = {}
+        if r["kind"] == "published_datasource":
+            rid = r.get("repo_id")
+            match = next((d for d in all_ds
+                          if d.get("contentUrl") == rid or d.get("name") == rid
+                          or d.get("name") == r.get("caption")), None)
+            if match:
+                dl = client.download_datasource(match["id"], Path(output_dir))
+                tds_files = [f for f in dl.get("files", []) if f.endswith(".tds")]
+                tds_text = (read_tds_xml(Path(dl["extracted_dir"]) / tds_files[0])
+                            if tds_files else None)
+                spec = parse_tds_structure(tds_text) if tds_text else {}
+                spec["resolved_via"] = f"download published datasource '{match['name']}'"
+            else:
+                spec = {"resolved_via": "caption fallback (Layer 1)",
+                        "qualified": caption_fallback(r.get("caption")), "tables": []}
+        elif r["kind"] == "virtual_connection":
+            rid = r["resource_id"]
+            detail = client.request("GET", f"{base}/virtualconnections/{rid}").json()
+            conns = client.request("GET", f"{base}/virtualconnections/{rid}/connections").json()
+            spec = parse_vc(detail, conns)
+            spec["resolved_via"] = f"virtual connection '{r.get('resource_name')}'"
+        out["resolved"].append({"ref": r, "spec": spec})
+
+    print(json.dumps(out, indent=2))

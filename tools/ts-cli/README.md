@@ -911,6 +911,33 @@ Stdout prints the stats summary JSON; the full result goes to `--output`.
 
 ---
 
+### `ts tableau resolve-published <workbook>`
+
+Resolve a consuming workbook's centralized-data references into TML-ready source specs.
+The base convert flow handles only a directly-embedded connection; this resolves the two
+references it otherwise mis-binds or ignores:
+
+- **`sqlproxy`** (Published Data Source) — the workbook's sqlproxy `dbname` is the
+  published-DS *contentUrl*, not the warehouse table. Matches the datasource via its
+  `repository-location` id, downloads its `.tdsx`, and parses the real `db.schema.table`
+  + typed columns.
+- **`publishedConnection`** (Virtual Connection) — resolves via the Virtual Connection
+  REST API (clean `qualifiedName`, columns, `dbClass`, and RLS policy count).
+
+```bash
+ts tableau resolve-published --workbook path/to/workbook.twbx --profile "Tableau Cloud Prod"
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--workbook`, `-w` | (required) | Path to the consuming `.twb`/`.twbx` |
+| `--profile`, `-p` | first profile | Tableau profile name |
+| `--output-dir`, `-o` | `.` | Directory for downloaded `.tdsx` files |
+
+Outputs JSON: the references found and, per reference, a resolved spec
+(`db_class`, `server`, `tables[]` with `database`/`schema`/`qualified`/`columns[]`).
+Feed the spec into the table-TML generation step.
+
 ## Piping and scripting
 
 All commands write JSON to stdout, making them easy to pipe into `jq` or Python:
