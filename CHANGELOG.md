@@ -6,6 +6,8 @@ Skill-level changes are tracked in each skill's own `## Changelog` section.
 ---
 
 ## 2026-06-27
+- feat: add `ts tableau resolve-published` CLI command (ts-cli 0.17.0) — resolve a consuming workbook's published-datasource (`sqlproxy`) and Virtual-Connection (`publishedConnection`) references into TML-ready source specs; `sqlproxy` downloads the published DS via its `repository-location`, Virtual Connections resolve via the REST API. Pure-function resolver in `tableau_resolve.py`
+- chore: bump ts-cli to v0.17.0
 - feat: add `ts-load-source-data` skill v1.0.0 — load CSV data into Snowflake (or generate synthetic data from schema definitions) for ThoughtSpot to connect to; adds `ts-load-*` naming family to skill-naming.md and check_skill_naming.py
 - feat: add `ts tableau translate-formulas` CLI command (ts-cli 0.16.0) — deterministic 14-step Tableau → ThoughtSpot formula translation pipeline with dependency DAG, cross-reference resolution, column scoping, parameter conflict detection. Pure-function engine in `tableau_translate.py`
 - chore: bump ts-cli to v0.16.0
