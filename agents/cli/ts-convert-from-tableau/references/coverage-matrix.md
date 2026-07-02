@@ -1,3 +1,5 @@
+<!-- currency: tableau — 2026-07 (matrix refresh) -->
+
 # Coverage Matrix: Tableau Workbook → ThoughtSpot Model + Liveboard
 
 What the `ts-convert-from-tableau` skill maps and what it does not.
@@ -40,21 +42,21 @@ Use this as the canonical limitations reference.
 | 24 | `DATEDIFF` (all units) | `diff_days`/`diff_months`/`diff_years`/`diff_time` | Args reversed vs Tableau. `day/month/year/hour/minute/week` supported; any other unit (e.g. `quarter`) rejected with reason at translate time (v0.26.0) |
 | 25 | `DATETRUNC` | `start_of_month/quarter/week/year`; `day` → `date()` | `hour`/`minute`/`second` (and any other unit not in the map) rejected with reason at translate time (v0.26.0) |
 | 26 | `DATEADD` | `add_days/add_months/add_years` | Only `day/month/year` supported; other units (e.g. `week`) rejected with reason at translate time (v0.26.0) |
-| 27 | `DATEPART` (all units) | Per-unit functions | `month`→`month_number`, `quarter`→`quarter_number`, `week`→`week_number_of_year`, `dayofyear`→`day_number_of_year`, `weekday`→`day_of_week`. Units outside this map rejected with reason at translate time (v0.26.0) |
+| 27 | `DATEPART` (all units) | Per-unit functions | `month`→`month_number`, `year`→`year`, `day`→`day`, `quarter`→`quarter_number`, `week`→`week_number_of_year`, `dayofyear`→`day_number_of_year`, `weekday`→`day_of_week`, `hour`→`hour_of_day`. Units outside this map rejected with reason at translate time (v0.26.0) |
 | 28 | `DATENAME('month', d)` | `month ( [date] )` | Returns name, not number. Only `month` supported — other units rejected with reason at translate time (v0.26.0) |
 | 29 | `DATEPARSE(format, s)` | `to_date ( s , format )` | CLI-translated (v0.26.0); args flipped vs Tableau |
 | 30 | `TODAY`/`NOW`/`DATE`/`YEAR`/`MONTH`/`DAY` | `today`/`now`/`date`/`year`/`month_number`/`day` | |
 | 31 | `ABS`/`ROUND`/`CEILING`/`FLOOR`/`SQRT`/`POWER`/`LOG`/`LN`/`EXP` | `abs`/`round`/`ceil`/`floor`/`sqrt`/`pow`/`log10`/`ln`/`exp` | |
-| 32 | `SIN/COS/TAN` | Radians-to-degrees conversion applied | CLI-translated (v0.26.0). Inverse trig (`ACOS`/`ASIN`/`ATAN`) is NOT implemented — passes through untranslated and is not caught by the fail-loud validator |
+| 32 | `SIN/COS/TAN` | Radians-to-degrees conversion applied | CLI-translated (v0.26.0). Inverse trig (`ACOS`/`ASIN`/`ATAN`) and `COT` are NOT implemented as of v0.26.0 — all four pass through untranslated and are not caught by the fail-loud validator (a silent gap distinct from the `_UNMAPPED_FUNCTIONS` reject-at-translate-time list below). `ACOS`/`ASIN`/`ATAN` are translatable in principle: ThoughtSpot's inverse trig functions return degrees where Tableau's return radians, so a `* pi/180` composite applies — the same conversion family as the shipped SIN/COS/TAN handling. `COT` has no direct ThoughtSpot function and would need a `1/tan(...)` composite. Tracked in BL-072 |
 | 33 | `PI()/RADIANS()/DEGREES()` | Literal composites | CLI-translated (v0.26.0); no native equivalent |
 | 34 | `INT(x)` | `if ( x >= 0 ) then floor ( x ) else ceil ( x )` | Partial; truncate-toward-zero |
 | 35 | `FLOAT(x)/STR(x)` | `to_double(x)/to_string(x)` | |
 | 36 | `DATETIME(expr)` cast | `sql_date_time_op ( "TO_TIMESTAMP({0})" , [col] )` | Pass-through |
 | 37 | String concat (`+` on strings) | `concat ( a , b )` | TS `+` is numeric-only |
 | 38 | `SIGN(x)/SQUARE(x)` | `if/then` composite / `pow(x,2)` | CLI-translated (v0.26.0) |
-| 39 | `MIN/MAX` (scalar, 2-arg) | `if ( a < b ) then a else b` / vice versa | |
+| 39 | `MIN/MAX` (scalar, 2-arg) | `least ( a , b )` / `greatest ( a , b )` | CLI-translated (since v0.17.0; scan-abort bug fixed v0.26.0); 2-arg form only — 1-arg is the aggregate `min()`/`max()` |
 | 40 | Division by zero | `safe_divide()` or `if ( b = 0 ) then null else a/b` | |
-| 108 | `ISMEMBEROF("group")` | `ts_groups = 'group'` | Multi-value list membership handled natively with `=` |
+| 108 | `ISMEMBEROF("group")` | `ts_groups = 'group'` | Multi-value list membership handled natively with `=`. Documented skill-level mapping only — the CLI does NOT translate it as of v0.26.0: `ISMEMBEROF(...)` passes through untranslated and is not caught by the fail-loud validator (not in `_UNMAPPED_FUNCTIONS`), the same silent-gap class as the inverse trig note on #32. CLI implementation tracked in BL-071 |
 
 ### Formula Translation — Aggregates
 
@@ -86,14 +88,14 @@ Use this as the canonical limitations reference.
 | # | Tableau Function(s) | ThoughtSpot Equivalent | Notes |
 |---|---|---|---|
 | 55 | `RUNNING_SUM/AVG/MAX/MIN` | `cumulative_sum/average/max/min ( [t::col] , [sort_attr] )` | |
-| 56 | `RUNNING_COUNT` | `cumulative_sum ( 1 , [sort_attr] )` | Answer-level only; approximate; Not verified |
+| 56 | `RUNNING_COUNT` | `cumulative_sum ( 1 , [sort_attr] )` | Answer-level only; approximate; Not verified as of 2026-07-03 |
 
 ### Formula Translation — Moving / Window
 
 | # | Tableau Function(s) | ThoughtSpot Equivalent | Notes |
 |---|---|---|---|
 | 57 | `WINDOW_SUM/AVG/MAX/MIN` | `moving_sum/average/max/min ( [t::col] , start , end , [sort_attr] )` | |
-| 58 | `WINDOW_STDEV/WINDOW_COUNT` (sliding window) | `moving_stdev/moving_count` | Same pattern as #57 |
+| 58 | `WINDOW_STDEV/WINDOW_COUNT` (sliding window) | `sql_*_aggregate_op("STDDEV_POP/COUNT(...) OVER (...)")` | Pass-through — no native `moving_stdev`/`moving_count` (`moving_*` is sum/average/max/min only, per `tableau-formula-translation.md`). If used as a plain aggregate over the whole partition (not a sliding window), use `stddev()`/`count()` instead |
 | 59 | `WINDOW_PERCENTILE/WINDOW_MEDIAN` (sliding window) | `sql_*_aggregate_op("PERCENTILE_CONT/MEDIAN(...) OVER (...)")` | Pass-through |
 
 ### Formula Translation — Rank
@@ -160,8 +162,8 @@ Use this as the canonical limitations reference.
 | # | Tableau Construct | ThoughtSpot Equivalent | Notes |
 |---|---|---|---|
 | 93 | Dashboard zones → layout | 12-column responsive grid | Band-based coordinate mapping |
-| 94 | Chart zones → visualization tiles | Answer TML with `search_query`, chart type, axis configs | Partial (#5) |
-| 95 | Text/title zones | Note tiles (`note_tile.html_parsed_string`) | Needs verification (#7) |
+| 94 | Chart zones → visualization tiles | Answer TML with `search_query`, chart type, axis configs | |
+| 95 | Text/title zones | Note tiles (`note_tile.html_parsed_string`) | |
 | 96 | Mark types (bar/line/circle/pie/area/text) | BAR/LINE/SCATTER/PIE/AREA/TABLE | |
 | 97 | Measure Names/Values KPI blocks | One KPI tile per measure with sparkline | `client_state_v2` rendering |
 | 98 | Filter zones | Liveboard `filters[]` | |
@@ -171,6 +173,7 @@ Use this as the canonical limitations reference.
 | 102 | Sections/groups | Inferred `groups[]` + `group_layouts[]` | From viz relationships |
 | 103 | Formula coverage answers | Every uncovered formula gets a testable answer | |
 | 104 | Migration Summary tab | Note tile tab | Documents items migrated, decisions, partial/omitted |
+| 117 | Multiple dashboards → single liveboard with tabs (Step 8 option **T**) | `layout.tabs[]` — one tab per dashboard + the Migration Summary tab | Implemented v1.5.20–v1.5.24; verified against `thoughtspot-liveboard-tml.md` schema (`layout.tabs[]`: `name`, `description`, `tiles[]`) |
 
 ### Operational Modes
 
@@ -221,14 +224,14 @@ through untranslated.
 
 | # | Tableau Construct | Limitation | Workaround |
 |---|---|---|---|
-| L8 | Set actions (`<action>` on a set) | No interactive set membership changes in TS | Omit + log |
+| L8 | Set actions (`<action>` on a set) | No interactive set membership changes in TS | Omit + log. See L26 for the other `<action>` types (filter/URL/parameter) |
 | L9 | SQL pass-through functions the CLI emits (RANK partitioned, DENSE_RANK, SIZE, UPPER, LOWER) | Enabled by default — admin would only need to check if explicitly turned off in Admin > Search & SpotIQ | Flagged with PT1 marker for review. `PROPER`/`ASCII`/`CHAR`/`REGEXP_*`/`FINDNTH` are a distinct case — the CLI does not emit a pass-through for them at all; see "Rejected at Translate Time" above |
 | L10 | Geospatial formulas (`MAKEPOINT`, `MAKELINE`, `DISTANCE`, `BUFFER`, `AREA`) | No spatial data types or constructors | Decompose `MAKEPOINT` lat/lon to individual ATTRIBUTE columns; omit spatial formula + log |
 | L11 | Non-warehouse sources (`google-sheets`, `ogrdirect`, `webdata-direct`, `CustomMapbox`) | No ThoughtSpot connection possible | Skip datasource; data must be loaded into a warehouse first |
-| L12 | Liveboard layout coordinate system | Exact ThoughtSpot grid units not fully verified | Open-items #6 |
-| L13 | Inline answer TML in liveboard | Nested `answer:` blocks inside `visualizations[]` not confirmed | Open-items #5 |
-| L14 | NOTE_TILE structure | Exact TML structure not fully verified | Open-items #7 |
-| L15 | Multi-dashboard → tabs | Liveboard tabs TML structure not implemented | Open-items #9 — deferred to v1.1.0; creates separate liveboards |
+| L24 | Tableau hierarchies (`<drill-paths>` in TWB XML) | No TML construct exists to encode a curated drill order (e.g. Region → State → City). Near-universal in production workbooks | Omit + log in the migration report's Limitations section. ThoughtSpot's own ad-hoc drill-down still works without a declared hierarchy, but the authored order/structure from `<drill-paths>` is not preserved. See BL-072 |
+| L25 | Dimension value aliases (`<aliases>` in TWB XML) | No TML construct for display-value remapping (e.g. source value `"US"` displayed as `"United States"`) | Omit + log. A `CASE`-style `if/else if` formula reproducing the alias mapping is conceivable but not auto-generated by the CLI today. See BL-072 |
+| L26 | Dashboard filter actions / URL actions / parameter actions (`<action>`, non-set) | No interactive cross-viz filter triggering, URL navigation, or parameter-set-on-click in TS Liveboards. Only set actions were previously documented (L8) — filter/URL/parameter actions were undocumented until now | Omit + log |
+| L27 | Fiscal-year start setting (`fiscal_year_start` datasource attribute) | No TML construct on the Model carries a non-calendar fiscal year start. ThoughtSpot date functions accept an optional `fiscal` parameter, but nothing populates it from this attribute today | Omit + log. `ts-object-model-coach`'s `time_defaults.fiscal_year_start` field (`model-instructions-schema.md`) is a plausible landing spot for a future coaching-pass integration, but this skill does not wire it up. See BL-072 |
 
 ### LOW — Cosmetic or edge-case
 
@@ -263,3 +266,9 @@ is the last resort (see the translation priority order in `tableau-formula-trans
 as pass-through candidates but the CLI does not implement them (v0.26.0) — it rejects the
 formula with a reason instead of emitting the pass-through, so a manual `sql_string_op`/
 `sql_bool_op`/`sql_int_op` formula (per that reference) is required.
+
+**L24–L27** are structural/metadata gaps documented here for the first time — hierarchies,
+value aliases, non-set dashboard actions, and fiscal-year start were previously absent
+from this matrix entirely despite being common in production Tableau workbooks. None of
+them break an import; all are logged in the migration report's Limitations section and
+left for manual follow-up. See BL-072.
