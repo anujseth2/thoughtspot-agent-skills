@@ -55,6 +55,7 @@ def _build_function_map() -> list[tuple[re.Pattern, Any]]:
         (r"\bUPPER\s*\(", "_UPPER_HANDLER"),
         (r"\bLOWER\s*\(", "_LOWER_HANDLER"),
         (r"\bSTARTSWITH\s*\(", "_STARTSWITH_HANDLER"),
+        (r"\bENDSWITH\s*\(", "_ENDSWITH_HANDLER"),
 
         # Math
         (r"\bABS\s*\(", "abs ( "),
@@ -67,6 +68,7 @@ def _build_function_map() -> list[tuple[re.Pattern, Any]]:
         (r"\bSQRT\s*\(", "sqrt ( "),
         (r"\bEXP\s*\(", "exp ( "),
         (r"\bSQUARE\s*\(", "_SQUARE_HANDLER"),
+        (r"\bPI\s*\(\s*\)", "3.14159265358979"),
 
         # Type conversion
         (r"\bFLOAT\s*\(", "to_double ( "),
@@ -101,7 +103,62 @@ def map_functions(expr: str) -> str:
     # ZN(x) → ifnull ( x , 0 )
     result = _convert_zn(result)
 
+    for fn, render in _ARG_HANDLERS:
+        result = _apply_arg_handler(result, fn, render)
+
     return result
+
+
+def _apply_arg_handler(expr: str, fn: str, render) -> str:
+    """Rewrite fn(args...) calls using render([stripped_args]) → replacement or None to skip."""
+    pat = re.compile(rf"\b{fn}\s*\(", re.IGNORECASE)
+    result = expr
+    search_start = 0
+    safety = 0
+    while safety < 50:
+        m = pat.search(result, search_start)
+        if not m:
+            break
+        safety += 1
+        extracted = _extract_function_args(result, m.end() - 1)
+        if not extracted:
+            search_start = m.end()
+            continue
+        args, end_pos = extracted
+        # Translate same-function calls nested inside the args first — the
+        # cursor skips past the replacement so they would never be revisited,
+        # and rescanning is unsafe because the UPPER/LOWER templates quote
+        # their own function name.
+        replacement = render([_apply_arg_handler(a.strip(), fn, render) for a in args])
+        if replacement is None:
+            search_start = m.end()
+            continue
+        result = result[:m.start()] + replacement + result[end_pos:]
+        search_start = m.start() + len(replacement)
+    return result
+
+
+_ARG_HANDLERS: list[tuple[str, Any]] = [
+    ("LEFT", lambda a: f"substr ( {a[0]} , 0 , {a[1]} )" if len(a) == 2 else None),
+    ("RIGHT", lambda a: f"substr ( {a[0]} , strlen ( {a[0]} ) - {a[1]} , {a[1]} )" if len(a) == 2 else None),
+    ("MID", lambda a: f"substr ( {a[0]} , {a[1]} - 1 , {a[2]} )" if len(a) == 3 else None),
+    ("UPPER", lambda a: f'sql_string_op ( "UPPER({{0}})" , {a[0]} )' if len(a) == 1 else None),
+    ("LOWER", lambda a: f'sql_string_op ( "LOWER({{0}})" , {a[0]} )' if len(a) == 1 else None),
+    ("STARTSWITH", lambda a: f"( strpos ( {a[0]} , {a[1]} ) = 1 )" if len(a) == 2 else None),
+    ("ENDSWITH", lambda a: (
+        f"( substr ( {a[0]} , strlen ( {a[0]} ) - strlen ( {a[1]} ) , strlen ( {a[1]} ) ) = {a[1]} )"
+        if len(a) == 2 else None)),
+    ("SQUARE", lambda a: f"pow ( {a[0]} , 2 )" if len(a) == 1 else None),
+    ("SIGN", lambda a: (
+        f"( if ( {a[0]} > 0 ) then 1 else if ( {a[0]} < 0 ) then -1 else 0 )"
+        if len(a) == 1 else None)),
+    ("SIN", lambda a: f"sin ( {a[0]} * 180 / 3.14159265358979 )" if len(a) == 1 else None),
+    ("COS", lambda a: f"cos ( {a[0]} * 180 / 3.14159265358979 )" if len(a) == 1 else None),
+    ("TAN", lambda a: f"tan ( {a[0]} * 180 / 3.14159265358979 )" if len(a) == 1 else None),
+    ("RADIANS", lambda a: f"( {a[0]} * 3.14159265358979 / 180 )" if len(a) == 1 else None),
+    ("DEGREES", lambda a: f"( {a[0]} * 180 / 3.14159265358979 )" if len(a) == 1 else None),
+    ("DATEPARSE", lambda a: f"to_date ( {a[1]} , {a[0]} )" if len(a) == 2 else None),
+]
 
 
 def _convert_zn(expr: str) -> str:
@@ -197,37 +254,51 @@ def map_date_functions(expr: str) -> str:
 def _convert_datetrunc(expr: str) -> str:
     _PAT = re.compile(r"\bDATETRUNC\s*\(", re.IGNORECASE)
     result = expr
+    search_start = 0
     safety = 0
     while safety < 20:
-        m = _PAT.search(result)
+        m = _PAT.search(result, search_start)
         if not m:
             break
         safety += 1
         extracted = _extract_function_args(result, m.end() - 1)
         if not extracted:
-            break
+            search_start = m.end()
+            continue
         args, end_pos = extracted
         if len(args) >= 2:
             unit = args[0].strip().strip("'\"").lower()
             date_expr = args[1].strip()
-            ts_func = _DATETRUNC_UNIT_MAP.get(unit, f"start_of_{unit}")
+            ts_func = _DATETRUNC_UNIT_MAP.get(unit)
+            if ts_func is None:
+                # Unknown unit — no ThoughtSpot start_of_* function exists.
+                # Leave the original DATETRUNC(...) text in place rather than
+                # fabricate a nonexistent function name; validate_output
+                # flags any surviving DATETRUNC call as unmapped.
+                search_start = end_pos
+                continue
             replacement = f"{ts_func} ( {date_expr} )"
             result = result[:m.start()] + replacement + result[end_pos:]
+            search_start = m.start() + len(replacement)
+        else:
+            search_start = m.end()
     return result
 
 
 def _convert_datediff(expr: str) -> str:
     _PAT = re.compile(r"\bDATEDIFF\s*\(", re.IGNORECASE)
     result = expr
+    search_start = 0
     safety = 0
     while safety < 20:
-        m = _PAT.search(result)
+        m = _PAT.search(result, search_start)
         if not m:
             break
         safety += 1
         extracted = _extract_function_args(result, m.end() - 1)
         if not extracted:
-            break
+            search_start = m.end()
+            continue
         args, end_pos = extracted
         if len(args) >= 3:
             unit = args[0].strip().strip("'\"").lower()
@@ -244,69 +315,103 @@ def _convert_datediff(expr: str) -> str:
             elif unit == "week":
                 replacement = f"diff_days ( {end_date} , {start_date} ) / 7"
             else:
-                replacement = f"diff_{unit}s ( {end_date} , {start_date} )"
+                # Unknown unit — no ThoughtSpot diff function exists. Leave
+                # the original DATEDIFF(...) text in place rather than
+                # fabricate a nonexistent function name; validate_output
+                # flags any surviving DATEDIFF call as unmapped.
+                search_start = end_pos
+                continue
             result = result[:m.start()] + replacement + result[end_pos:]
+            search_start = m.start() + len(replacement)
+        else:
+            search_start = m.end()
     return result
 
 
 def _convert_dateadd(expr: str) -> str:
     _PAT = re.compile(r"\bDATEADD\s*\(", re.IGNORECASE)
     result = expr
+    search_start = 0
     safety = 0
     while safety < 20:
-        m = _PAT.search(result)
+        m = _PAT.search(result, search_start)
         if not m:
             break
         safety += 1
         extracted = _extract_function_args(result, m.end() - 1)
         if not extracted:
-            break
+            search_start = m.end()
+            continue
         args, end_pos = extracted
         if len(args) >= 3:
             unit = args[0].strip().strip("'\"").lower()
             n = args[1].strip()
             date_expr = args[2].strip()
-            ts_func = _DATEADD_UNIT_MAP.get(unit, f"add_{unit}s")
+            ts_func = _DATEADD_UNIT_MAP.get(unit)
+            if ts_func is None:
+                # Unknown unit — no ThoughtSpot add function exists. Leave
+                # the original DATEADD(...) text in place rather than
+                # fabricate a nonexistent function name; validate_output
+                # flags any surviving DATEADD call as unmapped.
+                search_start = end_pos
+                continue
             # Note: arg order changes — TS takes (date, n)
             replacement = f"{ts_func} ( {date_expr} , {n} )"
             result = result[:m.start()] + replacement + result[end_pos:]
+            search_start = m.start() + len(replacement)
+        else:
+            search_start = m.end()
     return result
 
 
 def _convert_datepart(expr: str) -> str:
     _PAT = re.compile(r"\bDATEPART\s*\(", re.IGNORECASE)
     result = expr
+    search_start = 0
     safety = 0
     while safety < 20:
-        m = _PAT.search(result)
+        m = _PAT.search(result, search_start)
         if not m:
             break
         safety += 1
         extracted = _extract_function_args(result, m.end() - 1)
         if not extracted:
-            break
+            search_start = m.end()
+            continue
         args, end_pos = extracted
         if len(args) >= 2:
             unit = args[0].strip().strip("'\"").lower()
             date_expr = args[1].strip()
-            ts_func = _DATEPART_UNIT_MAP.get(unit, unit)
+            ts_func = _DATEPART_UNIT_MAP.get(unit)
+            if ts_func is None:
+                # Unknown unit — no ThoughtSpot extractor exists. Leave the
+                # original DATEPART(...) text in place rather than fabricate
+                # a nonexistent function name; validate_output flags any
+                # surviving DATEPART call as an unmapped function.
+                search_start = end_pos
+                continue
             replacement = f"{ts_func} ( {date_expr} )"
             result = result[:m.start()] + replacement + result[end_pos:]
+            search_start = m.start() + len(replacement)
+        else:
+            search_start = m.end()
     return result
 
 
 def _convert_datename(expr: str) -> str:
     _PAT = re.compile(r"\bDATENAME\s*\(", re.IGNORECASE)
     result = expr
+    search_start = 0
     safety = 0
     while safety < 20:
-        m = _PAT.search(result)
+        m = _PAT.search(result, search_start)
         if not m:
             break
         safety += 1
         extracted = _extract_function_args(result, m.end() - 1)
         if not extracted:
-            break
+            search_start = m.end()
+            continue
         args, end_pos = extracted
         if len(args) >= 2:
             unit = args[0].strip().strip("'\"").lower()
@@ -314,6 +419,14 @@ def _convert_datename(expr: str) -> str:
             if unit == "month":
                 replacement = f"month ( {date_expr} )"
             else:
-                replacement = f"{unit} ( {date_expr} )"
+                # Unknown unit — no ThoughtSpot extractor exists. Leave the
+                # original DATENAME(...) text in place rather than fabricate
+                # a nonexistent function name; validate_output flags any
+                # surviving DATENAME call as an unmapped function.
+                search_start = end_pos
+                continue
             result = result[:m.start()] + replacement + result[end_pos:]
+            search_start = m.start() + len(replacement)
+        else:
+            search_start = m.end()
     return result

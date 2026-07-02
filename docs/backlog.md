@@ -1830,6 +1830,17 @@ importing from the same entry points.
   return annotation says `tuple[list[str], list[dict]]` but the function returns
   `(kept: list[dict], dropped: list[str])` — docstring is correct, annotation reversed.
   Fix on next touch (PR 2 of the plan touches this area).
+- Quote-blindness (dated 2026-07-03): the whole map_functions driver — blanket regexes,
+  _apply_arg_handler, and validate_output's unmapped-function scan — matches function
+  tokens inside string literals. Pre-existing class, probe-proven vs pre-split code; rare
+  in real formulas. Fix would need a quote-aware scanner in ts_cli/tableau/parsing.py.
+- String-concat operand grammar (dated 2026-07-03, final-review finding):
+  convert_string_concat's operand pattern doesn't accept function calls, so e.g.
+  LEFT([a],2) + '-' + [b] on a dimension emerges half-converted with a surviving string +
+  and zero validation errors — the mapping doc's own worked example STR(ROUND(x,2)) + '%'
+  reproduces it. Pre-existing (identical exposure pre-v0.26.0). Candidate fixes: extend
+  the operand grammar to function calls, or a validate_output rule flagging + adjacent to
+  a quoted string literal.
 
 ---
 
