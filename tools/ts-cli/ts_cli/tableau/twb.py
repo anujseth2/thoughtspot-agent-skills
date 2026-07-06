@@ -165,7 +165,8 @@ def parse_twb(twb_path: str | Path) -> dict:
             continue
 
         tables = _extract_tables(ds)
-        if not tables:
+        sql_views = _extract_sql_views(ds)
+        if not tables and not sql_views:
             continue
         seen_ds.add(ds_name)
 
@@ -177,6 +178,7 @@ def parse_twb(twb_path: str | Path) -> dict:
         datasources.append({
             "name": ds_name,
             "tables": tables,
+            "sql_views": sql_views,
             "columns": columns,
             "joins": joins,
             "calculated_fields": calcs,
@@ -309,6 +311,71 @@ def _extract_tables(ds: ET.Element) -> list[dict]:
             entry["alias_of"] = physical_name
         tables.append(entry)
     return tables
+
+
+# XML-encoding artifacts Tableau writes into Custom SQL text bodies.
+_SQL_XML_ARTIFACTS = (("<<", "<"), (">>", ">"), ("==", "="))
+
+
+def _extract_sql_views(ds: ET.Element) -> list[dict]:
+    """Extract Custom SQL relations (``<relation type='text'>``) as SQL View specs.
+
+    Tableau stores a Custom SQL query as a ``type='text'`` relation whose element
+    text is the raw SQL. Its output columns live in ``<metadata-record class='column'>``
+    entries whose ``parent-name`` matches the relation name. Returns one dict per
+    Custom SQL relation::
+
+        {"name", "sql_query", "columns": [{"name", "sql_output_column",
+                                            "column_type", "data_type"}]}
+
+    ``column_type`` (MEASURE/ATTRIBUTE) is enriched from the datasource ``<column>``
+    elements' ``role`` when a matching logical column is present.
+    """
+    # role/caption by logical (local) name, from non-calculated <column> elements
+    col_meta: dict[str, dict] = {}
+    for col in ds.findall("./column"):
+        if col.find("calculation") is not None:
+            continue
+        local = col.get("name", "").strip("[]")
+        if local:
+            col_meta[local] = {
+                "caption": col.get("caption", local),
+                "role": col.get("role", "dimension"),
+            }
+
+    views = []
+    seen_names: set[str] = set()
+    for rel in ds.findall(".//relation[@type='text']"):
+        name = rel.get("name", "")
+        raw = rel.text or ""
+        for artifact, repl in _SQL_XML_ARTIFACTS:
+            raw = raw.replace(artifact, repl)
+        sql_query = raw.strip()
+        if not name or not sql_query or name in seen_names:
+            continue
+        seen_names.add(name)
+
+        columns = []
+        seen_cols: set[str] = set()
+        for mr in ds.findall(".//metadata-record[@class='column']"):
+            if (mr.findtext("parent-name") or "") != f"[{name}]":
+                continue
+            remote = (mr.findtext("remote-name") or "").strip()
+            if not remote or remote in seen_cols:
+                continue
+            seen_cols.add(remote)
+            local = (mr.findtext("local-name") or "").strip("[]")
+            local_type = (mr.findtext("local-type") or "string").strip()
+            meta = col_meta.get(local, {})
+            role = meta.get("role", "dimension")
+            columns.append({
+                "name": meta.get("caption", local or remote),
+                "sql_output_column": remote,
+                "column_type": "MEASURE" if role == "measure" else "ATTRIBUTE",
+                "data_type": _tableau_type_to_ts(local_type),
+            })
+        views.append({"name": name, "sql_query": sql_query, "columns": columns})
+    return views
 
 
 def _extract_columns(ds: ET.Element, tables: list[dict]) -> list[dict]:

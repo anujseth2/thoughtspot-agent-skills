@@ -123,15 +123,24 @@ def build_model_tml(
     parameters: list[dict],
     translated_formulas: list[dict],
     formula_rename_map: dict[str, str] | None = None,
+    sql_views: list[dict] | None = None,
 ) -> dict:
     """Assemble a complete ThoughtSpot model TML from parsed + translated data.
 
     Returns a TML dict ready for YAML serialization and import.
     Parameters are included; formulas have formula_ prefix applied and
     double-aggregation fixed.
+
+    ``sql_views`` (from Custom SQL relations, see ``_extract_sql_views``) are
+    referenced in ``model_tables[]`` by name and their columns added to
+    ``model.columns[]``. They are NOT added to the connection-qualified ``tables:``
+    list — a SQL View is a separate query-backed object (its own ``sql_view`` TML,
+    imported before the model), not a physical warehouse table.
     """
     if formula_rename_map is None:
         formula_rename_map = {}
+    if sql_views is None:
+        sql_views = []
 
     formula_names = {f["name"] for f in translated_formulas}
     param_names = {p["name"] for p in parameters}
@@ -139,6 +148,11 @@ def build_model_tml(
     formula_exprs = {f["name"]: f["expr"] for f in translated_formulas}
 
     model_tables = _build_model_tables(tables, columns, joins)
+    for sv in sql_views:
+        model_tables.append({
+            "name": sv["name"],
+            "columns": [{"name": c["name"]} for c in sv.get("columns", [])],
+        })
 
     model_formulas = []
     for f in translated_formulas:
@@ -151,7 +165,27 @@ def build_model_tml(
             "expr": expr,
         })
 
-    model_columns = _build_model_columns(columns, tables, translated_formulas)
+    # A SQL View owns its output columns. For a Custom-SQL-backed datasource the
+    # datasource's <column> elements ARE those same columns, so emitting them as
+    # bare physical columns too would duplicate names (import-fatal). Drop physical
+    # columns a SQL View already provides.
+    physical_columns = columns
+    if sql_views:
+        sv_col_names = {c["name"] for sv in sql_views for c in sv.get("columns", [])}
+        physical_columns = [c for c in columns if c.get("name") not in sv_col_names]
+
+    model_columns = _build_model_columns(physical_columns, tables, translated_formulas)
+    for sv in sql_views:
+        for c in sv.get("columns", []):
+            col_type = c.get("column_type", "ATTRIBUTE")
+            entry = {
+                "name": c["name"],
+                "column_id": f"{sv['name']}::{c['name']}",
+                "properties": {"column_type": col_type},
+            }
+            if col_type == "MEASURE":
+                entry["properties"]["aggregation"] = "SUM"
+            model_columns.append(entry)
 
     model_params = _build_model_parameters(parameters)
 
@@ -172,6 +206,45 @@ def build_model_tml(
         }
     }
     return tml
+
+
+def build_sql_view_tml(
+    *,
+    name: str,
+    connection_name: str,
+    sql_query: str,
+    columns: list[dict],
+) -> dict:
+    """Assemble a SQL View TML dict from a Custom SQL relation spec.
+
+    ``columns`` entries follow the parse shape from ``_extract_sql_views``:
+    ``{name, sql_output_column, column_type, data_type}``. Emits the ``sql_view:``
+    structure (see agents/shared/schemas/thoughtspot-sql-view-tml.md): ``connection.name``
+    is required, ``sql_query`` holds the raw SQL, and each column carries
+    ``sql_output_column`` + ``properties.column_type`` (MEASURE columns also get an
+    aggregation). Returns a TML dict ready for YAML serialization and import.
+    """
+    sql_view_columns = []
+    for c in columns:
+        col_type = c.get("column_type", "ATTRIBUTE")
+        entry: dict[str, Any] = {
+            "name": c["name"],
+            "sql_output_column": c["sql_output_column"],
+            "data_type": c.get("data_type", "VARCHAR"),
+            "properties": {"column_type": col_type},
+        }
+        if col_type == "MEASURE":
+            entry["properties"]["aggregation"] = c.get("aggregation", "SUM")
+        sql_view_columns.append(entry)
+
+    return {
+        "sql_view": {
+            "name": name,
+            "connection": {"name": connection_name},
+            "sql_query": sql_query,
+            "sql_view_columns": sql_view_columns,
+        }
+    }
 
 
 def _build_model_tables(
@@ -494,7 +567,9 @@ def filter_unresolvable_formulas(
     that otherwise get peeled off one-per-cycle by the import-retry loop:
 
     - ``sqlproxy::`` table references (published datasource artifact)
-    - ``Custom SQL Query`` references (unmapped CSQ)
+    - Bare ``(Custom SQL Query N)`` refs (unmapped CSQ artifact). A QUALIFIED
+      ``[SQL View::col]`` ref is NOT dropped — Custom SQL is emitted as a SQL View,
+      so it resolves via the ``::``-in-``col_upper`` check when the column exists.
     - Bare column names that match physical columns but lack table qualifiers
     - Unresolvable bare references (not a column, formula, or parameter)
     - ``+`` string concatenation that wasn't converted to ``concat()``
@@ -543,7 +618,13 @@ def _formula_is_unresolvable(
     """True if a formula expr has a reference that won't resolve at import."""
     import re
     low = expr.lower()
-    if "sqlproxy::" in low or "custom sql query" in low:
+    # sqlproxy:: = published-datasource artifact (not resolvable here).
+    # NOTE: "custom sql query" is intentionally NOT blanket-dropped — Custom SQL is
+    # now emitted as a SQL View (build_sql_view_tml), so a QUALIFIED ref like
+    # [Custom SQL Query::VIEWS] resolves via the ::-in-col_upper check below when the
+    # SQL View column exists. A BARE Tableau CSQ ref (e.g. [COL (Custom SQL Query6)])
+    # still fails the bare-ref fallback and is dropped.
+    if "sqlproxy::" in low:
         return True
     # + between a string literal and a ref (unconverted string concat)
     if re.search(r"'\s*\+\s*\[", expr) or re.search(r"\]\s*\+\s*'", expr):
