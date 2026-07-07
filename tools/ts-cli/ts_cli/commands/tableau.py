@@ -645,6 +645,31 @@ def _merge_flow(
     return result
 
 
+def _write_sql_view_files(sql_views: list, connection_name: str, out_path, slug: str) -> list:
+    """Write one ``{slug}.{ViewName}.sql_view.tml`` per Custom SQL relation; return paths.
+
+    SQL Views are written separately from the model phases and must be imported before
+    the model (which references them by name).
+    """
+    from ts_cli.model_builder import build_sql_view_tml
+    from ts_cli.tableau_translate import dump_tml_yaml
+
+    paths = []
+    for sv in sql_views:
+        sv_tml = build_sql_view_tml(
+            name=sv["name"],
+            connection_name=connection_name,
+            sql_query=sv["sql_query"],
+            columns=sv.get("columns", []),
+        )
+        sv_slug = re.sub(r"[^0-9A-Za-z._-]+", "_", sv["name"]).strip("_") or "custom_sql"
+        sv_path = out_path / f"{slug}.{sv_slug}.sql_view.tml"
+        sv_path.write_text(dump_tml_yaml(sv_tml))
+        typer.echo(f"  Wrote SQL View: {sv_path}", err=True)
+        paths.append(str(sv_path))
+    return paths
+
+
 def _generate_flow(
     ds: dict,
     name: str,
@@ -666,7 +691,7 @@ def _generate_flow(
     profile: Optional[str] = None,
 ) -> dict:
     """Build phased model TML files from scratch and write them to disk."""
-    from ts_cli.model_builder import build_model_tml, build_sql_view_tml, split_for_phased_import
+    from ts_cli.model_builder import build_model_tml, split_for_phased_import
     from ts_cli.tableau.build_model import apply_prefix_and_double_agg
     from ts_cli.tableau.reconcile import clean_columns, drop_junk_formulas, strip_suffix_in_expr
     from ts_cli.tableau_translate import dump_tml_yaml
@@ -762,18 +787,8 @@ def _generate_flow(
 
     if not dry_run:
         # SQL Views first — they must exist before the model that references them.
-        for sv in sql_views:
-            sv_tml = build_sql_view_tml(
-                name=sv["name"],
-                connection_name=connection_name,
-                sql_query=sv["sql_query"],
-                columns=sv.get("columns", []),
-            )
-            sv_slug = re.sub(r"[^0-9A-Za-z._-]+", "_", sv["name"]).strip("_") or "custom_sql"
-            sv_path = out_path / f"{slug}.{sv_slug}.sql_view.tml"
-            sv_path.write_text(dump_tml_yaml(sv_tml))
-            typer.echo(f"  Wrote SQL View: {sv_path}", err=True)
-            result.setdefault("sql_view_files", []).append(str(sv_path))
+        # (empty list when the datasource has no Custom SQL relations)
+        result["sql_view_files"] = _write_sql_view_files(sql_views, connection_name, out_path, slug)
 
         for i, phase in enumerate(phases):
             fname = f"{slug}.phase{i}.model.tml"

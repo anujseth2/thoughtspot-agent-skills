@@ -113,6 +113,41 @@ def fix_double_aggregation(
 # Model TML assembly
 # ---------------------------------------------------------------------------
 
+def _sql_view_model_tables(sql_views: list[dict]) -> list[dict]:
+    """model_tables[] entries for SQL Views — referenced by name, columns listed."""
+    return [
+        {"name": sv["name"], "columns": [{"name": c["name"]} for c in sv.get("columns", [])]}
+        for sv in sql_views
+    ]
+
+
+def _sql_view_model_columns(sql_views: list[dict]) -> list[dict]:
+    """model.columns[] entries for SQL View columns (column_id = ``SQLViewName::col``)."""
+    cols = []
+    for sv in sql_views:
+        for c in sv.get("columns", []):
+            col_type = c.get("column_type", "ATTRIBUTE")
+            entry: dict[str, Any] = {
+                "name": c["name"],
+                "column_id": f"{sv['name']}::{c['name']}",
+                "properties": {"column_type": col_type},
+            }
+            if col_type == "MEASURE":
+                entry["properties"]["aggregation"] = "SUM"
+            cols.append(entry)
+    return cols
+
+
+def _drop_sql_view_shadowed_columns(columns: list[dict], sql_views: list[dict]) -> list[dict]:
+    """Drop physical columns a SQL View already provides (by name). A Custom-SQL
+    datasource's ``<column>`` elements ARE the view's columns, so emitting them as
+    bare physical columns too would duplicate names (import-fatal)."""
+    if not sql_views:
+        return columns
+    sv_names = {c["name"] for sv in sql_views for c in sv.get("columns", [])}
+    return [c for c in columns if c.get("name") not in sv_names]
+
+
 def build_model_tml(
     *,
     model_name: str,
@@ -148,11 +183,7 @@ def build_model_tml(
     formula_exprs = {f["name"]: f["expr"] for f in translated_formulas}
 
     model_tables = _build_model_tables(tables, columns, joins)
-    for sv in sql_views:
-        model_tables.append({
-            "name": sv["name"],
-            "columns": [{"name": c["name"]} for c in sv.get("columns", [])],
-        })
+    model_tables.extend(_sql_view_model_tables(sql_views))
 
     model_formulas = []
     for f in translated_formulas:
@@ -165,27 +196,11 @@ def build_model_tml(
             "expr": expr,
         })
 
-    # A SQL View owns its output columns. For a Custom-SQL-backed datasource the
-    # datasource's <column> elements ARE those same columns, so emitting them as
-    # bare physical columns too would duplicate names (import-fatal). Drop physical
-    # columns a SQL View already provides.
-    physical_columns = columns
-    if sql_views:
-        sv_col_names = {c["name"] for sv in sql_views for c in sv.get("columns", [])}
-        physical_columns = [c for c in columns if c.get("name") not in sv_col_names]
-
-    model_columns = _build_model_columns(physical_columns, tables, translated_formulas)
-    for sv in sql_views:
-        for c in sv.get("columns", []):
-            col_type = c.get("column_type", "ATTRIBUTE")
-            entry = {
-                "name": c["name"],
-                "column_id": f"{sv['name']}::{c['name']}",
-                "properties": {"column_type": col_type},
-            }
-            if col_type == "MEASURE":
-                entry["properties"]["aggregation"] = "SUM"
-            model_columns.append(entry)
+    # A SQL View owns its output columns; drop physical columns it already provides
+    # (see _drop_sql_view_shadowed_columns), then append the SQL View columns.
+    model_columns = _build_model_columns(
+        _drop_sql_view_shadowed_columns(columns, sql_views), tables, translated_formulas)
+    model_columns.extend(_sql_view_model_columns(sql_views))
 
     model_params = _build_model_parameters(parameters)
 
