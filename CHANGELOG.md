@@ -6,6 +6,7 @@ Skill-level changes are tracked in each skill's own `## Changelog` section.
 ---
 
 ## 2026-07-11
+- feat(ts-cli): bump to v0.47.0 — `ts metadata search --connection <name>` (`-c`), a client-side case-insensitive filter on `metadata_header.dataSourceName` for connection-scoped table discovery (BL-111 part a; pure `filter_by_connection` helper + 11 tests). Deconflicts with the concurrent v0.46.0 CI PR — merge that first
 - chore(cleanup): retire `agents/claude/references/direct-api-auth.md` (curl + `/tmp/ts_token.txt` fallback now prohibited by `ts-cli.md`/`security.md`) + its two dead reference rows in ts-convert-from-snowflake-sv (→1.16.1) / ts-convert-to-snowflake-sv (→1.3.2); drop the now-stale note in `check_orphan_references.py` (BL-109)
 - fix(hooks): `pre-push.sh` now smoke-tests only dirs with a `SKILL.md` — a shared dir matching the skill path pattern (`agents/claude/references/`) or a fully-deleted skill dir no longer trips a false "no smoke test found" failure (surfaced by BL-109's deletion)
 - chore(ci): bump ts-cli to v0.46.0 — lift the CPython cap to `>=3.10,<3.15` (BL-106) + add a `pytest-matrix` CI job running the unit/validator suite on 3.10/3.11/3.13/3.14 (BL-107); 3.14 entry verifies the lifted cap. Validators/linters stay single-version (3.12) in `validate`
