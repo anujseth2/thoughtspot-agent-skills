@@ -188,3 +188,29 @@ path fires cleanly for a user without `CAN_USE_SPOTTER`.
 
 Status: SPEC-VERIFIED via MCP 2026-07-15; LIVE-VERIFICATION PENDING (run on a
 Spotter-enabled instance before relying on Step 12.6 output)
+
+---
+
+## #18 — CURRENCY / NUMBER answer_columns format sub-config — TO VERIFY
+
+Step 10b now carries Tableau currency/number/decimal formats to `answer_columns[].format`.
+Only `category: PERCENTAGE` (`percentageFormatConfig.decimals`) is live-verified in
+`thoughtspot-answer-tml.md`. The CURRENCY (`currencyFormatConfig`) and NUMBER
+(`numberFormatConfig`) shapes are documented by parallel structure but **not** verified —
+confirm the exact field names against a live Answer export (edit a currency + a
+thousands-separated number column in the UI, export the answer TML, read the `format` block)
+before relying on them. Until verified, the skill's guidance is to ship the numeric measure
+unformatted rather than emit a `format` block that could fail import.
+
+Status: TO VERIFY — capture a live Answer export with currency + number formats
+
+---
+
+## #19 — `sorted by … descending/ascending` search token — TO VERIFY
+
+Step 10b carries a plain measure sort as `sorted by [Measure] descending`/`ascending` in the
+`search_query`. `top N` / `bottom N` are verified (open items in the Top-N set work); the bare
+`sorted by … descending` token has not been round-tripped here. Confirm it parses and renders
+on the target build; if the exact keyword differs, correct Step 10b.
+
+Status: TO VERIFY — round-trip a sorted (non-Top-N) viz on a live instance

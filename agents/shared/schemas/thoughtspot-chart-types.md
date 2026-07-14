@@ -158,9 +158,37 @@ Example: a Tableau bar of customers by Region, colored by Gender → one
 - **`ADVANCED_PIVOT_TABLE`** does **not** use `custom_chart_config` — it auto-resolves
   rows/columns/values from `chart_columns` + `search_query` (the block is dropped on export).
 - **Combos** (`ADVANCED_LINE_COLUMN`, `ADVANCED_LINE_STACKED_COLUMN`) accept two+ measures
-  and **auto-resolve** which measure is the line vs the column; no `custom_chart_config`
-  required. Fine-grained line/column + secondary-axis control lives in `client_state_v2`
-  `axisProperties` (`axisType: Y`, `isOpposite: true` for the secondary axis).
+  and **auto-resolve** which measure is the line vs the column when you don't care which is
+  which. But a **specific** line-vs-column assignment and a **dual/secondary axis** do **not**
+  survive through `client_state_v2` `axisProperties` — ThoughtSpot re-derives the chart on
+  every render and the split decays to a single axis with all non-primary measures piled onto
+  one shared secondary. **The durable encoding is `custom_chart_config`** with combo-specific
+  shelves (verified live: the edit survived re-push; `client_state_v2` did not):
+
+  ```yaml
+  chart:
+    type: ADVANCED_LINE_COLUMN
+    chart_columns:
+    - {column_id: <date/attr>}
+    - {column_id: <column measure(s)>}
+    - {column_id: <line measure>}
+    custom_chart_config:
+    - key: basic
+      dimensions:
+      - {key: x-axis,        axes: [{type: FLAT,   column: <date/attr>}]}
+      - {key: y-axis-column, axes: [{type: MERGED, columns: [<the CLUSTERED-column measures>]}]}
+      - {key: y-axis-line,   axes: [{type: MERGED, columns: [<the LINE measure(s)>]}]}
+      - {key: trellis-by}
+      mode: AXIS_DRIVEN
+    display_mode: CHART_MODE
+  ```
+
+  Combo shelves: **`x-axis`**, **`y-axis-column`** (the clustered columns), **`y-axis-line`**
+  (the line(s), on their own axis → the dual-axis effect), **`trellis-by`**. Unlike the plain
+  cartesian shelves (`type: FLAT`), the two y-shelves use **`type: MERGED`** with a `columns:`
+  list. To reproduce a hand-tuned combo, capture and replay `custom_chart_config` — never
+  `client_state_v2`. Per-column format (e.g. PERCENTAGE) lives on `answer_columns[].format`.
+  Worked example: `worked-examples/tableau/combo-dual-axis-custom-chart-config.md`.
 - **The shelf vocabulary is permissive, not strictly validated.** An unknown shelf key (e.g.
   `size`) on a cartesian type is *accepted and retained* but ignored at render — so don't rely
   on rejection to validate; only the four cartesian shelves above actually render.
