@@ -214,3 +214,21 @@ Step 10b carries a plain measure sort as `sorted by [Measure] descending`/`ascen
 on the target build; if the exact keyword differs, correct Step 10b.
 
 Status: TO VERIFY — round-trip a sorted (non-Top-N) viz on a live instance
+
+---
+
+## #20 — `ts tableau build-liveboard` spec extraction from the parser — FOLLOW-ON
+
+`ts tableau build-liveboard` (ts-cli v0.54.0) emits the base answer/liveboard TML
+deterministically from a dashboard spec (role-aware axes, chart-needs floor, overrides
+replay — Step 10c). The spec is currently **assembled by the skill** from the Step 9 parse.
+To make Step 10 fully deterministic end-to-end, extend `ts tableau parse` (`twb.py`) to
+extract per-visual shelves + roles (Columns/Rows/Color) and dashboard zones, so the spec is
+produced by the parser with no hand-assembly. Emission engine + command are done and
+unit-tested (`test_tableau_liveboard.py`, 21 cases); this is the remaining parser half.
+
+Also pending: **live import** of a build-liveboard-emitted liveboard on a real instance
+(the emission is ported from the verified Power BI converter, but not yet round-tripped
+through `ts tml import` from this command specifically).
+
+Status: FOLLOW-ON — parser role extraction + one live import round-trip

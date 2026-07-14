@@ -70,6 +70,7 @@ export/merge/import TML, iterate over formula failures, or assemble model JSON.
 | Create tables | `ts tables create` | Raw HTTP calls to the TML import endpoint |
 | Export/import TML | `ts tml export` / `ts tml import` | Manual curl or HTTP library calls |
 | Ask Spotter to express a parked formula (Step 12.6) | `ts spotter answer` | Raw `requests` to `ai/answer/create` |
+| Emit answer + liveboard TML (Step 10c) | `ts tableau build-liveboard` | Hand-writing answer/liveboard YAML per viz |
 
 If a CLI command fails or produces wrong results, **fix the CLI** (`tools/ts-cli/`) and
 re-run — do not work around it with manual scripting. The CLI encodes months of
@@ -3601,8 +3602,38 @@ a "sum sales" phrase. Build it from the worksheet shelves:
 
 ### 10c. Build liveboard TML
 
-Follow `../../shared/schemas/thoughtspot-liveboard-tml.md` exactly — the structure below
-is what actually imports and renders (an earlier `fqn`-based, minimal-chart form did not).
+**Emit the base Answer + Liveboard TML deterministically — don't hand-write it.** Assemble a
+dashboard spec from Steps 9/9b/9c and run:
+
+```bash
+ts tableau build-liveboard --input dashboard_spec.json --output-dir ./out
+```
+
+The spec is one object per dashboard → visuals → fields, each field tagged with its Tableau
+`shelf` (`columns`/`rows`/`color`) or an explicit `role`, plus `measure: true/false`; carry
+the Step 9c grid placement as each visual's `tile`. The command does the role-aware axis
+layout (Columns→x, Color→series/color, Rows→pivot rows, measures→y — a `PIVOT_TABLE` gets
+`axis_configs` or it renders blank), applies the chart-type requirement floor (flags a chart
+short of the measures it needs — never silently downgrades), and assembles one tabbed
+liveboard with every answer embedded. Full spec shape: `tools/ts-cli/README.md`
+(`ts tableau build-liveboard`) / `ts_cli/tableau/liveboard.py`.
+
+**Presentation polish rides in the spec, not a second hand-edit pass.** Anything the
+auto-builder can't express — a hand-tuned **combo/dual-axis** (`custom_chart_config`, Step
+10a), a **KPI sparkline** (`client_state_v2`, Step 10a), per-column **`format`** (Step 10b),
+or a **theme** `viz_style` (Step 10.5) — goes on that visual's `override` (verbatim answer
+spec) or `formats`/`client_state_v2`/`custom_chart_config`/`viz_style` keys, which the
+command replays into the emitted TML. Add tiles with no Tableau source visual via
+`extra_visuals[]`.
+
+> The command consumes a spec you assemble from the Step 9 parse; fully **extracting** the
+> per-visual shelves/roles inside `ts tableau parse` (so the spec is produced end-to-end with
+> no hand-assembly) is a tracked follow-on — see open item #20.
+
+The YAML below is the **reference for what the command emits** (and the shape to match when
+hand-tuning an `override`). Follow `../../shared/schemas/thoughtspot-liveboard-tml.md` exactly
+— the structure below is what actually imports and renders (an earlier `fqn`-based,
+minimal-chart form did not).
 
 ```yaml
 liveboard:
@@ -4295,7 +4326,7 @@ suggested-but-unverified with its tokens for manual follow-up.
 
 | Version | Date | Summary |
 |---|---|---|
-| 1.28.0 | 2026-07-15 | **Spotter last-mile + chart/layout fidelity.** (1) **New Step 12.6 — Spotter Last-Mile:** after Step 12.5 leaves a measure parked, optionally ask Spotter to express its intent as a ThoughtSpot Search via the new `ts spotter answer` command (wraps `POST /api/rest/2.0/ai/answer/create`; returns `tokens`/`display_tokens`). Opt-in, gated on Spotter enablement (Step 5.5) + `CAN_USE_SPOTTER`; **surfaces** the suggested Search, requires a **verified number match** (Step 11.5 coverage answer or `ts spotql fetch-data`) before adopting, else leaves it ⏸ Parked. Never auto-adopts. Can materialize an adopted measure as a Step 11.5 coverage tile seeded from Spotter's `tokens` + `visualization_type` (human-approved). (2) **Step 10a combo/dual-axis fidelity:** a Tableau dual-axis (Bar + Line) viz → `ADVANCED_LINE_COLUMN` with the durable `custom_chart_config` (`y-axis-column`/`y-axis-line`, `type: MERGED`) — `client_state_v2` decays on re-render; new shared worked example. (3) **Step 9c layout fidelity:** container-tree walk (horz/vert) with proportional column split (largest-remainder → sum 12) + aspect-ratio height + floating-zone handling, replacing the flat y-band heuristic. (4) **Step 10b format + color/mark fidelity:** currency/number/decimal formats → `answer_columns[].format`; Color shelf → Muze `slice-with-color`; small multiples → `trellis-by`; series palettes → `viz_style`; measure sort → `sorted by`. Open items #17–#19 track the live-verification gaps (Spotter call, currency/number format sub-config, sort token). Prereq ts-cli v0.53.0. |
+| 1.28.0 | 2026-07-15 | **Spotter last-mile + chart/layout fidelity.** (1) **New Step 12.6 — Spotter Last-Mile:** after Step 12.5 leaves a measure parked, optionally ask Spotter to express its intent as a ThoughtSpot Search via the new `ts spotter answer` command (wraps `POST /api/rest/2.0/ai/answer/create`; returns `tokens`/`display_tokens`). Opt-in, gated on Spotter enablement (Step 5.5) + `CAN_USE_SPOTTER`; **surfaces** the suggested Search, requires a **verified number match** (Step 11.5 coverage answer or `ts spotql fetch-data`) before adopting, else leaves it ⏸ Parked. Never auto-adopts. Can materialize an adopted measure as a Step 11.5 coverage tile seeded from Spotter's `tokens` + `visualization_type` (human-approved). (2) **Step 10a combo/dual-axis fidelity:** a Tableau dual-axis (Bar + Line) viz → `ADVANCED_LINE_COLUMN` with the durable `custom_chart_config` (`y-axis-column`/`y-axis-line`, `type: MERGED`) — `client_state_v2` decays on re-render; new shared worked example. (3) **Step 9c layout fidelity:** container-tree walk (horz/vert) with proportional column split (largest-remainder → sum 12) + aspect-ratio height + floating-zone handling, replacing the flat y-band heuristic. (4) **Step 10b format + color/mark fidelity:** currency/number/decimal formats → `answer_columns[].format`; Color shelf → Muze `slice-with-color`; small multiples → `trellis-by`; series palettes → `viz_style`; measure sort → `sorted by`. (5) **Step 10c now emits answer + liveboard TML deterministically** via the new `ts tableau build-liveboard` command — role-aware axis layout (Columns→x, Color→series, Rows→pivot, measures→y; pivot gets `axis_configs` or renders blank), a chart-type requirement floor (flags, never downgrades), and overrides capture-and-replay (`format`/`client_state_v2`/`custom_chart_config`/`viz_style`), replacing the hand-written per-viz YAML. ThoughtSpot-side emission ported from the verified standalone Power BI converter; 21 unit tests. Open items #17–#20 track the live-verification / parser-extraction gaps (Spotter call, currency/number format sub-config, sort token, build-liveboard spec extraction). Prereq ts-cli v0.54.0. |
 | 1.27.0 | 2026-07-08 | **Parse published-datasource `.tds`/`.tdsx` for the physical model (BL-089 M8).** `ts tableau parse` and `ts tableau build-model` now accept a `.tds`/`.tdsx` (root *is* `<datasource>`) — extracting its real tables/joins/columns/calcs — so a multi-query published datasource builds a multi-table model **automatically via GENERATE mode, no hand-assembly**. Get the `.tds` via `ts tableau download {id}` (the `.tds` inside the `.tdsx`) or a user-supplied file. Step 3.5 corrected: the field API (VizQL `read-metadata`) returns **columns/calcs only, not tables/joins** — the physical model lives in the `.tds`. Step 5b "Multi-query datasources" now leads with the `.tds` path; hand-assembly is the fallback for when only the `.twb` is available. Prereq ts-cli v0.38.0. |
 | 1.26.0 | 2026-07-06 | **Custom SQL → SQL View is now automated in `build-model`** (Step 5a/5c), realizing what the skill documented since 1.1.0. `ts tableau build-model` extracts `<relation type='text'>` Custom SQL (SQL + columns from `metadata-record` `parent-name`/`remote-name`, decoding `<<`/`>>`/`==`), emits a `.sql_view.tml` per relation, and references it by name in `model_tables[]` (no GUID at emit time). Physical/SQL-View column dedup prevents duplicate-name import failures; formula resolvability no longer blanket-drops qualified `[SQL View::col]` refs. Verified end-to-end live on ps-internal (parse → emit → import → searchdata returns correct numbers) and against real workbooks (single-CTE + Tableau's 6-query ts_users). Known follow-ons: drop the extract table when its Custom SQL becomes a view; substitute/flag Tableau params embedded in SQL. Prereq ts-cli v0.37.0. |
 | 1.25.0 | 2026-07-05 | **Multi-query datasource → multi-table model guidance + liveboard parameter rule (BL-090).** Step 5b: new "Multi-query datasources" subsection — a published/sqlproxy datasource that joins several Custom SQL Queries must become a **multi-table model** (a single-view reconcile silently filters the other queries' formulas as "Unresolved Custom SQL Query alias"); documents detection, greedy table-set cover + shared-key join confirmation, hand-built base → `build-model --existing-guid` (which now auto-migrates parameters, validates qualified columns, cascade-drops, and table-qualifies bare refs to the real owning table), plus **(M14)** collision-renamed formulas, **(M15)** absent-column data-gap surfacing, **(M16)** measure classification on all-ATTRIBUTE table exports. Step 7 Phase-2 pipeline list updated: parameter auto-migration, deterministic qualified-column + cross-formula-cascade filtering, `--max-retries` default 25→10. Step 10f: parameter chips only stick when a param-consuming formula tile is on the board (ThoughtSpot drops unreferenced params) — filter-type params → liveboard filters; display-toggle params (sheet-swap) → per-metric tiles or omit. Live-verified in the CPG Merch migration (tentpole 119/119, prod 137/163). Prereq ts-cli v0.36.1. |

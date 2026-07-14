@@ -1560,6 +1560,54 @@ formulas, rename map, phase count).
 
 ---
 
+### `ts tableau build-liveboard`
+
+Emit Answer + tabbed-Liveboard TML deterministically from a parsed Tableau dashboard
+spec — the codified replacement for the LLM-executed chart/liveboard prose templates
+(SKILL.md Step 10). Role-aware axis layout (Columns→x, Color→series/color, Rows→pivot
+rows, measures→y), a chart-type requirement floor (flags a chart that lacks the measures
+it needs — never silently downgrades it), and overrides capture-and-replay (per-column
+`format`, `client_state_v2`, the authoritative `custom_chart_config` for combos, and
+`viz_style`). The ThoughtSpot-side emission is ported from the verified standalone Power BI
+converter (`_answer_tml`/`_answer_tml_explicit`/`_liveboard_tml`).
+
+```bash
+ts tableau build-liveboard --input dashboard_spec.json --output-dir ./out
+```
+
+**Input** (`--input`): a JSON dashboard spec — see `build_from_spec` in
+`ts_cli/tableau/liveboard.py` for the full shape:
+
+```json
+{
+  "report_name": "Sales Report", "model_name": "Sales Model", "model_fqn": null,
+  "measure_names": ["Total Sales"],
+  "dashboards": [
+    {"name": "Overview", "visuals": [
+      {"title": "Sales by Region", "mark": "bar",
+       "fields": [{"name": "Region", "shelf": "columns", "measure": false},
+                  {"name": "Total Sales", "measure": true},
+                  {"name": "Segment", "role": "Series"}],
+       "tile": {"x": 0, "y": 0, "width": 6, "height": 8}}
+    ]}
+  ]
+}
+```
+
+- Each field carries a Tableau `shelf` (`columns`/`rows`/`color`) — mapped to a
+  canonical role — or an explicit `role` that wins over the shelf. `measure: true`
+  columns always land on y.
+- A visual may carry an `override` (verbatim answer spec) for anything the auto-builder
+  can't express (e.g. a hand-tuned combo — put its `custom_chart_config` here). `tile`
+  is the Step 9c grid placement; omit it to fall back to a two-per-row layout.
+- `extra_visuals[]` (top level) adds tiles that have no Tableau source visual.
+
+**Output:** writes `{report}.liveboard.tml` (with every answer embedded) to `--output-dir`.
+Stdout: JSON `{report_name, n_answers, n_tabs, liveboard_file, visual_rows, page_rows}` —
+`visual_rows`/`page_rows` feed the Step 12 migration report.
+
+---
+
 ## Piping and scripting
 
 All commands write JSON to stdout, making them easy to pipe into `jq` or Python:

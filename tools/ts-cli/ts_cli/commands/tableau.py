@@ -1089,3 +1089,66 @@ def build_model_cmd(
         all_results.append(result)
 
     print(json.dumps(all_results, indent=2))
+
+
+@app.command("build-liveboard")
+def build_liveboard_cmd(
+    input_file: str = typer.Option(..., "--input", "-i",
+                                   help="Dashboard spec JSON (see ts_cli/tableau/liveboard.py build_from_spec)"),
+    output_dir: str = typer.Option(".", "--output-dir", "-o",
+                                   help="Directory for the emitted .liveboard.tml"),
+) -> None:
+    """Emit Answer + tabbed-Liveboard TML from a parsed Tableau dashboard spec.
+
+    Deterministic replacement for the Step 10 prose templates: role-aware axis layout
+    (Columns→x, Color→series/color, Rows→pivot rows, measures→y), a chart-type requirement
+    floor (flag, don't downgrade), and overrides capture-and-replay (formats /
+    client_state_v2 / custom_chart_config / viz_style). Writes `{report}.liveboard.tml`
+    (full answers embedded) to --output-dir and prints a JSON summary
+    {report_name, n_answers, n_tabs, liveboard_file, visual_rows, page_rows} to stdout —
+    visual_rows/page_rows feed the Step 12 migration report.
+
+    Example:
+
+    \\b
+      ts tableau build-liveboard -i dashboard_spec.json -o out/
+    """
+    from ts_cli.tableau import liveboard as lb
+    from ts_cli.tml_common import dump_tml_yaml
+
+    p = Path(input_file)
+    if not p.is_file():
+        typer.echo(f"Spec file not found: {input_file}", err=True)
+        raise SystemExit(1)
+    try:
+        spec = json.loads(p.read_text())
+    except ValueError as exc:
+        typer.echo(f"Invalid JSON spec: {exc}", err=True)
+        raise SystemExit(1)
+    if not spec.get("model_name"):
+        typer.echo("Spec must include 'model_name'.", err=True)
+        raise SystemExit(1)
+
+    result = lb.build_from_spec(spec)
+
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    liveboard_file = None
+    if result["liveboard"]:
+        slug = lb.slugify(spec.get("report_name") or spec["model_name"])
+        liveboard_file = str(out_path / f"{slug}.liveboard.tml")
+        Path(liveboard_file).write_text(dump_tml_yaml(result["liveboard"]))
+
+    n_tabs = len(result["liveboard"]["liveboard"]["layout"]["tabs"]) if result["liveboard"] else 0
+    typer.echo(
+        f"{len(result['answers'])} answer(s), {n_tabs} tab(s) -> {liveboard_file or '(no liveboard)'}",
+        err=True,
+    )
+    print(json.dumps({
+        "report_name": spec.get("report_name") or spec["model_name"],
+        "n_answers": len(result["answers"]),
+        "n_tabs": n_tabs,
+        "liveboard_file": liveboard_file,
+        "visual_rows": result["visual_rows"],
+        "page_rows": result["page_rows"],
+    }, indent=2))
