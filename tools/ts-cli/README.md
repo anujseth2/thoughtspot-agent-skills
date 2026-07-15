@@ -1710,6 +1710,36 @@ ts load snowflake --source ./csvs/ --profile Production \
 
 **Output:** JSON with `database`, `schema`, `profile`, and `tables[]` array containing `table_name`, `status`, `rows_loaded`, `columns`, `source_file`.
 
+### `ts load databricks`
+
+Provision table(s) + synthetic data into a Databricks `catalog.schema` (Unity Catalog), so a
+ThoughtSpot Databricks connection can bind a model over them. Auth via a Databricks profile in
+`~/.claude/databricks-profiles.json` (`dbx_profile`, `sql_warehouse_http_path`, `catalog`,
+`schema`); the token lives in `~/.databrickscfg` (`databricks auth login`), never in the
+profile file. Execution goes through the `databricks` CLI's SQL Statement Execution API.
+
+```
+ts load databricks --source ./orders_demo_schema.json --profile sisense-dbx --rows 200
+```
+
+Infers the schema from `--source` (manifest / schema JSON / CSV dir), generates deterministic
+synthetic rows, then `CREATE TABLE` (Delta **column mapping** enabled — preserves column names
+with spaces/special chars like `Order Date` 1:1) + batched `INSERT`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--source`, `-s` | — | Schema/manifest JSON or CSV dir (required) |
+| `--profile`, `-p` | — | Databricks profile name (required) |
+| `--catalog` / `--schema` | from profile | Override target catalog/schema |
+| `--rows`, `-r` | `100` | Synthetic rows per table |
+| `--batch` | `200` | Rows per `INSERT` statement |
+
+> **Connection caveat (live-verified):** for a ThoughtSpot model to bind to the new table, the
+> connection must expose it. A **SERVICE_ACCOUNT** Databricks connection introspects it
+> automatically; an **OAuth/PKCE** connection returns an empty API hierarchy (a ThoughtSpot
+> limitation), so the new table must be **selected in the ThoughtSpot connection editor (UI)**
+> before `ts tables create` / model build can reference it.
+
 ### `ts snowflake diff`
 
 Diff two Semantic-View-adjacent column maps and print a change set. Codifies the

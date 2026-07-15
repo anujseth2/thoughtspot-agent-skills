@@ -6,6 +6,8 @@ Skill-level changes are tracked in each skill's own `## Changelog` section.
 ---
 
 ## 2026-07-16
+- feat(ts-cli): `ts load databricks` (v0.57.0) — provisions tables + synthetic data into a Databricks catalog.schema via the SQL Statement Execution API (Delta column-mapping preserves spaced column names 1:1), completing the "Databricks planned" half of ts-load-source-data (skill v1.1.0). **Live-verified on ps-internal**: created + populated `workspace.sisense_demo.orders_demo` (200 rows). Documents the OAuth/PKCE connection caveat (new table must be UI-selected on the connection before a model binds). 4 new unit tests
+- fix(ts-cli): `ts connections add-tables` accepts `db`|`database` and errors cleanly instead of a raw `KeyError` traceback when a key is missing
 - fix(ts-cli): `ts connections list` v0.56.0 — no longer defaults `--type` to `SNOWFLAKE` (which silently hid Databricks/BigQuery/etc. connections despite the "list all" docstring); now lists **every** warehouse type by default, `--type` filters. Caught live: the command was reporting only Snowflake connections on a multi-warehouse org
 - feat(ts-cli): org support (v0.56.0) — `export TS_ORG=<org_id>` scopes CLI calls to a non-default ThoughtSpot org (passed as `org_id` int to `auth/token/full`; `org_identifier` is silently ignored by that endpoint — verified empirically), with an org-keyed token cache. Enables reaching org-scoped connections/metadata (e.g. an AnujSeth-org Databricks connection). 5 new unit tests
 

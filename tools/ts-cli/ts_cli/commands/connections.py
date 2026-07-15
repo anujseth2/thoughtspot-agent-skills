@@ -321,6 +321,20 @@ def create_connection(
 # Merge logic
 # ---------------------------------------------------------------------------
 
+def _require_entry_keys(entry: Dict[str, Any]) -> tuple:
+    """Extract (db, schema, table) from an add-tables entry. Accepts 'db' or 'database'
+    (the docstring used 'database' while the code read 'db' — a KeyError-crashing mismatch)."""
+    db_name = entry.get("db") or entry.get("database")
+    schema_name = entry.get("schema")
+    table_name = entry.get("table")
+    if not (db_name and schema_name and table_name):
+        raise SystemExit(
+            "Each table entry needs 'db' (or 'database'), 'schema', and 'table'. "
+            f"Got keys: {sorted(entry)}"
+        )
+    return db_name, schema_name, table_name
+
+
 def _merge_tables(
     fetch_response: Dict[str, Any],
     new_tables: List[Dict[str, Any]],
@@ -373,9 +387,7 @@ def _merge_tables(
 
     # Process each new table
     for entry in new_tables:
-        db_name = entry["db"]
-        schema_name = entry["schema"]
-        table_name = entry["table"]
+        db_name, schema_name, table_name = _require_entry_keys(entry)
         table_type = entry.get("type", "TABLE")
         new_columns = entry.get("columns", [])
 
