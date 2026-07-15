@@ -1,104 +1,104 @@
-# Proposal: single-pass formula cross-reference import for `ts-convert-*` skills
+# Proposal: retire the vestigial phased-import emission in `ts tableau build-model`
 
 **Repo:** `thoughtspot/thoughtspot-agent-skills`
 **Owner:** Anuj Seth
-**Affects:** `ts tableau build-model` (and the incoming `ts powerbi build-model`); shared invariant I9
-**Type:** performance + codification (audit angles #14 and #11); conversion-consistency (#9)
-**Status:** proposal (docs only, no code change here). Gate #1 closed and gate #2 investigated (see "Verification gate"); one confirmation with Damian outstanding before the code change is raised.
+**Affects:** `ts tableau build-model` (GENERATE-mode file emission); shared invariant I9
+**Type:** codification / simplification (audit angle #11); conversion-consistency (#9)
+**Status:** proposal, re-baselined after Damian's review. Docs only; the code follow-up is scoped below.
+
+> **Correction (2026-07-15).** The first version of this doc claimed the Tableau
+> `build-model` path costs **N+1 import round-trips** and proposed collapsing them to a
+> single pass. That premise was wrong, and Damian caught it. The runtime is **already
+> single-pass** in the way that matters: it does **base + one merged formula import** (two
+> calls total), and the merged import relies on `[formula_<Name>]` id-references resolving
+> in one pass — which they do. There are no per-level round-trips at runtime to eliminate.
+> What is actually left is smaller and real: (1) refine invariant I9, and (2) stop emitting
+> the `*.phase1+.model.tml` files that nothing consumes. This doc is rewritten around those
+> two. Power BI is dropped as a driver — its converter was never N+1 either.
 
 ---
 
-## TL;DR
+## What is actually true (corrected)
 
-The Tableau `build-model` path resolves formula cross-references by **phased multi-pass
-import**: it splits the model into dependency levels and imports one level per pass, so a
-formula never references a not-yet-created formula within a single pass. That costs
-**N+1 import round-trips** (N = number of dependency levels).
+Two separate mechanisms were conflated in the original framing.
 
-Evidence on a current ps-internal build shows a model using **id-references**
-(`[formula_<Name>]`) resolves cross-references in a **single import pass**, independent of
-formula declaration order. If that holds under an actual create (the one thing still to
-confirm), we can make single-pass the default, keep phased import as an automatic fallback,
-and drop the extra round-trips — for both the Tableau skill and the incoming Power BI skill,
-from one shared code path.
+**1. The reference token — consistent, single-pass, correct.** Both the Tableau path and the
+Power BI converter write a cross-reference as `[formula_<Name>]` (an **id-reference**). See
+`ts_cli/model_builder.py::add_formula_prefix` and `fix_bare_refs`. Id-references resolve on
+first import and are **order-independent** (verified 2026-07-09 — Evidence below). So all
+formulas import in a single pass. No change is proposed here.
 
-This is deliberately framed as a question to settle with evidence, not an assertion that the
-current design is wrong. Invariant I9 came from real import failures; the proposal explains
-why those failures do not apply to id-references, and names the check that must confirm it.
+**2. The runtime import path — already two calls, not N+1.** The `ts-convert-from-tableau`
+skill (SKILL.md Step 7) imports in two calls:
 
----
+- **Phase 1:** import `{slug}.phase0.model.tml` (the base — `model_tables`, physical
+  `columns`, `joins`, `parameters`; **no formulas**). One call.
+- **Phase 2:** add **all** formulas at once via a separate `ts tableau build-model
+  --existing-guid` call. That path (`_import_with_retry` in `commands/tableau.py`) imports
+  the whole merged model in **one** `tml/import` call, and only re-imports if the server
+  rejects a specific formula — dropping the failing formula (and cascade-dropping its
+  dependents) and retrying. That retry loop is **error recovery**, not per-level phasing; on
+  a clean model it runs exactly once.
 
-## Background: how cross-references work today
+So the runtime cost is **2 import calls**, independent of dependency depth. The "N+1" figure
+came from reading `split_for_phased_import` (which builds N+1 cumulative phase dicts) as if
+the runtime imported each one. It does not.
 
-Two separate things are involved. They are easy to conflate.
+**3. The vestigial part.** `split_for_phased_import` still **writes** `{slug}.phase1.model.tml`,
+`{slug}.phase2.model.tml`, … (one per dependency level) to disk in GENERATE mode. The skill's
+own docs already say these are dead weight:
 
-**1. The reference token — already consistent.** Both the current Tableau path and the
-Power BI converter write a cross-reference the same way: `[formula_<Name>]`.
-See `ts_cli/model_builder.py::add_formula_prefix` (`[Name]` → `[formula_Name]`) and
-`fix_bare_refs`. There is no divergence here, and none is proposed.
+- SKILL.md Step 5b: *"The `.phase1+` files are not consumed anywhere in this skill's import
+  flow: formulas are added independently in Step 7 Phase 2, via a separate `build-model
+  --existing-guid` call."*
+- SKILL.md Step 6: the pre-import validation *"only wants the base, so pass `--model-phase
+  base` to drop every `*.phase1.model.tml`+ file (unused by this skill)."*
 
-**2. The resolution strategy — where the cost is.** `ts_cli/model_builder.py::split_for_phased_import`
-(driven by `ts_cli/tableau/dag.py::build_formula_levels`) splits one model TML into phases:
-
-- Phase 0: tables + columns + joins + parameters, no formulas
-- Phase 1..N: formulas added cumulatively by dependency level (level 0 references no other
-  formula; level 1 references level 0; and so on), each phase a complete model TML
-  re-imported with a `guid` to update.
-
-Per its docstring, "Each phase is a complete model TML dict with `guid` field for update," so
-the build-model flow imports **N+1 times**, each pass persisting the next dependency level so
-the following pass never contains a forward reference. This is the concrete implementation of
-invariant I9's "use a two-pass import."
-
-> Confirm at the call site (`ts_cli/commands/tableau.py`, `build-model`) that each phase is a
-> separate `tml/import` HTTP call — the function shape and the module description
-> ("phased-import orchestration facade") indicate it is; worth stating exactly in the PR.
-
-## Invariant I9 today
-
-From `agents/shared/schemas/thoughtspot-model-tml.md` (mirrored in the root `CLAUDE.md`
-"Critical TML invariants"):
-
-> Formula cross-references (`[Other Formula]`) fail on first import — inline the expression or
-> use a two-pass import (I9)
-
-The proposal's core claim: **I9 is precisely true for display-name references
-(`[Other Formula]`) and does not apply to id-references (`[formula_<Name>]`).**
+We emit files, then document that they are unused, then filter them out again. That is the
+thing worth removing.
 
 ---
 
-## The proposal
+## Invariant I9 — split out to its own PR
 
-1. Make **single-pass import with topological ordering** the default for formula
-   cross-references: emit all formulas in one model TML, ordered so a formula appears after
-   the formulas it references, using the existing `[formula_<Name>]` token.
-2. Keep `split_for_phased_import` as an **automatic fallback**: if a single-pass import
-   returns **any formula-addition failure** (not only a cross-reference resolution error),
-   fall back to the phased + drop-and-retry path, so the formula-error-recovery behaviour is
-   preserved when single-pass hits an untranslatable formula. No capability is lost; the
-   phased code stays.
-3. Put the assembly in **one shared code path** that both `ts tableau build-model` and
-   `ts powerbi build-model` call, so the two conversion skills stay consistent by
-   construction (audit angle #9) and any future fix lands once.
-4. Refine invariant I9 to distinguish the two reference kinds (text below).
+Refining I9 to distinguish id-references (single-pass, safe) from display-name references
+(fail on first import) is independent of any code change and lands on its own:
 
-Net effect: N+1 import round-trips collapse to 1 in the common case (audit angle #14,
-"redundant API round-trips"), with a safe fallback for builds that still need phasing.
+**→ PR #247** (`docs(I9): distinguish id-refs (single-pass) from display-name formula refs`).
 
-### Proposed I9 rewrite
-
-> **I9 — Formula cross-references.** A cross-reference by **display name** (`[Other Formula]`)
-> fails on first import: the importer treats the name as search tokens, not a formula
-> reference. Reference other formulas by **id** (`[formula_<Name>]`) instead. Id-references
-> resolve on first import and are order-independent on current builds (verified
-> 2026-07-09, see the conversion skills' `open-items.md`). Prefer a single-pass import with
-> id-references and topological ordering; the phased/multi-pass path
-> (`split_for_phased_import`) remains as a fallback for builds where single-pass id-ref
-> creation fails.
+That PR carries the rewritten I9 wording and the matching root-`CLAUDE.md` line. It does not
+depend on this proposal; this proposal does not re-litigate it.
 
 ---
 
-## Evidence
+## The proposal (what remains)
+
+**Retire the vestigial phased-formula emission in GENERATE mode.** `ts tableau build-model`
+(no `--existing-guid`) should emit:
+
+- `{slug}.phase0.model.tml` — the base model (unchanged; this is what Step 7 Phase 1 imports).
+- **one** formulas artifact (all formulas, topologically ordered, id-referenced) — matching
+  what Step 7 Phase 2's `--existing-guid` merge actually imports in a single call.
+
+Stop writing `{slug}.phase1.model.tml … phaseN.model.tml`. Nothing imports them; the skill
+already filters them out.
+
+Keep, unchanged:
+
+- `_import_with_retry`'s **drop-and-retry error recovery** in the MERGE path — this is the
+  real robustness mechanism (untranslatable formula → drop + cascade-drop dependents +
+  retry) and is orthogonal to level-phasing.
+- `build_formula_levels` topological ordering — still used to order formulas within the
+  single merged import so a formula never precedes one it references.
+
+Net effect: fewer emitted files, GENERATE output that matches what the runtime actually
+imports, and one less "why are these files here / oh they're unused" round for the next
+reader (audit angle #11, agentic → deterministic-and-simpler). No round-trips change,
+because there were never N+1 of them.
+
+---
+
+## Evidence (confirms the runtime is already correct)
 
 ### Controlled experiment (VALIDATE_ONLY, ps-internal, 2026-07-09)
 
@@ -111,14 +111,10 @@ Minimal one-table model; formula `XRefDerived` references formula
 | **id-ref** `[formula_XRefBase]` | **OK** | **OK** |
 | **name-ref** `[XRefBase]` | ERROR | ERROR |
 
-- id-references validated cleanly, **independent of declaration order** (ordered and forward
-  both passed).
+- id-references validated cleanly, **independent of declaration order**.
 - name-references failed identically either way:
-  `Formula addition failed. Formula: XRefDerived, Error: Search did not find "XRefBase + 1"
-  in your data or metadata. Expecting one of the valid keywords ...` — the name was parsed as
-  search tokens, not resolved as a formula reference.
-
-This directly supports the I9 refinement: the failure I9 warns about is the **name-ref** case.
+  `Formula addition failed. ... Search did not find "XRefBase + 1" in your data or metadata`
+  — the name was parsed as search tokens, not resolved as a formula reference.
 
 ### Create-time head-to-head (actual create, ps-internal, 2026-07-09)
 
@@ -130,93 +126,64 @@ A 2-level chain: `XRefL2 = [formula_XRefL1] * 2` → `XRefL1 = [formula_XRefL0] 
 |---|:-:|---|
 | Single-pass, topologically ordered (L0,L1,L2) | **1** | **OK** — all 3 formulas present on export |
 | Single-pass, **forward** order (L2,L1,L0 declared) | **1** | **OK** — create succeeded regardless of order |
-| Phased (level-cumulative: L0, then +L1, then +L2) | **3** | OK — same result, 3× the round-trips |
 
-A dangling cross-reference fails **at create** with `Formula addition failed` (the same error
-the name-ref case produces). So a successful create with all formulas intact on export is
-direct proof that every id-reference resolved during creation — including the two-level
-transitive chain, and independent of declaration order.
-
-Caveat (honest): a post-create `searchdata [XRefL2]` did not return a computed value (HTTP 500
-after ~30s of retries), a query-path/indexing issue on a throwaway sample-table model — not a
-cross-reference failure. The resolution claim rests on create-success + export, not on the
-data query.
+A dangling cross-reference fails **at create** with `Formula addition failed`, so a
+successful create with all formulas intact on export proves every id-reference resolved
+during creation — including the two-level transitive chain, order-independent. This is why
+Step 7 Phase 2's single merged import is sufficient and the per-level phase files add nothing.
 
 ### Prior create-time evidence
 
-Separately, a ~44-formula model with multi-level cross-references (a Power BI → ThoughtSpot
-conversion, same `[formula_<Name>]` id-refs + topological ordering) was created on the same
-build in a single import pass and rendered correctly.
-
-### Reproduction
-
-Self-contained script in the appendix. It mints a token, builds the two variants over any
-existing base table, and runs VALIDATE_ONLY. It creates nothing (VALIDATE_ONLY does not
-persist).
+A ~44-formula Power BI → ThoughtSpot conversion (same `[formula_<Name>]` id-refs + topological
+ordering) was created on the same build in a single merged import and rendered correctly.
 
 ---
 
-## Verification gate
+## Why phasing exists (archaeology — kept, and it supports the change)
 
-The honest part, and the reason the proposal keeps phasing as a fallback rather than deleting it.
+Worth recording so the change is made with eyes open, not by deleting code whose purpose was
+forgotten.
 
-1. **Create-time head-to-head — CLOSED (2026-07-09).** Genuine single-pass `create` of a
-   2-level transitive chain succeeded in **1 import call**, ordered and forward, with all
-   formulas intact on export; the phased path produced the same result in **3 calls**. See
-   Evidence. Remaining sub-checks: deeper chains (5+ levels) and large models (see #3).
-2. **Why was phasing introduced? — INVESTIGATED 2026-07-09, one confirmation left.** Git
-   history is unusable here: the published repo is a single squashed commit, so there is no
-   original phasing PR or commit message to read. From the code, phasing does two separable
-   jobs: (a) **dependency-level ordering** (`split_for_phased_import`), which is exactly what
-   single-pass id-refs replace; and (b) **formula-error recovery** (`_import_with_retry` +
-   `filter_unresolvable_formulas`: drop the failing formula, cascade-drop its dependents,
-   retry), plus a human review checkpoint (SKILL Step 7). Because ordering and error-recovery
-   are separate mechanisms, collapsing ordering to single-pass does not remove error
-   recovery; the retry path stays and the fallback (proposal item 2) triggers on any formula
-   error. The one sharp question left for Damian: **was the phasing for cross-reference
-   ordering, or for the formula-drop retry loop?** If ordering, single-pass id-refs handle it
-   and phasing is fallback-only; if the retry loop, that mechanism is untouched by this change.
-3. **Depth and size — PARTIALLY OPEN.** Confirmed to depth 2 (above). Still worth a deep
-   transitive chain (5+ levels) and a large model, to be sure phasing was not guarding
-   scale/timeout rather than ordering.
-4. **Build coverage — OPEN.** Confirmed on current ps-internal only. Check the oldest
-   ThoughtSpot build the skills still support, since I9 is build-sensitive.
+I9 was added in **#110** ("add I9/I10 invariants") from a **live import failure** during the
+Weighted Usage migration on se-thoughtspot (2026-06-19): *"formula-to-formula bracket
+references fail on first import."* Phased import (`split_for_phased_import`) was then built
+into the first `build-model` in **#128** (v0.18.0) as one of 8 formula-import failure modes
+from the CPG Merch migration, and validated at scale (163 formulas, 6 dependency levels).
 
-With #1 closed, single-pass is proven for the common case on the current build; #2 governs
-whether phasing is "fallback only" or "still required for some builds." Either way the
-fallback stays, so nothing regresses.
+So phasing was deliberate and battle-tested — but it does **two separable jobs**:
+
+- **(a) dependency-level ordering** — subsumed by single-pass id-refs + topological sort
+  within one import. This is the part the phase1+ *emission* represented, and it is what is
+  safe to retire.
+- **(b) formula-error recovery** — `_import_with_retry` + `filter_unresolvable_formulas`.
+  This is a different mechanism, lives in the MERGE path, and is **kept**.
+
+The one thing history does **not** settle: whether the failing refs in #110/#128 were
+**display-name** refs (which our evidence shows still fail) or **id** refs (which resolve
+single-pass). I9's original wording predates the id-ref convention, so it most likely
+describes name-refs. **Confirm with Damian:** were the Weighted Usage / CPG failures
+name-refs? If so, retiring the phase1+ emission carries no risk — recovery stays, ordering
+moves into the single merged import that already runs.
 
 ---
 
-## Scope of changes (if it lands)
+## Scope of the code follow-up (separate PR, if this lands)
 
-- `ts_cli/model_builder.py` / `ts_cli/commands/tableau.py`: single-pass assembly as default;
-  phased path retained as fallback. Extract the shared cross-ref assembly so
-  `ts powerbi build-model` reuses it (do not reimplement).
-- `agents/shared/schemas/thoughtspot-model-tml.md`: refine I9 (text above); mirror the one-
-  line invariant in the root `CLAUDE.md`.
-- Tests in `tools/ts-cli/tests/` for the single-pass assembler and the fallback trigger
-  (pure functions, no live cluster — per `.claude/rules/ts-cli.md`).
-- `tools/ts-cli` version bump (MINOR — new capability) with `__init__.py`/`pyproject.toml`
-  kept in sync (`check_version_sync.py`); `CHANGELOG.md` repo entry.
-- Record the verified finding in the relevant skills' `references/open-items.md`.
-
-## Why this is a good-citizen change, not an override
-
-- It **keeps** the phased path as a fallback; nothing regresses.
-- It moves cross-ref resolution into **shared** code, which is the repo's own principle for a
-  ThoughtSpot-side concern and satisfies the conversion-consistency auditor (#9).
-- It is motivated by the repo's own audit angles: fewer API round-trips (#14) and
-  agentic/deterministic-and-simpler codification (#11).
-- It refines an invariant **with evidence and a named verification gate**, rather than
-  contradicting it.
-
----
+- `ts_cli/model_builder.py` / `ts_cli/commands/tableau.py`: GENERATE mode emits base +
+  **one** ordered formulas artifact; stop writing `*.phase1+.model.tml`. `_import_with_retry`
+  and `build_formula_levels` unchanged.
+- SKILL.md (`ts-convert-from-tableau`): drop the Step 5b/Step 6 caveats about unused phase1+
+  files (they stop existing); MINOR skill version bump + changelog.
+- `tools/ts-cli` version bump (MINOR) with `__init__.py`/`pyproject.toml` in sync
+  (`check_version_sync.py`); `CHANGELOG.md` entry.
+- Tests in `tools/ts-cli/tests/` for the new single-artifact emitter (pure functions, no live
+  cluster — per `.claude/rules/ts-cli.md`).
+- I9 wording lands separately in **PR #247**.
 
 ## Appendix: reproduction script
 
-Uses a ThoughtSpot profile / secret you already have; prints no secrets. Run with any 3.x
-Python that has `requests` + `pyyaml`.
+Uses a ThoughtSpot profile / secret you already have; prints no secrets. VALIDATE_ONLY —
+creates nothing.
 
 ```python
 import json, yaml, requests
