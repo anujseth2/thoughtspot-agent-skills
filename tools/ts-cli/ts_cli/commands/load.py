@@ -247,11 +247,35 @@ _STATUSES = ["Active", "Pending", "Closed", "Open", "Cancelled", "Processing",
              "Shipped", "Delivered", "Returned", "On Hold"]
 
 
+def _is_int_type(col_type: str) -> bool:
+    """True for integer-family types across dialects: INTEGER/INT/BIGINT/… and
+    NUMBER/NUMERIC/DECIMAL with zero (or absent) scale."""
+    t = (col_type or "").upper()
+    if any(k in t for k in ("INTEGER", "BIGINT", "SMALLINT", "TINYINT")) or \
+            re.search(r"\bINT\b", t):
+        return True
+    if any(k in t for k in ("NUMBER", "NUMERIC", "DECIMAL")):
+        m = re.search(r"\(\s*\d+\s*,\s*(\d+)\s*\)", t)
+        return not (m and int(m.group(1)) > 0)   # scale 0 / no scale → integer
+    return False
+
+
+def _is_float_type(col_type: str) -> bool:
+    """True for real-number types: FLOAT/DOUBLE/REAL and NUMBER/DECIMAL with scale > 0."""
+    t = (col_type or "").upper()
+    if any(k in t for k in ("FLOAT", "DOUBLE", "REAL")):
+        return True
+    if any(k in t for k in ("NUMBER", "NUMERIC", "DECIMAL")):
+        m = re.search(r"\(\s*\d+\s*,\s*(\d+)\s*\)", t)
+        return bool(m and int(m.group(1)) > 0)
+    return False
+
+
 def _pick_generator(col_name: str, col_type: str, rng):
     """Return a generator function for a column based on name and type patterns."""
     lower = col_name.lower()
 
-    if ("id" in lower or "key" in lower) and "INTEGER" in col_type:
+    if ("id" in lower or "key" in lower) and _is_int_type(col_type):
         counter = [0]
         def gen_seq():
             counter[0] += 1
@@ -263,7 +287,7 @@ def _pick_generator(col_name: str, col_type: str, rng):
             return f"user_{rng.randint(1, 9999)}@example.com"
         return gen_email
 
-    if any(w in lower for w in ("name", "customer")) and "INTEGER" not in col_type and "FLOAT" not in col_type:
+    if any(w in lower for w in ("name", "customer")) and not _is_int_type(col_type) and not _is_float_type(col_type):
         def gen_name():
             return f"{rng.choice(_FIRST_NAMES)} {rng.choice(_LAST_NAMES)}"
         return gen_name
@@ -311,15 +335,15 @@ def _pick_generator(col_name: str, col_type: str, rng):
             return f"{rng.uniform(0, 1):.4f}"
         return gen_pct
 
-    if "BOOLEAN" in col_type:
+    if "BOOL" in col_type.upper():   # matches BOOL and BOOLEAN
         def gen_bool():
             return rng.choice(["true", "false"])
         return gen_bool
-    if "INTEGER" in col_type:
+    if _is_int_type(col_type):
         def gen_int():
             return str(rng.randint(1, 1000))
         return gen_int
-    if "FLOAT" in col_type:
+    if _is_float_type(col_type):
         def gen_float():
             return f"{rng.uniform(0, 1000):.2f}"
         return gen_float
@@ -741,13 +765,15 @@ def _col_type(col: dict) -> str:
     return col.get("inferred_type") or col.get("type") or "STRING"
 
 
-def build_dbx_create_sql(fqtn: str, columns: list) -> str:
+def build_dbx_create_sql(fqtn: str, columns: list, replace: bool = False) -> str:
     """CREATE TABLE DDL. Backtick-quotes identifiers and enables Delta **column mapping**
     so source column names with spaces/special chars (e.g. `Order Date`, `Order Id`) are
     preserved 1:1 — Delta otherwise rejects them (DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES).
-    Live-verified on ps-internal 2026-07-16."""
+    `replace=True` uses CREATE OR REPLACE (drops+recreates to change the schema of an
+    already-provisioned table). Live-verified on ps-internal 2026-07-16."""
+    verb = "CREATE OR REPLACE TABLE" if replace else "CREATE TABLE IF NOT EXISTS"
     cols = ",\n  ".join(f"`{_col_name(c)}` {dbx_type(_col_type(c))}" for c in columns)
-    return (f"CREATE TABLE IF NOT EXISTS {fqtn} (\n  {cols}\n) USING DELTA\n"
+    return (f"{verb} {fqtn} (\n  {cols}\n) USING DELTA\n"
             "TBLPROPERTIES ('delta.columnMapping.mode' = 'name', "
             "'delta.minReaderVersion' = '2', 'delta.minWriterVersion' = '5')")
 
@@ -816,6 +842,7 @@ def databricks(
     rows: int = typer.Option(100, "--rows", "-r", help="Synthetic rows per table"),
     seed: int = typer.Option(42, "--seed", help="Deterministic data seed"),
     batch: int = typer.Option(200, "--batch", help="Rows per INSERT statement"),
+    replace: bool = typer.Option(False, "--replace", help="CREATE OR REPLACE (re-provision an existing table's schema)"),
 ) -> None:
     """Provision table(s) + synthetic data into a Databricks catalog.schema.
 
@@ -845,7 +872,7 @@ def databricks(
         name = tbl["table_name"]
         cols = tbl["columns"]
         fqtn = f"`{cat}`.`{sch}`.`{name}`"
-        _dbx_exec(cli_profile, warehouse_id, build_dbx_create_sql(fqtn, cols))
+        _dbx_exec(cli_profile, warehouse_id, build_dbx_create_sql(fqtn, cols, replace=replace))
         csv_path = generate_csv(tbl, rows=rows, output_dir=out_dir, seed=seed)
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv_mod.reader(f)

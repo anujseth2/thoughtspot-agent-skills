@@ -44,3 +44,38 @@ def test_insert_sql_builds_value_tuples():
     assert sql.startswith("INSERT INTO `c`.`s`.`t` (`Region`, `Sales`) VALUES ")
     assert "('West', 10.5)" in sql
     assert "('East', 20)" in sql
+
+
+# ---------------------------------------------------------------------------
+# Numeric-type detection for synthetic data (bug: NUMBER/DECIMAL/INT/BIGINT
+# fell through to the val_00001 string generator) — added 2026-07-16
+# ---------------------------------------------------------------------------
+from ts_cli.commands.load import _is_int_type, _is_float_type, _pick_generator
+import random
+
+
+def test_is_int_type():
+    for t in ("INTEGER", "INT", "BIGINT", "NUMBER(38,0)", "NUMERIC(10)", "DECIMAL(5,0)"):
+        assert _is_int_type(t), t
+    for t in ("NUMBER(38,2)", "DOUBLE", "VARCHAR(64)", "DATE"):
+        assert not _is_int_type(t), t
+
+
+def test_is_float_type():
+    for t in ("FLOAT", "DOUBLE", "REAL", "NUMBER(38,2)", "DECIMAL(10,4)"):
+        assert _is_float_type(t), t
+    for t in ("NUMBER(38,0)", "BIGINT", "VARCHAR", "DATE"):
+        assert not _is_float_type(t), t
+
+
+def test_id_column_number_type_generates_integers_not_val_strings():
+    # regression: order_id NUMBER(38,0) previously produced "val_00001" (string)
+    gen = _pick_generator("order_id", "NUMBER(38,0)", random.Random(1))
+    vals = [gen() for _ in range(5)]
+    assert all(v.isdigit() for v in vals), vals   # integers, not val_0000N
+
+
+def test_plain_number_column_generates_numeric():
+    gen = _pick_generator("some_measure", "NUMBER(38,2)", random.Random(1))
+    v = gen()
+    assert float(v)  # parses as a number, not a val_ string
