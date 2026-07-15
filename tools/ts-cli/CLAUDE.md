@@ -17,6 +17,17 @@ ts_cli/
   snowflake_ops.py     — Semantic View diff (normalise_expr/exprs_differ/compute_change_set) + DDL lint (lint_sv_ddl) + SQL var substitution (parse_var_assignment/substitute_sql_vars, behind `ts snowflake exec` — BL-079) behind `ts snowflake` (pure functions, no I/O)
   spotql_ops.py        — Aggregate-function classification (AGGREGATE_FUNCS/is_aggregate_expr/classify_expr/outermost_func/classify_model_columns; incl. semi-additive last_value/first_value → SUM wrapper) behind `ts spotql classify-columns` (pure functions, no I/O)
   promote.py           — Formula promotion merge (extract_answer_formulas/detect_duplicates/map_references/build_merged_model) behind `ts model promote-formula` (pure functions, no I/O; BL-066)
+  aggregate/
+    __init__.py          — package marker
+    signatures.py         — Answer/Liveboard TML -> normalized query signatures (grouping columns, filters, date bucket) behind `ts aggregate signatures` (pure functions, no I/O)
+    measures.py           — measure decomposition rewrite plans (SUM/MIN/MAX/COUNT/AVG/ratio classification) for aggregate models (pure functions, no I/O)
+    lattice.py            — grain lattice: bucket/coverage rule + candidate generation from signatures + rewrite plans behind `ts aggregate recommend` (pure functions, no I/O)
+    scoring.py            — cost-based (profiled) / coverage-based (unprofiled) greedy candidate selection with a marginal-gain curve behind `ts aggregate recommend` (pure functions, no I/O)
+    sqlgen.py             — aggregate SELECT / profiling SQL / DDL emission across snowflake/databricks/bigquery dialects behind `ts aggregate profile`/`generate` (pure functions, no I/O); fallback path only as of Task 18 — see spotql_aggregate.py
+    spotql_aggregate.py   — Task 18/19: build a SpotQL SELECT for a candidate's grain (build_spotql — measures by display name, raw date columns, no bucket fn; single-component SUM/MIN/MAX/COUNT measures only, AVG/RATIO raise UnsupportedMeasureError) and wrap ThoughtSpot-compiled warehouse SQL as aggregate DDL (wrap_as_ddl — outer DATE_TRUNC+reagg aggregating SELECT when a date descriptor carries a bucket, plain positional pass-through otherwise), reusing sqlgen.build_ddl/_date_trunc for materialization shapes and per-dialect date truncation — the default DDL SELECT source behind `ts aggregate profile`/`generate`, because ThoughtSpot's own SQL generation resolves joins correctly on role-playing/ambiguous-path dimensions where sqlgen.build_select's hand-rolled walker can be wrong (pure functions, no I/O)
+    generate.py           — aggregate Table/Model TML assembly + `aggregated_models` association patch on the primary Model, reusing tables.py/model_builder.py rather than hand-assembling TML (pure functions, no I/O)
+    rls.py                — RLS extraction + grain-conflict detection + rule propagation onto the aggregate table (extract_rls/rls_filter_columns/candidate_rls_conflict/add_rls_columns_to_candidate/propagate_rls; tuple-keyed, identical-rule dedup) — wired by commands/aggregate.py + aggregate_rls.py (pure functions, no I/O)
+    history.py            — match Snowflake QUERY_HISTORY GROUP BY shapes to signatures, producing reweighted signature weights behind `ts aggregate history` (pure functions, no I/O)
   dependency/
     __init__.py          — re-exports mutate.py + backup.py public entry points
     mutate.py             — REMOVE/REPOINT TML dict transforms (apply_remove/apply_repoint dispatchers + remove_columns_from_*/repoint_* helpers) behind `ts dependency mutate` (pure functions, no I/O; BL-083)
@@ -65,6 +76,8 @@ ts_cli/
     dependency_apply.py — ts dependency apply-change (Step 9 destructive orchestrator; attaches to dependency.app) — BL-083 PR2
     audit.py      — ts audit run / report
     databricks.py — ts databricks (parse-mv, translate-formulas, build-model) — BL-063 PR2/PR3/PR4
+    aggregate.py  — ts aggregate (signatures, recommend, profile, history, generate) — aggregate-model advisor engine
+    aggregate_rls.py — RLS command-layer wiring for `ts aggregate` (Task 23): _attach_rls_conflicts (recommend advisory surfacing) + _propagate_rls_or_fail_closed (generate security gate — fails closed on incomplete tables-dir or grain missing an RLS filter column) over the pure aggregate/rls.py engine; split out of aggregate.py to stay under the file-size gate, imported lazily from recommend/generate
   audit/
     __init__.py       — run_audit() entry point, angle module registry
     context.py        — AuditContext dataclass + build_context()
@@ -85,7 +98,7 @@ Each command group is a separate module in `commands/`. `cli.py` imports and reg
 ## Version sync
 
 `ts_cli/__init__.py __version__` must always match `pyproject.toml version`. Bump both together.
-Current version: **0.52.0**. Run `python tools/validate/check_version_sync.py` to verify.
+Current version: **0.53.0**. Run `python tools/validate/check_version_sync.py` to verify.
 
 ## Required dependencies
 

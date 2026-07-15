@@ -1530,6 +1530,195 @@ formulas, rename map, phase count).
 
 ---
 
+### `ts aggregate signatures` / `recommend` / `profile` / `history` / `generate`
+
+The aggregate-model advisor for the `ts-object-model-aggregates` skill (planned):
+mines a Model's dependent Answers/Liveboards into query "signatures", generates and
+ranks candidate aggregate grains, optionally profiles/reweights them against a live
+Snowflake warehouse, and emits the DDL + TML to create one approved aggregate. Each
+step writes to a shared working directory so the pipeline can be resumed or re-run
+independently. Pure logic lives in `ts_cli/aggregate/` (`signatures.py`,
+`measures.py`, `lattice.py`, `scoring.py`, `sqlgen.py`, `generate.py`, `history.py`);
+this command group is the I/O shell.
+
+#### `ts aggregate signatures`
+
+Export the primary Model and its Answer/Liveboard dependents, and extract query
+signatures (grouping columns, filters, date bucket) from each.
+
+```bash
+ts aggregate signatures --model abc-123 --out /tmp/agg --profile prod
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | — | Primary Model GUID (required) |
+| `--profile` / `-p` | `TS_PROFILE` env var | ThoughtSpot profile |
+| `--out` | — | Output directory (required) |
+
+**Output:** writes `<out>/model.tml.yaml` and `<out>/signatures.jsonl`. Stdout JSON:
+`{"model_guid", "signatures", "full", "partial", "dependents", "export_failures"}` —
+`partial` counts signatures whose source query couldn't be fully parsed;
+`export_failures` counts dependents that failed to export (skipped, not fatal).
+
+#### `ts aggregate recommend`
+
+Generate candidate aggregate grains from the signatures and rank them with a
+greedy marginal-gain selection.
+
+```bash
+ts aggregate recommend --dir /tmp/agg --max-select 10
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dir` | — | Directory from `signatures` (required) |
+| `--weights` | — | `weights.json` produced by `history`, to reweight signatures by observed query volume |
+| `--base-rows` | — | Base (unaggregated) row count, enables cost-mode selection once at least one candidate is profiled |
+| `--max-select` | `10` | Maximum number of candidates to select |
+| `--tables-dir` | `<dir>/tables` | Directory of exported Table TMLs (Step 3's `<NAME>.tml.yaml` per `model_tables` entry) — read to detect base-table row-level security and surface per-candidate conflicts. A missing/empty directory is a no-op. |
+
+**Output:** writes/updates `<dir>/candidates.json`. Stdout JSON: `{"mode",
+"selected", "curve", "candidates", "excluded_unprofiled", "rls_conflicts"}` — `mode` is
+`"cost"` once profiling data exists, else `"coverage"`; `excluded_unprofiled` lists
+candidate ids skipped from cost-mode ranking because they have no `agg_rows` yet;
+`rls_conflicts` (Task 23) lists candidate ids whose grain omits a base-table RLS filter
+column — each also carries `rls: {required, missing}` + `rls_conflict: true` in
+`candidates.json`; empty when no base table carries RLS at all.
+
+#### `ts aggregate profile`
+
+Measure base and per-candidate row counts, in connected or manual mode.
+
+```bash
+ts aggregate profile --dir /tmp/agg --tables-dir /tmp/agg/tables \
+  --snowflake-profile my-sf --top-k 10
+
+ts aggregate profile --dir /tmp/agg --tables-dir /tmp/agg/tables \
+  --emit-sql /tmp/agg/profile.sql
+ts aggregate profile --dir /tmp/agg --tables-dir /tmp/agg/tables \
+  --results /tmp/agg/manual_counts.json
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dir` | — | Directory from `signatures`/`recommend` (required) |
+| `--tables-dir` | — | Directory of exported Table TMLs, one `<NAME>.tml.yaml` per `model_tables` entry (required) |
+| `--snowflake-profile` | — | Connected mode: profile directly via a `ts-profile-snowflake` profile |
+| `--emit-sql` | — | Manual mode: write a numbered profiling SQL script here instead of connecting |
+| `--results` | — | Manual mode: ingest `{"base_rows": N, "candidates": {"cand_1": rows, ...}}` from a manual profiling run |
+| `--top-k` | `10` | Profile only the top-K candidates by coverage |
+| `--dialect` | `snowflake` | SQL dialect for generated statements |
+| `--warehouse` | profile's `default_warehouse` | Connected mode: Snowflake warehouse |
+| `--role` | profile's `default_role` | Connected mode: Snowflake role |
+| `--model-guid` | — | Primary Model GUID — enables SpotQL-based profiling SQL per candidate (ThoughtSpot resolves joins correctly on role-playing/ambiguous-path dimensions; the built-in join walker can be wrong there). Omit to always use the built-in walker (pre-Task-18 default; no ThoughtSpot connection needed). |
+| `--profile` / `-p` | `TS_PROFILE` env var | ThoughtSpot profile — used with `--model-guid` to call `ts spotql generate-sql`. Ignored if `--model-guid` is omitted. |
+| `--no-spotql` | `false` | Even with `--model-guid`, use the built-in join walker directly |
+
+The three modes are mutually exclusive: `--results` ingests, `--emit-sql` writes a
+script (no connection), otherwise `--snowflake-profile` connects and profiles
+directly. Each candidate's profiling SQL prefers SpotQL when `--model-guid` is
+given (falling back to the built-in join walker on any failure); the base-row
+count is always a plain single-table count either way. Candidates whose SELECT
+can't be built deterministically by either path are skipped (reported, not
+fatal) — the skill falls back to manual SQL for those.
+
+**Output:** writes `agg_rows`/`base_rows` back into `<dir>/candidates.json`. Stdout
+JSON varies by mode (`emitted`/`skipped`, `ingested`, or `base_rows`/`profiled`/`skipped`).
+
+#### `ts aggregate history`
+
+Mine Snowflake `QUERY_HISTORY` for the physical tables behind a Model into
+signature weights, reflecting actual query volume rather than assuming every
+dependent is queried equally.
+
+```bash
+ts aggregate history --dir /tmp/agg --snowflake-profile my-sf \
+  --tables "SALES_FACT,DIM_CUSTOMER" --days 30
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dir` | — | Directory from `signatures` (required) |
+| `--snowflake-profile` | — | `ts-profile-snowflake` profile (required) |
+| `--tables` | — | Comma-separated physical table names to match in query history (required) |
+| `--days` | `30` | Lookback window in days |
+| `--warehouse` | profile's `default_warehouse` | Snowflake warehouse |
+| `--role` | profile's `default_role` | Snowflake role |
+
+**Output:** writes `<dir>/weights.json`. Stdout: `{"history_rows",
+"weighted_signatures"}`.
+
+#### `ts aggregate generate`
+
+Emit the DDL and TML for one approved candidate — never imports; the calling skill
+gates each import separately.
+
+**DDL SELECT source (default: SpotQL):** builds a SpotQL statement for the
+candidate's grain and asks ThoughtSpot to compile it against the primary Model
+(`--model-guid`/`--profile`) — this resolves joins against the full semantic
+model, so it's correct on role-playing/ambiguous-path dimensions where the
+built-in join walker (`sqlgen.build_select`) can silently be wrong. Falls back
+to that walker automatically if SpotQL generation is unavailable or errors, or
+always with `--no-spotql`; a fallback prints a stderr note that the result may
+be wrong on such dimensions.
+
+**RLS propagation (Task 23):** before anything is written, extracts row-level
+security from the `--tables-dir` Table TMLs. It **fails closed** (`exit 1`, nothing
+written) in two cases: (1) the `--tables-dir` didn't load a Table TML for every
+`model_tables` entry, so RLS can't even be assessed (an empty/incomplete dir would
+otherwise read as "no RLS" and emit an unsecured aggregate — a fail-open); or (2) any
+base table carries `rls_rules` and the candidate's grain still omits a required filter
+column. Otherwise the base rule(s) are remapped onto the aggregate's own grain columns
+and attached to `table.tml.yaml`'s `table.rls_rules` (and `table_spec.json`'s
+`rls_rules` key); a no-op only when the tables-dir fully covers the model and no covered
+base table carries RLS. No dedicated flag for the force-add path — the calling skill
+applies `ts_cli.aggregate.rls.add_rls_columns_to_candidate` directly to
+`candidates.json` before calling `generate`, so `generate` just reads the
+already-widened candidate.
+
+```bash
+ts aggregate generate --dir /tmp/agg --candidate cand_3 \
+  --model-guid abc-123 --tables-dir /tmp/agg/tables \
+  --db ANALYTICS --schema PUBLIC --connection-name "Snowflake Prod" \
+  --profile prod --materialization auto
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dir` | — | Directory from `recommend`/`profile` (required) |
+| `--candidate` | — | Candidate id, e.g. `cand_3` (required) |
+| `--model-guid` | — | Primary Model GUID, re-exported fresh to patch `aggregated_models` (required) |
+| `--tables-dir` | — | Directory of exported Table TMLs (required) |
+| `--db` | — | Target database for the aggregate table (required) |
+| `--schema` | — | Target schema for the aggregate table (required) |
+| `--connection-name` | — | ThoughtSpot connection display name (required) |
+| `--profile` / `-p` | `TS_PROFILE` env var | ThoughtSpot profile (used to re-export the primary Model) |
+| `--dialect` | `snowflake` | SQL dialect |
+| `--materialization` | `auto` | `auto` \| `ctas` \| `dynamic` — a Snowflake dynamic table requires `--warehouse` |
+| `--warehouse` | — | Warehouse for a dynamic table materialization |
+| `--agg-name` | derived from root table + grain | Override the aggregate table/model base name |
+| `--out-dir` | `<dir>/<candidate>` | Output directory |
+| `--agg-model-guid` | — | Aggregate Model's GUID, once known (import `agg_model.tml.yaml` first, then pass its returned GUID here). Used as the `aggregated_models` association `id` — the aggregate Model and its backing Table share a name, so a name-based id is ambiguous (`DUPLICATE_OBJECT_FOUND` on a live cluster). Omit on the first, pre-import pass; a stderr warning flags the name-based fallback. |
+| `--no-spotql` | `false` | Skip SpotQL SQL generation and use the built-in join walker directly — see the DDL SELECT source note above |
+
+**Output:** writes `ddl.sql`, `table_spec.json`, `table.tml.yaml`,
+`agg_model.tml.yaml`, and `primary_patched.tml.yaml` (the primary Model TML with the
+new `aggregated_models` entry patched in) to `--out-dir`. Stdout: `{"candidate",
+"aggregate_name", "files"}`.
+
+---
+
 ## Piping and scripting
 
 All commands write JSON to stdout, making them easy to pipe into `jq` or Python:
