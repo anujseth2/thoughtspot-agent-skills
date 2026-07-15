@@ -750,11 +750,12 @@ source drift.
 ### `ts connections list`
 
 List all available data connections. Results are auto-paginated — all connections
-are returned regardless of how many exist on the instance.
+are returned regardless of how many exist on the instance. **Lists every warehouse type
+by default** (Snowflake, Databricks, BigQuery, …); pass `--type` to filter to one.
 
 ```bash
-ts connections list
-ts connections list --type BIGQUERY
+ts connections list                      # ALL types
+ts connections list --type DATABRICKS    # filter to one type
 ```
 
 **Options:**
@@ -762,7 +763,12 @@ ts connections list --type BIGQUERY
 | Flag | Default | Description |
 |---|---|---|
 | `--profile`, `-p` | first profile | Profile to use |
-| `--type`, `-t` | `SNOWFLAKE` | Data warehouse type filter |
+| `--type`, `-t` | _(none — all types)_ | Optional data warehouse type filter (e.g. `SNOWFLAKE`, `DATABRICKS`) |
+
+> **Org scope:** connections (and metadata) are org-scoped. To operate in a non-default
+> org, set `TS_ORG=<org_id>` (integer org id) — the CLI mints an org-scoped token
+> (`org_id` on `auth/token/full`) with an org-keyed token cache. Without it, calls run in
+> your default org.
 
 **Output:** JSON array of connection objects.
 

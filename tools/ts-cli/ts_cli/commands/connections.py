@@ -18,12 +18,14 @@ _profile_option = typer.Option(None, "--profile", "-p", envvar="TS_PROFILE",
 @app.command("list")
 def list_connections(
     profile: Optional[str] = _profile_option,
-    type: str = typer.Option("SNOWFLAKE", "--type", "-t",
-                             help="Data warehouse type filter (e.g. SNOWFLAKE, BIGQUERY)"),
+    type: Optional[str] = typer.Option(None, "--type", "-t",
+                             help="Optional data warehouse type filter (e.g. SNOWFLAKE, "
+                                  "DATABRICKS, BIGQUERY). Omit to list ALL types."),
 ) -> None:
     """List all available data connections (auto-paginated).
 
-    Output: JSON array of all connection objects from
+    Lists connections of **every** warehouse type by default; pass --type to filter to one
+    (e.g. DATABRICKS). Output: JSON array of all connection objects from
     POST /api/rest/2.0/connection/search (all pages, not capped).
     """
     client = ThoughtSpotClient(resolve_profile(profile))
@@ -31,10 +33,10 @@ def list_connections(
     offset = 0
     page_size = 500
     while True:
-        resp = client.post(
-            "/api/rest/2.0/connection/search",
-            json={"data_warehouse_types": [type], "record_size": page_size, "record_offset": offset},
-        )
+        body: Dict[str, Any] = {"record_size": page_size, "record_offset": offset}
+        if type:  # omit the filter entirely to return every warehouse type
+            body["data_warehouse_types"] = [type]
+        resp = client.post("/api/rest/2.0/connection/search", json=body)
         page = resp.json()
         if not isinstance(page, list) or not page:
             break
