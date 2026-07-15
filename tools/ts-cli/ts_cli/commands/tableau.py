@@ -129,13 +129,17 @@ def parse_cmd(
     for ds in parsed["datasources"]:
         ds["orphan_calcs"] = detect_orphan_calcs(ds)
     parsed["blend_plan"] = build_blend_plan(parsed["blends"], parsed["datasources"])
+    from ts_cli.tableau.dashboards import extract_dashboards
+    parsed["dashboards"] = extract_dashboards(root)
 
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     Path(output_file).write_text(json.dumps(parsed, indent=2))
 
+    n_viz = sum(len(d.get("visuals", [])) for d in parsed["dashboards"])
     typer.echo(
         f"Parsed {len(parsed['datasources'])} datasource(s), "
-        f"{len(parsed['blends'])} blend edge-set(s) -> {output_file}",
+        f"{len(parsed['blends'])} blend edge-set(s), "
+        f"{len(parsed['dashboards'])} dashboard(s)/{n_viz} viz -> {output_file}",
         err=True,
     )
 
@@ -1091,12 +1095,34 @@ def build_model_cmd(
     print(json.dumps(all_results, indent=2))
 
 
+def _resolve_lb_spec(data: dict, model_name, model_fqn, report_name) -> dict:
+    """A full build_from_spec spec (has 'model_name'), or a `ts tableau parse` output
+    (has 'dashboards') → assembled into a spec with --model-name + derived measures."""
+    if data.get("model_name"):
+        return data
+    if "dashboards" not in data:
+        raise SystemExit("Input must be a parse output ('dashboards') or a full spec ('model_name').")
+    if not model_name:
+        raise SystemExit("--model-name is required when --input is a parse output.")
+    measures = sorted({f["name"] for d in data["dashboards"]
+                       for v in d.get("visuals", []) for f in v.get("fields", [])
+                       if f.get("measure")})
+    return {"report_name": report_name or model_name, "model_name": model_name,
+            "model_fqn": model_fqn, "measure_names": measures, "dashboards": data["dashboards"]}
+
+
 @app.command("build-liveboard")
 def build_liveboard_cmd(
     input_file: str = typer.Option(..., "--input", "-i",
-                                   help="Dashboard spec JSON (see ts_cli/tableau/liveboard.py build_from_spec)"),
+                                   help="A `ts tableau parse` output (has 'dashboards') OR a full spec (has 'model_name')"),
     output_dir: str = typer.Option(".", "--output-dir", "-o",
                                    help="Directory for the emitted .liveboard.tml"),
+    model_name: Optional[str] = typer.Option(None, "--model-name",
+                                             help="Model/table name to bind to (required with a parse-output input)"),
+    model_fqn: Optional[str] = typer.Option(None, "--model-fqn",
+                                            help="Model/table GUID to bind to (optional; more robust than name)"),
+    report_name: Optional[str] = typer.Option(None, "--report-name",
+                                              help="Liveboard name (default: the model name)"),
 ) -> None:
     """Emit Answer + tabbed-Liveboard TML from a parsed Tableau dashboard spec.
 
@@ -1121,14 +1147,12 @@ def build_liveboard_cmd(
         typer.echo(f"Spec file not found: {input_file}", err=True)
         raise SystemExit(1)
     try:
-        spec = json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except ValueError as exc:
-        typer.echo(f"Invalid JSON spec: {exc}", err=True)
-        raise SystemExit(1)
-    if not spec.get("model_name"):
-        typer.echo("Spec must include 'model_name'.", err=True)
+        typer.echo(f"Invalid JSON: {exc}", err=True)
         raise SystemExit(1)
 
+    spec = _resolve_lb_spec(data, model_name, model_fqn, report_name)
     result = lb.build_from_spec(spec)
 
     out_path = Path(output_dir)

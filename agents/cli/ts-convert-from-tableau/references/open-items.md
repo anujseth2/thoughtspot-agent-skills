@@ -241,9 +241,18 @@ emitter bugs the live import caught (lint did NOT) — both **FIXED in ts-cli v0
   `build_answer` now references the resolved name in chart/axis/table (search still uses the
   token). Bare (unbucketed) dates were never a problem.
 
-**Still FOLLOW-ON:** parser role extraction — `ts tableau parse` does not yet emit
-dashboards/visuals/shelves, so the build-liveboard spec is still assembled by the skill from
-the Step 9 parse rather than produced end-to-end by the parser.
+**Parser dashboard/role extraction — DONE 2026-07-16 (ts-cli v0.59.0).** `ts tableau parse`
+now emits a `dashboards` key (each `<dashboard>` → visuals with mark + fields tagged by
+shelf/role/measure, calc-id→caption resolution, date buckets, grid tiles) via
+`ts_cli/tableau/dashboards.py`. `ts tableau build-liveboard --input <parse.json> --model-name
+<model>` consumes it directly — **parse→build-liveboard now runs with no hand-assembled spec**.
+Live-verified on the FedEx VEDR workbook: parse → 18 auto-extracted visuals → build-liveboard
+emitted a clean-linting 18-tile liveboard bound to the model (vs the prior hand-picked subset).
 
-Status: LIVE-VERIFIED (emission + import) 2026-07-15; two fixes applied; parser role
-extraction remains the open follow-on.
+Remaining fidelity follow-ons (not blockers): (a) caption↔model-formula-name reconciliation
+when binding to a pre-existing model whose formula names differ from the workbook captions;
+(b) KPI-on-attribute-grade handling (a PASS/FAIL grade KPI is flagged NEEDS REVIEW since a KPI
+wants a measure); (c) container-tree tile layout (currently coord-proportional).
+
+Status: RESOLVED (parser extraction + end-to-end parse→build-liveboard) 2026-07-16; fidelity
+follow-ons tracked above.
