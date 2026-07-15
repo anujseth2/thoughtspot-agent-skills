@@ -124,6 +124,25 @@ safe_divide ( sum ( [ORDER_FACT::NET_REVENUE] ) , unique count ( [ORDER_FACT::OR
 | `CURRENT_DATE` | `today ()` |
 | `CURRENT_TIMESTAMP` | `now ()` |
 
+### JSON / VARIANT path access — bracket notation only
+
+A LookML `sql:` expression may carry a warehouse JSON path (e.g. on Snowflake,
+`${TABLE}.raw:address.city`). When wrapped in a `sql_*_op` pass-through, ThoughtSpot's
+parser **rejects the colon-and-dot syntax** — convert each segment to `['key']` bracket
+notation:
+
+| LookML `sql:` (Snowflake colon path) | ThoughtSpot formula |
+|--------------|-------------|
+| `PARSE_JSON(${TABLE}.RAW):address.city` | `sql_string_op ( "PARSE_JSON({0})['address']['city']" , [T::RAW] )` |
+
+Canonical rule:
+[../../schemas/thoughtspot-formula-patterns.md](../../schemas/thoughtspot-formula-patterns.md#json--variant-path-access--bracket-notation-only).
+The colon-free replacement must be valid SQL for the explore's warehouse dialect —
+bracket notation is verified for Snowflake (2026-07-15) but is **not** valid on
+Databricks (use `get_json_object` there — see
+[../ts-databricks/ts-databricks-formula-translation.md](../ts-databricks/ts-databricks-formula-translation.md)).
+Confirm the form for BigQuery/Redshift/etc. before relying on it.
+
 ---
 
 ## 5. LookML `type: tier` → ThoughtSpot `if...then...else`
