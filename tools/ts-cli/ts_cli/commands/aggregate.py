@@ -23,6 +23,7 @@ from ts_cli.aggregate.scoring import consolidation_analysis, greedy_select
 from ts_cli.aggregate.signatures import column_kinds_from_model, extract_signatures
 from ts_cli.tml_common import dump_tml_yaml
 from ts_cli.commands.aggregate_advisories import (_physical_attribute_dims,
+                                                    conformed_dates,
                                                     routing_ineligible_measures,
                                                     semiadditive_measures)
 
@@ -272,6 +273,7 @@ def recommend(
     rls_conflicts = _attach_rls_conflicts(candidates, plans, model_tml, table_tmls)
     ineligible = routing_ineligible_measures(model_tml, candidates)
     semiadditive = semiadditive_measures(plans)
+    role_playing_dates = conformed_dates(model_tml, table_tmls)
 
     prior_path = d / "candidates.json"
     base_rows = _merge_prior_agg_rows(candidates, prior_path, base_rows)
@@ -285,7 +287,8 @@ def recommend(
     payload = {"base_rows": base_rows, "candidates": candidates, "selection": result,
                "routing_ineligible_measures": ineligible,
                "semiadditive_measures": semiadditive,
-               "consolidation_analysis": consolidation}
+               "consolidation_analysis": consolidation,
+               "role_playing_dates": role_playing_dates}
     prior_path.write_text(json.dumps(payload, indent=2))
 
     print(json.dumps({
@@ -298,6 +301,7 @@ def recommend(
         "routing_ineligible_measures": ineligible,
         "semiadditive_measures": semiadditive,
         "consolidation_analysis": consolidation,
+        "role_playing_dates": role_playing_dates,
     }, indent=2))
 
 
@@ -471,9 +475,18 @@ def _spotql_profile_sql_or_none(model_tml: dict, cand: dict, plans: dict, model_
     failure so the caller falls back to sqlgen's build_select/build_profile_sql."""
     if not model_guid:
         return None
-    from ts_cli.aggregate.spotql_aggregate import _strip_trailing_limit, build_spotql
+    from ts_cli.aggregate.spotql_aggregate import (_strip_trailing_limit,
+                                                   build_profiling_spotql)
     try:
-        spotql, _descriptors = build_spotql(cand, plans, model_tml["model"]["name"])
+        # Row-count profiling uses a MEASURE-FREE grain SpotQL: the distinct
+        # grain row count is measure-independent, so this keeps profiling on the
+        # SpotQL path (correct joins) even for candidates carrying an AVG/RATIO
+        # measure that build_spotql can't express (#14). `plans` is unused here
+        # for that reason (kept in the signature for caller symmetry with
+        # `_spotql_ddl_or_none`, which does need it).
+        spotql = build_profiling_spotql(cand, model_tml["model"]["name"])
+        if spotql is None:
+            return "SELECT 1 AS agg_rows"   # grand-total grain: exactly one row
         result = _spotql_generate_sql(spotql, model_guid, ts_profile)
         if result["status"] != "SUCCESS" or not result["executable_sql"]:
             _err(f"SpotQL generate-sql did not return SUCCESS for candidate "
