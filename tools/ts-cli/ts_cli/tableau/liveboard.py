@@ -191,7 +191,7 @@ def _axis_configs(chart_type: str, cols: list[str], xs: list[str], ys: list[str]
 
 
 def _resolve_outputs(cols: list[str], roles: list[str], measure_names: set,
-                     bucket_tokens: dict) -> tuple:
+                     bucket_tokens: dict, top_n: Optional[int] = None) -> tuple:
     """(cols, roles) → (out_cols, xs, ys, role_of, search_query).
 
     `out[c]` is the OUTPUT column name — the resolved bucket name (`Month(Date)`) for a
@@ -204,13 +204,16 @@ def _resolve_outputs(cols: list[str], roles: list[str], measure_names: set,
     ys = [out[c] for c in cols if c in measure_names]
     xs = [out[c] for c in cols if c not in measure_names]
     search = " ".join(bucket_tokens.get(c, f"[{c}]") for c in cols)
+    if top_n:
+        search += f" top {top_n}"                   # ThoughtSpot ranks by the (last) measure
     return out_cols, xs, ys, role_of, search
 
 
 def build_answer(name: str, obj_key: str, model_name: str, model_fqn: Optional[str],
                  cols: list[str], chart_type: str, measure_names: set,
                  roles: Optional[list[str]] = None,
-                 bucket_tokens: Optional[dict] = None) -> dict:
+                 bucket_tokens: Optional[dict] = None,
+                 top_n: Optional[int] = None) -> dict:
     """Role-aware Answer TML (ported from generate_tml._answer_tml).
 
     Measures go on y; non-measures are placed by role — Category/Axis/X → x,
@@ -224,7 +227,7 @@ def build_answer(name: str, obj_key: str, model_name: str, model_fqn: Optional[s
     raw name — referencing the raw name errors `Invalid GUID string` on import (live-verified).
     """
     out_cols, xs, ys, role_of, search = _resolve_outputs(
-        cols, roles or [""] * len(cols), measure_names, bucket_tokens or {})
+        cols, roles or [""] * len(cols), measure_names, bucket_tokens or {}, top_n)
 
     chart: dict[str, Any] = {"type": chart_type,
                              "chart_columns": [{"column_id": c} for c in out_cols]}
@@ -272,6 +275,10 @@ def build_answer_explicit(name: str, obj_key: str, model_name: str,
                              "chart_columns": [{"column_id": c} for c in cols]}
     if ov.get("axis"):
         chart["axis_configs"] = [ov["axis"]]
+    elif ov.get("ts_chart") == "KPI":
+        # A KPI viz requires a y axis or the liveboard import errors "Index: 0"
+        # (live-verified). Default it to the answer's columns when the override omits one.
+        chart["axis_configs"] = [{"y": list(cols)}]
     if ov.get("client_state_v2"):
         chart["client_state_v2"] = ov["client_state_v2"]
     # Replay custom_chart_config ONLY when it is GUID-based (a real captured config); a
@@ -345,7 +352,37 @@ def _note_join(note: str, msg: str) -> str:
 def _chart_needs(ct: str) -> int:
     if ct in CHART_NEEDS:
         return CHART_NEEDS[ct]
-    return 0 if ct in ("GRID_TABLE", "PIVOT_TABLE") else 1
+    # KPI is valid on a single value — a measure OR a PASS/FAIL grade attribute — so it
+    # needs no measure (GRID/PIVOT likewise); everything else needs at least one.
+    return 0 if ct in ("GRID_TABLE", "PIVOT_TABLE", "KPI") else 1
+
+
+def _infer_chart_type(cols: list[str], measure_names: set, buckets: dict,
+                      top_n: Optional[int]) -> str:
+    """Pick a chart type from field composition when the Tableau mark is 'Automatic'
+    (Tableau's own auto-charting is opaque, so we derive it deterministically)."""
+    if len(cols) == 1:
+        return "KPI"                               # single value (measure or grade attribute)
+    ys = [c for c in cols if c in measure_names]
+    xs = [c for c in cols if c not in measure_names]
+    if ys and not xs:
+        return "COLUMN"                            # Measure Values: many measures, no dimension
+    if not (xs and ys):
+        return "GRID_TABLE"                        # no clean dim×measure split
+    if top_n:
+        return "BAR"                               # a ranked Top-N list → horizontal bars
+    dates = [c for c in xs if c in (buckets or {})]
+    if len(dates) == len(xs):
+        return "LINE"                              # every dimension is a date → time series
+    return "COLUMN"                                # category × measure
+
+
+def _resolve_ct(mk: str, cols: list[str], vis: dict, measure_names: set) -> tuple:
+    """(ct, status, note) for a visible mark — infer when 'Automatic', else map the mark."""
+    if mk in ("automatic", ""):
+        ct = _infer_chart_type(cols, measure_names, vis.get("bucket_tokens") or {}, vis.get("top_n"))
+        return ct, "Migrated", ""
+    return chart_type_for_mark(mk)
 
 
 def _override_result(vis: dict, page: str, title: str, model_name: str,
@@ -365,15 +402,19 @@ def _visual_to_result(vis: dict, page: str, vi: int, model_name: str,
     if ov and ov.get("search") and ov.get("columns"):
         return _override_result(vis, page, title, model_name, model_fqn, ov)
 
-    ct, status, note = chart_type_for_mark(vis.get("mark"))
-    if ct is None:
+    mk = (vis.get("mark") or "").lower()
+    if mk in _NON_VISUAL:
+        _, status, note = chart_type_for_mark(mk)
         return None, None, {"page": page, "visual": title, "ts_chart": "(skipped)",
                             "status": status, "note": note}
 
     cols, roles = _collect_fields(vis)
     if not cols:
-        return None, None, {"page": page, "visual": title, "ts_chart": ct,
-                            "status": "NEEDS REVIEW", "note": _note_join(note, "no fields on the visual")}
+        return None, None, {"page": page, "visual": title, "ts_chart": "?",
+                            "status": "NEEDS REVIEW", "note": "no fields on the visual"}
+
+    # 'Automatic' → infer the chart type from the field composition; otherwise map the mark.
+    ct, status, note = _resolve_ct(mk, cols, vis, measure_names)
 
     n_meas = sum(1 for c in cols if c in measure_names)
     need = _chart_needs(ct)
@@ -384,7 +425,8 @@ def _visual_to_result(vis: dict, page: str, vi: int, model_name: str,
 
     name = vis.get("title") or auto_name(cols, measure_names) or title
     a_obj = build_answer(name, title, model_name, model_fqn, cols, ct,
-                         measure_names, roles, vis.get("bucket_tokens") or {})
+                         measure_names, roles, vis.get("bucket_tokens") or {},
+                         vis.get("top_n"))
     row = {"page": page, "visual": title, "ts_chart": ct, "status": status, "note": note}
     return a_obj, {"answer": a_obj["answer"], "tile": vis.get("tile")}, row
 

@@ -57,29 +57,28 @@ def detect_source(path: Path) -> tuple[str, list[dict]]:
             return "tableau_download", file_infos
 
         if "tables" in data:
-            has_data = any(t.get("data_file") for t in data["tables"])
-            if has_data:
-                file_infos = []
-                for t in data["tables"]:
-                    info: dict[str, Any] = {
-                        "table_name": t["table_name"],
-                        "columns": t.get("columns", []),
-                    }
-                    if t.get("data_file"):
-                        info["csv_path"] = Path(t["data_file"])
-                    file_infos.append(info)
-                return "manifest", file_infos
-            else:
-                file_infos = []
-                for t in data["tables"]:
-                    file_infos.append({
-                        "table_name": t["table_name"],
-                        "columns": t.get("columns", []),
-                    })
-                return "schema_only", file_infos
+            return _detect_tables_source(data["tables"])
 
     raise SystemExit(f"Cannot detect source type for {path}. "
                      "Provide a CSV directory, Tableau download JSON, or manifest JSON.")
+
+
+def _detect_tables_source(tables: list[dict]) -> tuple[str, list[dict]]:
+    """Normalise a `{"tables": [...]}` manifest into (source_type, file_infos).
+
+    `manifest` when any table has a `data_file` (load its CSV); otherwise `schema_only`
+    (synthetic generation). Per-table `columns` and optional `rows` are carried through.
+    """
+    has_data = any(t.get("data_file") for t in tables)
+    file_infos = []
+    for t in tables:
+        info: dict[str, Any] = {"table_name": t["table_name"], "columns": t.get("columns", [])}
+        if has_data and t.get("data_file"):
+            info["csv_path"] = Path(t["data_file"])
+        if t.get("rows") is not None:
+            info["rows"] = t["rows"]
+        file_infos.append(info)
+    return ("manifest" if has_data else "schema_only"), file_infos
 
 
 def _infer_type(values: list[str]) -> str:
@@ -185,12 +184,15 @@ def infer_schema(source_path: Path) -> dict:
     tables = []
     for info in file_infos:
         if source_type == "schema_only":
-            tables.append({
+            entry = {
                 "table_name": info["table_name"],
                 "row_count": 0,
                 "columns": info.get("columns", []),
                 "has_data": False,
-            })
+            }
+            if info.get("rows") is not None:
+                entry["rows"] = info["rows"]
+            tables.append(entry)
             continue
 
         if source_type == "manifest" and info.get("columns"):
@@ -251,7 +253,7 @@ def _is_int_type(col_type: str) -> bool:
     """True for integer-family types across dialects: INTEGER/INT/BIGINT/… and
     NUMBER/NUMERIC/DECIMAL with zero (or absent) scale."""
     t = (col_type or "").upper()
-    if any(k in t for k in ("INTEGER", "BIGINT", "SMALLINT", "TINYINT")) or \
+    if any(k in t for k in ("INTEGER", "BIGINT", "SMALLINT", "TINYINT", "INT64", "INT32")) or \
             re.search(r"\bINT\b", t):
         return True
     if any(k in t for k in ("NUMBER", "NUMERIC", "DECIMAL")):
@@ -263,12 +265,33 @@ def _is_int_type(col_type: str) -> bool:
 def _is_float_type(col_type: str) -> bool:
     """True for real-number types: FLOAT/DOUBLE/REAL and NUMBER/DECIMAL with scale > 0."""
     t = (col_type or "").upper()
-    if any(k in t for k in ("FLOAT", "DOUBLE", "REAL")):
+    if any(k in t for k in ("FLOAT", "DOUBLE", "REAL", "FLOAT64")):
         return True
     if any(k in t for k in ("NUMBER", "NUMERIC", "DECIMAL")):
         m = re.search(r"\(\s*\d+\s*,\s*(\d+)\s*\)", t)
         return bool(m and int(m.group(1)) > 0)
     return False
+
+
+def _explicit_generator(col: dict, rng):
+    """Generator from an explicit spec on the column, or None to fall back to heuristics.
+
+    - `values: [...]`  → pick uniformly from the set (categorical alignment: a formula that
+      tests `[behavior] = 'speeding'` only produces non-zero rows if 'speeding' is emitted).
+    - `min`/`max`      → uniform numeric in range (threshold alignment: a grade formula
+      `[ki] > 5` needs values that straddle 5 to yield both PASS and FAIL).
+    Used by the synthetic-data manifest derived from a Tableau model's formulas.
+    """
+    vals = col.get("values")
+    if vals:
+        return lambda: str(rng.choice(vals))
+    if "min" in col and "max" in col:
+        lo, hi = col["min"], col["max"]
+        col_type = col.get("inferred_type", col.get("type", ""))
+        if _is_float_type(col_type):
+            return lambda: f"{rng.uniform(float(lo), float(hi)):.2f}"
+        return lambda: str(rng.randint(int(lo), int(hi)))
+    return None
 
 
 def _pick_generator(col_name: str, col_type: str, rng):
@@ -379,7 +402,8 @@ def generate_csv(table_schema: dict, rows: int, output_dir: Path, seed: int = 42
     for col in columns:
         col_name = col.get("db_column_name", col.get("name", ""))
         col_type = col.get("inferred_type", col.get("type", "VARCHAR(256)"))
-        generators.append(_pick_generator(col_name, col_type, rng))
+        generators.append(_explicit_generator(col, rng)
+                          or _pick_generator(col_name, col_type, rng))
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv_mod.writer(f)
@@ -396,10 +420,13 @@ def generate_all(source_path: Path, rows: int, output_dir: Path, seed: int = 42)
     schema = infer_schema(source_path)
     results = []
     for tbl in schema["tables"]:
-        csv_path = generate_csv(tbl, rows=rows, output_dir=output_dir, seed=seed)
+        # A table may pin its own row count (e.g. a fleet-grain dimension wants 1 row so a
+        # KPI shows one clean value, while its driver-grain fact wants many for a Top-N).
+        n = int(tbl.get("rows", rows))
+        csv_path = generate_csv(tbl, rows=n, output_dir=output_dir, seed=seed)
         results.append({
             "table_name": tbl["table_name"],
-            "rows": rows,
+            "rows": n,
             "file": str(csv_path),
         })
     return results
@@ -873,7 +900,8 @@ def databricks(
         cols = tbl["columns"]
         fqtn = f"`{cat}`.`{sch}`.`{name}`"
         _dbx_exec(cli_profile, warehouse_id, build_dbx_create_sql(fqtn, cols, replace=replace))
-        csv_path = generate_csv(tbl, rows=rows, output_dir=out_dir, seed=seed)
+        n = int(tbl.get("rows", rows))   # a table may pin its own row count in the manifest
+        csv_path = generate_csv(tbl, rows=n, output_dir=out_dir, seed=seed)
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv_mod.reader(f)
             next(reader, None)  # skip header

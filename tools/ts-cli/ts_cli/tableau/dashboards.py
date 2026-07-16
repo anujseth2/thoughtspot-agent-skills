@@ -45,14 +45,60 @@ def _resolve(inst_key: str, ci: dict, captions: dict) -> Optional[dict]:
     return {"name": name, "measure": measure, "bucket": bucket}
 
 
-def worksheet_visual(name: str, ws: ET.Element, captions: dict) -> Optional[dict]:
-    """One worksheet → a build_from_spec visual (mark + fields + bucket_tokens)."""
-    mark_el = ws.find(".//mark")
-    mark = (mark_el.get("class") if mark_el is not None else "") or "Automatic"
-    cols_el = ws.find(".//table/cols")
-    rows_el = ws.find(".//table/rows")
-    ci = _instances(ws)
+def _topn_sets(root: ET.Element) -> dict:
+    """Top/bottom-N Tableau sets → {set_name: count}.
 
+    A ranked set is a `<group ui-builder="filter-group">` whose nested `<groupfilter
+    function="end">` carries `end="top"|"bottom"` and a record `count` — e.g.
+    `[Driver Name Set 2]` = top 5 drivers by SUM(events). We keep the count; ThoughtSpot's
+    `top N` search keyword reproduces the limit, ranked by the query's measure.
+    """
+    sets: dict[str, int] = {}
+    for g in root.iter("group"):
+        name = g.get("name")
+        end = g.find(".//groupfilter[@function='end']")
+        if not name or end is None:
+            continue
+        count = end.get("count")
+        if end.get("end") in ("top", "bottom") and count and count.isdigit():
+            sets[name] = int(count)
+    return sets
+
+
+def _visual_top_n(ws: ET.Element, topn_sets: dict) -> Optional[int]:
+    """The top-N count if this worksheet filters on a ranked set, else None.
+
+    A worksheet references a set either directly (`[ds].[Driver Name Set 2]`) or via the
+    in/out membership form (`[ds].[io:Driver Name Set:nk]`); both resolve to the same set.
+    """
+    for f in ws.findall(".//filter"):
+        col = f.get("column") or ""
+        m = re.search(r"\]\.(\[[^\]]+\])$", col)   # trailing [Set Name] of [ds].[Set Name]
+        if not m:
+            continue
+        key = m.group(1)
+        io = re.match(r"\[io:(.+):[a-z]+\]$", key)  # unwrap [io:Driver Name Set:nk] → [Driver Name Set]
+        if io:
+            key = f"[{io.group(1)}]"
+        if key in topn_sets:
+            return topn_sets[key]
+    return None
+
+
+def _enc_ref(enc: ET.Element) -> Optional[str]:
+    """The `[inst]` key an encoding points at, e.g. color/text → `[none:NORMALIZEDDAYS:ok]`."""
+    m = re.search(r"\]\.(\[[^\]]+\])", enc.get("column") or "")
+    return m.group(1) if m else None
+
+
+def _ws_fields(ws: ET.Element, ci: dict, captions: dict) -> tuple[list, dict]:
+    """(fields, bucket_tokens) for a worksheet, in shelf order.
+
+    Primary fields come from cols/rows/color and the Measure Values construct. `text`/`label`
+    encodings are used only as a **fallback** when nothing else resolved — a value-only KPI
+    (e.g. Normalised Days) carries its single value on `text`, but reading text unconditionally
+    would also drag in decorative label calcs (sheet-name titles, `''` spacers) onto every KPI.
+    """
     fields: list[dict] = []
     bucket_tokens: dict[str, str] = {}
     seen: set[str] = set()
@@ -62,24 +108,48 @@ def worksheet_visual(name: str, ws: ET.Element, captions: dict) -> Optional[dict
         if not f or f["name"] in seen:
             return
         seen.add(f["name"])
-        role = role_for_shelf(shelf, f["measure"])
-        fields.append({"name": f["name"], "measure": f["measure"], "role": role})
+        fields.append({"name": f["name"], "measure": f["measure"],
+                       "role": role_for_shelf(shelf, f["measure"])})
         if f["bucket"]:
             bucket_tokens[f["name"]] = f"[{f['name']}].{f['bucket']}"
 
-    for k in _shelf_refs(cols_el.text if cols_el is not None else ""):
+    cols_el, rows_el = ws.find(".//table/cols"), ws.find(".//table/rows")
+    cols_text = (cols_el.text if cols_el is not None else "") or ""
+    rows_text = (rows_el.text if rows_el is not None else "") or ""
+    for k in _shelf_refs(cols_text):
         add(k, "cols")
-    for k in _shelf_refs(rows_el.text if rows_el is not None else ""):
+    for k in _shelf_refs(rows_text):
         add(k, "rows")
     for enc in ws.findall(".//encodings/color"):
-        m = re.search(r"\]\.(\[[^\]]+\])", enc.get("column") or "")
-        if m:
-            add(m.group(1), "color")
+        if _enc_ref(enc):
+            add(_enc_ref(enc), "color")
+    # Measure Values: the shelf holds [Multiple Values]/[:Measure Names] pseudo-fields, so the
+    # real measures are the worksheet's column-instances (e.g. Behaviours & Events).
+    both = cols_text + rows_text
+    if "[Multiple Values]" in both or "[:Measure Names]" in both:
+        for inst_key in ci:
+            add(inst_key, "measure-values")
+    if not fields:                                  # value-only KPI fallback (text/label)
+        for enc in ws.findall(".//encodings/text") + ws.findall(".//encodings/label"):
+            if _enc_ref(enc):
+                add(_enc_ref(enc), enc.tag)
+    return fields, bucket_tokens
 
+
+def worksheet_visual(name: str, ws: ET.Element, captions: dict,
+                     topn_sets: Optional[dict] = None) -> Optional[dict]:
+    """One worksheet → a build_from_spec visual (mark + fields + bucket_tokens + top_n)."""
+    mark_el = ws.find(".//mark")
+    mark = (mark_el.get("class") if mark_el is not None else "") or "Automatic"
+    fields, bucket_tokens = _ws_fields(ws, _instances(ws), captions)
     if not fields:
         return None
-    return {"title": name, "mark": mark.lower(), "fields": fields,
-            "bucket_tokens": bucket_tokens}
+    v = {"title": name, "mark": mark.lower(), "fields": fields,
+         "bucket_tokens": bucket_tokens}
+    top_n = _visual_top_n(ws, topn_sets or {})
+    if top_n:
+        v["top_n"] = top_n
+    return v
 
 
 def _zone_tile(z: ET.Element) -> Optional[dict]:
@@ -106,6 +176,7 @@ def extract_dashboards(root: ET.Element) -> list[dict]:
     ws_by_name = {w.get("name"): w for w in root.findall(".//worksheets/worksheet")}
     captions = {col.get("name"): col.get("caption")
                 for col in root.findall(".//column") if col.get("caption")}
+    topn_sets = _topn_sets(root)
     dashboards: list[dict] = []
     for d in root.findall(".//dashboards/dashboard"):
         visuals: list[dict] = []
@@ -115,7 +186,7 @@ def extract_dashboards(root: ET.Element) -> list[dict]:
             if not wsname or wsname in seen or wsname not in ws_by_name:
                 continue
             seen.add(wsname)
-            v = worksheet_visual(wsname, ws_by_name[wsname], captions)
+            v = worksheet_visual(wsname, ws_by_name[wsname], captions, topn_sets)
             if v:
                 tile = _zone_tile(z)
                 if tile:
