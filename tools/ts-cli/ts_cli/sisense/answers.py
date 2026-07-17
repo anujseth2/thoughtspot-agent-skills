@@ -240,6 +240,42 @@ def _range_generic_filter(raw: dict):
     return None
 
 
+def _resolve_exposed_col(dim, cols: set, measures: set, check_exposure: bool):
+    """Filter dim -> the model column display name to chip on, or None to skip the filter.
+
+    Retries the date-hierarchy base ('Date (Calendar)' -> 'Date') before giving up; when
+    exposure checking is off, any non-empty resolved column is kept."""
+    col = _model_col(dim)
+    if not col:
+        return None
+    if not check_exposure or col in cols or col in measures:
+        return col
+    base = col.split(" (")[0].strip()
+    if base in cols or base in measures:
+        return base
+    return None
+
+
+def _chip_from_filter(sf: dict, col: str) -> dict:
+    """One resolved Sisense filter -> a ThoughtSpot Liveboard filter chip.
+
+    member -> generic_filter IN; exclude -> NOT_IN; numeric range -> GE/GT/LE/LT/BW_INC/BW/EQ.
+    Any other preset (all / relative-date / unknown) yields a bare interactive chip."""
+    chip = {"column": [col], "is_mandatory": False,
+            "is_single_value": False, "display_name": ""}
+    kind = sf.get("kind")
+    values = sf.get("values") or []
+    if kind == "member" and values:
+        chip["generic_filter"] = {"oper": "IN", "values": [str(v) for v in values]}
+    elif kind == "exclude" and values:
+        chip["generic_filter"] = {"oper": "NOT_IN", "values": [str(v) for v in values]}
+    elif kind == "range":
+        gf = _range_generic_filter(sf.get("raw"))
+        if gf:
+            chip["generic_filter"] = gf
+    return chip
+
+
 def extract_liveboard_filters(inv: dict, column_names=None, measure_names=None) -> list:
     """Sisense DASHBOARD-level filters (the interactive filter bar) -> ThoughtSpot Liveboard
     filter chips that apply across every viz. member -> generic_filter IN; exclude -> NOT_IN;
@@ -256,29 +292,10 @@ def extract_liveboard_filters(inv: dict, column_names=None, measure_names=None) 
     check_exposure = bool(cols or measures)
     out = []
     for sf in (inv.get("dashboard") or {}).get("filters", []) or []:
-        kind = sf.get("kind")
-        if kind == "top_n":
+        if sf.get("kind") == "top_n":
             continue
-        col = _model_col(sf.get("dim"))
-        if not col:
+        col = _resolve_exposed_col(sf.get("dim"), cols, measures, check_exposure)
+        if col is None:
             continue
-        if check_exposure and col not in cols and col not in measures:
-            base = col.split(" (")[0].strip()
-            if base in cols or base in measures:
-                col = base
-            else:
-                continue
-        chip = {"column": [col], "is_mandatory": False,
-                "is_single_value": False, "display_name": ""}
-        values = sf.get("values") or []
-        if kind == "member" and values:
-            chip["generic_filter"] = {"oper": "IN", "values": [str(v) for v in values]}
-        elif kind == "exclude" and values:
-            chip["generic_filter"] = {"oper": "NOT_IN", "values": [str(v) for v in values]}
-        elif kind == "range":
-            gf = _range_generic_filter(sf.get("raw"))
-            if gf:
-                chip["generic_filter"] = gf
-        # else: all / relative-date / unknown -> a bare interactive chip (preset not carried)
-        out.append(chip)
+        out.append(_chip_from_filter(sf, col))
     return out

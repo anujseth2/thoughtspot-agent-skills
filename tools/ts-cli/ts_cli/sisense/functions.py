@@ -131,6 +131,91 @@ def _normalize_key(raw_key: str) -> str:
     return k
 
 
+def _apply_downgrade(coverage: str, notes: list, level: str, note: str = "") -> str:
+    """Fold a coverage downgrade into ``coverage`` (returning the new level) and record ``note``.
+
+    MANUAL is the floor; PARTIAL only downgrades from AUTO. Pure: mutates ``notes`` in place,
+    returns the (possibly changed) coverage level.
+    """
+    if note:
+        notes.append(note)
+    if level == _MANUAL or coverage == _AUTO:
+        return level
+    return coverage
+
+
+def _resolve_placeholder(raw_key: str, frag, source: str, out: str,
+                         coverage: str, notes: list) -> tuple:
+    """Resolve one `[key]` context placeholder within ``out``.
+
+    Returns (out, coverage, terminal) where ``terminal`` is either None (continue) or a
+    finished ``(None, status, note)`` result that aborts the whole translation. A `{dim, agg}`
+    fragment becomes a bare column ref when the expression already wraps it in an aggregation,
+    or ``agg([Column])`` when it appears bare; a nested ``formula`` fragment recurses.
+    """
+    key = _normalize_key(raw_key)
+    token = "[" + key + "]"
+    frag = frag if isinstance(frag, dict) else {}
+
+    if frag.get("formula"):  # nested calc -> recurse
+        sub_expr, sub_status, sub_note = translate_jaql(str(frag["formula"]),
+                                                        frag.get("context") or {})
+        if sub_status == "NEEDS REVIEW" or sub_expr is None:
+            return out, coverage, (None, "NEEDS REVIEW",
+                                   sub_note or f"unsupported nested formula for '{key}'")
+        if sub_status == "Approximated":
+            coverage = _apply_downgrade(coverage, notes, _PARTIAL, sub_note)
+        return out.replace(token, "(" + sub_expr + ")"), coverage, None
+
+    col = _column_from_dim(frag.get("dim"))
+    if col is None:
+        return out, coverage, (None, "NEEDS REVIEW",
+                               f"cannot resolve placeholder '{key}' (no dim/formula)")
+
+    # If the expression already aggregates the placeholder (e.g. "sum([rev])"),
+    # substitute the bare column and let the function-map pass handle the wrapper. If it
+    # appears bare, apply the context agg here.
+    wrapped = re.search(r"[A-Za-z_]\w*\s*\(\s*" + re.escape(token) + r"\s*\)", source)
+    agg = frag.get("agg")
+    if wrapped or not agg:
+        replacement = col
+    else:
+        fn, cov, note = _agg_to_func(agg)
+        if fn is None:
+            return out, coverage, (None, "NEEDS REVIEW", note)
+        coverage = _apply_downgrade(coverage, notes, cov, note)
+        replacement = f"{fn}({col})"
+    return out.replace(token, replacement), coverage, None
+
+
+def _inspect_functions(source: str, coverage: str, notes: list) -> tuple:
+    """Inspect every function call in ``source`` for support.
+
+    Returns (coverage, terminal): ``terminal`` is None when all calls are AUTO/PARTIAL, or a
+    finished ``(None, "NEEDS REVIEW", note)`` result for the first unsupported/unknown call.
+    """
+    for name in _FUNC_CALL.findall(source):
+        low = name.lower()
+        if low in UNSUPPORTED:
+            return coverage, (None, "NEEDS REVIEW", f"unsupported function '{name}'")
+        if low in FUNCTION_MAP:
+            continue
+        if low in _PARTIAL_FUNCS:
+            coverage = _apply_downgrade(coverage, notes, _PARTIAL,
+                                        f"'{name}' mapped with a caveat (review)")
+            continue
+        return coverage, (None, "NEEDS REVIEW", f"unknown function '{name}'")
+    return coverage, None
+
+
+def _rename_func(m: "re.Match") -> str:
+    """Rename a mapped function call in the resolved expression (ceiling->ceil, case->if)."""
+    low = m.group(1).lower()
+    if low == "case":
+        return "if("
+    return FUNCTION_MAP.get(low, m.group(1)) + "("
+
+
 def translate_jaql(expr, context: dict | None = None) -> tuple:
     """Translate a Sisense JAQL formula + context into a TML formula expression.
 
@@ -152,75 +237,27 @@ def translate_jaql(expr, context: dict | None = None) -> tuple:
     coverage = _AUTO
     notes: list = []
 
-    def downgrade(level: str, note: str = "") -> None:
-        nonlocal coverage
-        if note:
-            notes.append(note)
-        # MANUAL is the floor; PARTIAL only downgrades from AUTO.
-        if level == _MANUAL or coverage == _AUTO:
-            coverage = level
-
     # 1. Resolve context placeholders.
     for raw_key, frag in context.items():
-        key = _normalize_key(raw_key)
-        token = "[" + key + "]"
-        frag = frag if isinstance(frag, dict) else {}
-
-        if frag.get("formula"):  # nested calc -> recurse
-            sub_expr, sub_status, sub_note = translate_jaql(str(frag["formula"]),
-                                                            frag.get("context") or {})
-            if sub_status == "NEEDS REVIEW" or sub_expr is None:
-                return None, "NEEDS REVIEW", sub_note or f"unsupported nested formula for '{key}'"
-            if sub_status == "Approximated":
-                downgrade(_PARTIAL, sub_note)
-            out = out.replace(token, "(" + sub_expr + ")")
-            continue
-
-        col = _column_from_dim(frag.get("dim"))
-        if col is None:
-            return None, "NEEDS REVIEW", f"cannot resolve placeholder '{key}' (no dim/formula)"
-
-        # If the expression already aggregates the placeholder (e.g. "sum([rev])"),
-        # substitute the bare column and let step 2 map the wrapping function. If it
-        # appears bare, apply the context agg here.
-        wrapped = re.search(r"[A-Za-z_]\w*\s*\(\s*" + re.escape(token) + r"\s*\)", source)
-        agg = frag.get("agg")
-        if wrapped or not agg:
-            replacement = col
-        else:
-            fn, cov, note = _agg_to_func(agg)
-            if fn is None:
-                return None, "NEEDS REVIEW", note
-            downgrade(cov, note)
-            replacement = f"{fn}({col})"
-        out = out.replace(token, replacement)
+        out, coverage, terminal = _resolve_placeholder(raw_key, frag, source, out,
+                                                        coverage, notes)
+        if terminal is not None:
+            return terminal
 
     # 2/3. Inspect every function call in the (original) expression.
-    for name in _FUNC_CALL.findall(source):
-        low = name.lower()
-        if low in UNSUPPORTED:
-            return None, "NEEDS REVIEW", f"unsupported function '{name}'"
-        if low in FUNCTION_MAP:
-            continue
-        if low in _PARTIAL_FUNCS:
-            downgrade(_PARTIAL, f"'{name}' mapped with a caveat (review)")
-            continue
-        return None, "NEEDS REVIEW", f"unknown function '{name}'"
+    coverage, terminal = _inspect_functions(source, coverage, notes)
+    if terminal is not None:
+        return terminal
 
     # 3b. round() arg semantics diverge: TS's 2nd arg is a rounding INCREMENT
     # (round(x, .01) for 2 decimals), not Sisense's decimal-place COUNT (Round(x, 2)).
     if re.search(r"\bround\s*\([^()]*,", source, re.IGNORECASE):
-        downgrade(_PARTIAL,
-                  "TS round() 2nd arg is a rounding increment, not a decimal-place count")
+        coverage = _apply_downgrade(coverage, notes, _PARTIAL,
+                                    "TS round() 2nd arg is a rounding increment, "
+                                    "not a decimal-place count")
 
     # 4. Rename mapped functions in the resolved expression (ceiling->ceil, case->if).
-    def _rename(m: re.Match) -> str:
-        low = m.group(1).lower()
-        if low == "case":
-            return "if("
-        return FUNCTION_MAP.get(low, m.group(1)) + "("
-
-    out = _FUNC_CALL.sub(_rename, out)
+    out = _FUNC_CALL.sub(_rename_func, out)
     out = re.sub(r"\s+", " ", out).strip()
 
     return out, _STATUS[coverage], "; ".join(notes)

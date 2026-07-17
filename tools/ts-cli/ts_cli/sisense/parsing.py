@@ -58,6 +58,61 @@ def _to_datatype(code) -> str:
 # --------------------------------------------------------------------------- #
 # Data model
 # --------------------------------------------------------------------------- #
+def _parse_columns(t: dict, col_by_oid: dict, t_id) -> list:
+    """One table's ``columns[]`` -> list of column dicts; records column oid -> (t_id, c_id)."""
+    columns: list[dict] = []
+    for c in t.get("columns", []) or []:
+        c_id = c.get("id") or c.get("name") or c.get("oid")
+        columns.append({
+            "id": c_id,
+            "name": c.get("name") or c.get("displayName") or c_id,
+            "data_type": _to_datatype(c.get("type")),
+            "calculated": bool(c.get("isCustom")),
+            "expression": c.get("expression"),
+        })
+        if c.get("oid"):
+            col_by_oid[c["oid"]] = (t_id, c_id)
+    return columns
+
+
+def _parse_table(t: dict, tables: list, col_by_oid: dict, table_by_oid: dict) -> None:
+    """One schema table -> append a table dict and record its oid -> id mapping."""
+    t_oid = t.get("oid")
+    t_id = t.get("id") or t.get("name") or t_oid
+    tables.append({
+        "id": t_id,
+        "name": t.get("displayName") or t.get("name") or t_id,
+        "columns": _parse_columns(t, col_by_oid, t_id),
+        "sql_expression": t.get("expression") if t.get("type") == "custom" else None,
+    })
+    if t_oid:
+        table_by_oid[t_oid] = t_id
+
+
+def _resolve_endpoint(ep: dict, col_by_oid: dict, table_by_oid: dict) -> dict:
+    """One relation column ref -> {table, column}, resolving via the oid index when possible."""
+    col_ref = ep.get("column")
+    resolved = col_by_oid.get(col_ref)
+    if resolved:
+        return {"table": resolved[0], "column": resolved[1]}
+    # already a name/id (synthetic bundle) or unresolved oid
+    return {"table": table_by_oid.get(ep.get("table"), ep.get("table")), "column": col_ref}
+
+
+def _parse_relations(raw: dict, col_by_oid: dict, table_by_oid: dict, warnings: list) -> list:
+    """Walk ``relations[]`` -> list of {endpoints, cardinality}; unresolvable relations warned."""
+    relations: list[dict] = []
+    for rel in raw.get("relations", []) or []:
+        endpoints = [_resolve_endpoint(ep, col_by_oid, table_by_oid)
+                     for ep in rel.get("columns", []) or []]
+        if endpoints:
+            relations.append({"endpoints": endpoints,
+                              "cardinality": rel.get("type") or "UNKNOWN"})
+        else:
+            warnings.append("A relation had no resolvable endpoints; skipped.")
+    return relations
+
+
 def parse_datamodel(raw: dict, warnings: list) -> tuple:
     """Sisense v2 datamodel export -> (tables, relations) as plain dicts.
 
@@ -72,46 +127,9 @@ def parse_datamodel(raw: dict, warnings: list) -> tuple:
     for ds in raw.get("datasets", []) or []:
         schema = ds.get("schema") or {}
         for t in schema.get("tables", []) or []:
-            t_oid = t.get("oid")
-            t_id = t.get("id") or t.get("name") or t_oid
-            columns: list[dict] = []
-            for c in t.get("columns", []) or []:
-                c_id = c.get("id") or c.get("name") or c.get("oid")
-                columns.append({
-                    "id": c_id,
-                    "name": c.get("name") or c.get("displayName") or c_id,
-                    "data_type": _to_datatype(c.get("type")),
-                    "calculated": bool(c.get("isCustom")),
-                    "expression": c.get("expression"),
-                })
-                if c.get("oid"):
-                    col_by_oid[c["oid"]] = (t_id, c_id)
-            tables.append({
-                "id": t_id,
-                "name": t.get("displayName") or t.get("name") or t_id,
-                "columns": columns,
-                "sql_expression": t.get("expression") if t.get("type") == "custom" else None,
-            })
-            if t_oid:
-                table_by_oid[t_oid] = t_id
+            _parse_table(t, tables, col_by_oid, table_by_oid)
 
-    relations: list[dict] = []
-    for rel in raw.get("relations", []) or []:
-        endpoints: list[dict] = []
-        for ep in rel.get("columns", []) or []:
-            col_ref = ep.get("column")
-            resolved = col_by_oid.get(col_ref)
-            if resolved:
-                endpoints.append({"table": resolved[0], "column": resolved[1]})
-            else:  # already a name/id (synthetic bundle) or unresolved oid
-                endpoints.append({"table": table_by_oid.get(ep.get("table"), ep.get("table")),
-                                  "column": col_ref})
-        if endpoints:
-            relations.append({"endpoints": endpoints,
-                              "cardinality": rel.get("type") or "UNKNOWN"})
-        else:
-            warnings.append("A relation had no resolvable endpoints; skipped.")
-
+    relations = _parse_relations(raw, col_by_oid, table_by_oid, warnings)
     return tables, relations
 
 
@@ -146,6 +164,46 @@ def _jaql_to_field(jaql: dict) -> dict | None:
             "formula": f, "level": jaql.get("level")}
 
 
+def _classify_member(f: dict, dim) -> dict | None:
+    if "members" not in f:
+        return None
+    return {"kind": "member", "dim": dim, "operator": "members",
+            "values": list(f.get("members") or []), "raw": f}
+
+
+def _classify_exclude(f: dict, dim) -> dict | None:
+    if "exclude" not in f:
+        return None
+    return {"kind": "exclude", "dim": dim, "operator": "exclude",
+            "values": list((f.get("exclude") or {}).get("members") or []), "raw": f}
+
+
+def _classify_relative_date(f: dict, dim) -> dict | None:
+    if "last" not in f and "next" not in f:
+        return None
+    op = "last" if "last" in f else "next"
+    return {"kind": "relative_date", "dim": dim, "operator": op, "values": [f.get(op)], "raw": f}
+
+
+def _classify_top_n(f: dict, dim) -> dict | None:
+    if "top" not in f and "bottom" not in f:
+        return None
+    op = "top" if "top" in f else "bottom"
+    return {"kind": "top_n", "dim": dim, "operator": op, "values": [f.get(op)], "raw": f}
+
+
+def _classify_range(f: dict, dim) -> dict | None:
+    if not any(k in f for k in ("from", "to", "equals", "fromNotEqual", "toNotEqual")):
+        return None
+    return {"kind": "range", "dim": dim, "operator": "range",
+            "values": [f[k] for k in ("from", "to", "equals") if k in f], "raw": f}
+
+
+# Ordered so the first matching kind wins (member > exclude > relative_date > top_n > range).
+_FILTER_CLASSIFIERS = (_classify_member, _classify_exclude, _classify_relative_date,
+                       _classify_top_n, _classify_range)
+
+
 def _classify_filter(jaql: dict) -> dict | None:
     """Map a JAQL item (dim + filter) to a filter dict; UNKNOWN shapes still recorded.
 
@@ -160,21 +218,10 @@ def _classify_filter(jaql: dict) -> dict | None:
     dim = jaql.get("dim")
     if not f:
         return None
-    if "members" in f:
-        return {"kind": "member", "dim": dim, "operator": "members",
-                "values": list(f.get("members") or []), "raw": f}
-    if "exclude" in f:
-        return {"kind": "exclude", "dim": dim, "operator": "exclude",
-                "values": list((f.get("exclude") or {}).get("members") or []), "raw": f}
-    if "last" in f or "next" in f:
-        op = "last" if "last" in f else "next"
-        return {"kind": "relative_date", "dim": dim, "operator": op, "values": [f.get(op)], "raw": f}
-    if "top" in f or "bottom" in f:
-        op = "top" if "top" in f else "bottom"
-        return {"kind": "top_n", "dim": dim, "operator": op, "values": [f.get(op)], "raw": f}
-    if any(k in f for k in ("from", "to", "equals", "fromNotEqual", "toNotEqual")):
-        return {"kind": "range", "dim": dim, "operator": "range",
-                "values": [f[k] for k in ("from", "to", "equals") if k in f], "raw": f}
+    for classify in _FILTER_CLASSIFIERS:
+        hit = classify(f, dim)
+        if hit is not None:
+            return hit
     return {"kind": "unknown", "dim": dim, "operator": ",".join(f.keys()), "values": [], "raw": f}
 
 
