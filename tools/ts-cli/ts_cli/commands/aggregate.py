@@ -19,9 +19,13 @@ import yaml
 
 from ts_cli.aggregate.lattice import _cand_date_grains, generate_candidates
 from ts_cli.aggregate.measures import build_rewrite_plans
-from ts_cli.aggregate.scoring import greedy_select
+from ts_cli.aggregate.scoring import consolidation_analysis, greedy_select
 from ts_cli.aggregate.signatures import column_kinds_from_model, extract_signatures
 from ts_cli.tml_common import dump_tml_yaml
+from ts_cli.commands.aggregate_advisories import (_physical_attribute_dims,
+                                                    conformed_dates,
+                                                    routing_ineligible_measures,
+                                                    semiadditive_measures)
 
 app = typer.Typer(
     help="Aggregate-model advisor: audit dependents, recommend and generate aggregate Models.",
@@ -154,6 +158,7 @@ def _apply_weights(sigs: list, weights_path: Optional[str]) -> None:
         s["weight"] = float(wmap.get(key, s.get("weight", 1.0)))
 
 
+
 def _candidate_key(c: dict) -> str:
     """Stable cross-run identity for a candidate, used to merge profiled
     `agg_rows` forward across `recommend` re-runs (see `_merge_prior_agg_rows`).
@@ -260,21 +265,30 @@ def recommend(
     _apply_weights(sigs, weights)
 
     plans = build_rewrite_plans(model_tml)
-    candidates = generate_candidates(sigs, plans)
-
     from ts_cli.commands.aggregate_rls import _attach_rls_conflicts
     table_tmls = _load_tables_dir(tables_dir or str(d / "tables"))
+    candidates = generate_candidates(
+        sigs, plans, consolidatable_dims=_physical_attribute_dims(model_tml, table_tmls))
+
     rls_conflicts = _attach_rls_conflicts(candidates, plans, model_tml, table_tmls)
     ineligible = routing_ineligible_measures(model_tml, candidates)
+    semiadditive = semiadditive_measures(plans)
+    role_playing_dates = conformed_dates(model_tml, table_tmls)
 
     prior_path = d / "candidates.json"
     base_rows = _merge_prior_agg_rows(candidates, prior_path, base_rows)
+    # After _merge_prior_agg_rows restores profiled agg_rows onto the freshly
+    # generated candidates, so the combine-vs-split row counts are populated.
+    consolidation = consolidation_analysis(candidates)
 
     result = greedy_select(candidates, sigs, base_rows=base_rows, max_select=max_select)
     excluded = _excluded_unprofiled(candidates, result["mode"])
 
     payload = {"base_rows": base_rows, "candidates": candidates, "selection": result,
-               "routing_ineligible_measures": ineligible}
+               "routing_ineligible_measures": ineligible,
+               "semiadditive_measures": semiadditive,
+               "consolidation_analysis": consolidation,
+               "role_playing_dates": role_playing_dates}
     prior_path.write_text(json.dumps(payload, indent=2))
 
     print(json.dumps({
@@ -285,6 +299,9 @@ def recommend(
         "excluded_unprofiled": excluded,
         "rls_conflicts": rls_conflicts,
         "routing_ineligible_measures": ineligible,
+        "semiadditive_measures": semiadditive,
+        "consolidation_analysis": consolidation,
+        "role_playing_dates": role_playing_dates,
     }, indent=2))
 
 
@@ -358,33 +375,6 @@ def _ingest_profile_results(payload: dict, results_path: str) -> dict:
         if c["id"] in r["candidates"]:
             c["agg_rows"] = int(r["candidates"][c["id"]])
     return {"ingested": len(r["candidates"])}
-
-
-def routing_ineligible_measures(model_tml: dict, candidates: list) -> list:
-    """F9: measures targeted by candidates that are plain measure columns and so
-    will NOT be routed to until promoted to formula measures.
-
-    Aggregate-aware routing on this product fires only for FORMULA measures
-    (open-item #0); a plain measure column (`kind == 'raw_measure'`) yields an
-    aggregate nothing ever routes to. Reuses `spotql_ops.classify_model_columns`
-    (the same classifier `ts spotql classify-columns` exposes) so the skill can
-    surface the gap and offer the promotion (plain measure -> `sum([physical])`)
-    before generating anything."""
-    from ts_cli.spotql_ops import classify_model_columns
-    kinds = {c["name"]: c.get("kind") for c in classify_model_columns(model_tml)}
-    targeted = {m for c in candidates for m in c.get("measure_columns", []) or []}
-    out = []
-    for name in sorted(targeted):
-        if kinds.get(name) == "raw_measure":
-            out.append({
-                "measure": name,
-                "reason": "plain measure column — aggregate-aware routing fires "
-                          "only for formula measures",
-                "remedy": f"promote '{name}' to a formula measure "
-                          f"(e.g. sum([<physical column>])) on the primary Model "
-                          f"before generating aggregates",
-            })
-    return out
 
 
 def flag_suspect_base_rows(payload: dict) -> bool:
@@ -485,9 +475,18 @@ def _spotql_profile_sql_or_none(model_tml: dict, cand: dict, plans: dict, model_
     failure so the caller falls back to sqlgen's build_select/build_profile_sql."""
     if not model_guid:
         return None
-    from ts_cli.aggregate.spotql_aggregate import _strip_trailing_limit, build_spotql
+    from ts_cli.aggregate.spotql_aggregate import (_strip_trailing_limit,
+                                                   build_profiling_spotql)
     try:
-        spotql, _descriptors = build_spotql(cand, plans, model_tml["model"]["name"])
+        # Row-count profiling uses a MEASURE-FREE grain SpotQL: the distinct
+        # grain row count is measure-independent, so this keeps profiling on the
+        # SpotQL path (correct joins) even for candidates carrying an AVG/RATIO
+        # measure that build_spotql can't express (#14). `plans` is unused here
+        # for that reason (kept in the signature for caller symmetry with
+        # `_spotql_ddl_or_none`, which does need it).
+        spotql = build_profiling_spotql(cand, model_tml["model"]["name"])
+        if spotql is None:
+            return "SELECT 1 AS agg_rows"   # grand-total grain: exactly one row
         result = _spotql_generate_sql(spotql, model_guid, ts_profile)
         if result["status"] != "SUCCESS" or not result["executable_sql"]:
             _err(f"SpotQL generate-sql did not return SUCCESS for candidate "

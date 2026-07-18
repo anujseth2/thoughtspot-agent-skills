@@ -150,8 +150,12 @@ def test_recommend_cost_mode_reports_excluded_unprofiled(tmp_path):
     assert result.exit_code == 0, result.output
     out = json.loads(result.stdout)
     assert out["mode"] == "cost"
-    region_ids = [c["id"] for c in saved["candidates"] if c["dimensions"] == ["Region"]]
-    assert out["excluded_unprofiled"] == region_ids
+    # The profiled Category candidate is NOT excluded; every other (unprofiled)
+    # candidate is surfaced — the single Region grain and the F3-added combined
+    # Category x Region grain (also unprofiled).
+    profiled = {c["id"] for c in saved["candidates"] if c["dimensions"] == ["Category"]}
+    all_ids = {c["id"] for c in saved["candidates"]}
+    assert set(out["excluded_unprofiled"]) == all_ids - profiled
 
 
 def test_candidate_key_distinguishes_single_vs_multi_date_grains():
@@ -1717,3 +1721,84 @@ def test_load_tables_dir_matches_yml_and_json(tmp_path):
     (tmp_path / "GEO.json").write_text(json.dumps({"table": {"name": "GEO"}}))
     loaded = _load_tables_dir(str(tmp_path))
     assert set(loaded) == {"FACT", "DIM", "GEO"}
+
+
+def test_semiadditive_measures_surfaced():
+    from ts_cli.commands.aggregate import semiadditive_measures
+    from ts_cli.aggregate.measures import classify_measure
+    plans = {
+        "Inventory Balance": classify_measure(
+            "Inventory Balance",
+            expr="last_value ( sum ( [DM_INVENTORY::FILLED_INVENTORY] ) , "
+                 "query_groups ( ) , { [DM_DATE_DIM::DATE] } )"),
+        "Amount": classify_measure("Amount", aggregation="SUM"),
+    }
+    out = semiadditive_measures(plans)
+    assert [o["measure"] for o in out] == ["Inventory Balance"]
+    assert "recipe" in out[0]["remedy"]
+
+
+def test_physical_attribute_dims_excludes_measures_formulas_dates():
+    from ts_cli.commands.aggregate import _physical_attribute_dims
+    # Order Date carries NO data_type on the Model column (common for role-playing
+    # dates) — the DATE type must be read from the TABLE TML, else it would be
+    # consolidated as a raw-date dim.
+    model = {"model": {"columns": [
+        {"name": "State", "column_id": "C::STATE",
+         "properties": {"column_type": "ATTRIBUTE"}},
+        {"name": "Employee", "formula_id": "f",           # formula dim -> excluded
+         "properties": {"column_type": "ATTRIBUTE"}},
+        {"name": "Order Date", "column_id": "O::DT",       # date (per table TML) -> excluded
+         "properties": {"column_type": "ATTRIBUTE"}},
+        {"name": "Amount", "column_id": "O::AMT",          # measure -> excluded
+         "properties": {"column_type": "MEASURE"}}]}}
+    tables = {
+        "C": {"table": {"columns": [{"name": "STATE", "db_column_name": "STATE",
+              "db_column_properties": {"data_type": "VARCHAR"}}]}},
+        "O": {"table": {"columns": [
+            {"name": "DT", "db_column_name": "DT", "db_column_properties": {"data_type": "DATE"}},
+            {"name": "AMT", "db_column_name": "AMT", "db_column_properties": {"data_type": "DOUBLE"}}]}},
+    }
+    assert _physical_attribute_dims(model, tables) == {"State"}
+
+
+def test_conformed_dates_detects_role_playing_dates():
+    from ts_cli.commands.aggregate_advisories import conformed_dates
+    # Order Date + Balance Date both join to the shared DM_DATE_DIM date
+    # (Transaction Date) — the conformed date.
+    model = {"model": {
+        "columns": [
+            {"name": "Transaction Date", "column_id": "DD::DATE"},
+            {"name": "Order Date", "column_id": "O::ODT"},
+            {"name": "Balance Date", "column_id": "INV::BDT"}],
+        "model_tables": [
+            {"name": "O", "joins": [{"with": "DD", "on": "[O::ODT] = [DD::DATE]"}]},
+            {"name": "INV", "joins": [{"with": "DD", "on": "[INV::BDT] = [DD::DATE]"}]},
+            {"name": "DD"}]}}
+    tables = {
+        "DD": {"table": {"columns": [{"name": "DATE", "db_column_name": "DATE",
+               "db_column_properties": {"data_type": "DATE"}}]}},
+        "O": {"table": {"columns": [{"name": "ODT", "db_column_name": "ODT",
+              "db_column_properties": {"data_type": "DATE"}}]}},
+        "INV": {"table": {"columns": [{"name": "BDT", "db_column_name": "BDT",
+                "db_column_properties": {"data_type": "DATE"}}]}},
+    }
+    out = conformed_dates(model, tables)
+    assert len(out) == 1
+    assert out[0]["conformed"] == "Transaction Date"
+    assert out[0]["role_playing"] == ["Balance Date", "Order Date"]
+
+
+def test_conformed_dates_empty_without_shared_date():
+    from ts_cli.commands.aggregate_advisories import conformed_dates
+    # A single fact date joining to the dim date is not a role-playing set.
+    model = {"model": {
+        "columns": [{"name": "Order Date", "column_id": "O::ODT"},
+                    {"name": "Transaction Date", "column_id": "DD::DATE"}],
+        "model_tables": [{"name": "O", "joins": [{"with": "DD", "on": "[O::ODT] = [DD::DATE]"}]},
+                         {"name": "DD"}]}}
+    tables = {"DD": {"table": {"columns": [{"name": "DATE", "db_column_name": "DATE",
+              "db_column_properties": {"data_type": "DATE"}}]}},
+              "O": {"table": {"columns": [{"name": "ODT", "db_column_name": "ODT",
+              "db_column_properties": {"data_type": "DATE"}}]}}}
+    assert conformed_dates(model, tables) == []
