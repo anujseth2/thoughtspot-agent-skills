@@ -256,6 +256,31 @@ The inner expression is already valid SQL. Strip the wrapper function and emit
 the contents. If the SQL uses Snowflake-specific syntax, translate it to
 Databricks SQL equivalents.
 
+### JSON path access — use `get_json_object`, NOT bracket notation
+
+Databricks colon-path access for semi-structured columns (`col:field.subfield`) is
+valid Databricks SQL but **fails ThoughtSpot's `sql_*_op` template parser**. The
+Snowflake fix — bracket notation on the parsed value — **does not work on Databricks**:
+`parse_json(col)['field']` errors with `INVALID_EXTRACT_BASE_FIELD_TYPE` because `[...]`
+extraction requires a complex type (`STRUCT`/`ARRAY`/`MAP`), and `parse_json` returns
+`VARIANT`. Use one of these colon-free forms instead:
+
+| Databricks JSON access | ThoughtSpot pass-through | Notes |
+|---|---|---|
+| `col:field.subfield` (rejected by TS) | `sql_string_op ( "get_json_object({0}, '$.field.subfield')" , [T::COL] )` | **Preferred.** No colon, no schema needed. The `'$.path'` is a quoted string literal, so the TS parser accepts it. |
+| — | `sql_string_op ( "from_json({0}, 'field struct<subfield:string>')['field']['subfield']" , [T::COL] )` | Bracket extraction is valid here because `from_json` returns `STRUCT`. Requires declaring the JSON schema in the template — more verbose; use when you need typed nested extraction. |
+
+Verified live on Databricks 2026-07-15 (`get_json_object` and the `from_json`+bracket
+form both return the value; `parse_json(...)['...']` fails; colon-path executes on
+Databricks but is rejected by ThoughtSpot). Canonical constraint:
+[../../schemas/thoughtspot-formula-patterns.md](../../schemas/thoughtspot-formula-patterns.md#json--variant-path-access--bracket-notation-only).
+
+**Codified (ts-cli ≥ v0.54.0):** `ts databricks translate-formulas` rewrites a
+whole-expression colon path (`col:a.b`, `parse_json(col):a.b`, optional trailing
+`::string` cast) to `get_json_object({0}, '$.a.b')` automatically. Non-string casts
+(`::int`, …) and array indices (`items[0]`) are not codified — they route to
+`skipped[]` with a reason rather than emitting a wrong translation.
+
 ---
 
 ## Window Functions

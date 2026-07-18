@@ -17,6 +17,17 @@ ts_cli/
   snowflake_ops.py     — Semantic View diff (normalise_expr/exprs_differ/compute_change_set) + DDL lint (lint_sv_ddl) + SQL var substitution (parse_var_assignment/substitute_sql_vars, behind `ts snowflake exec` — BL-079) behind `ts snowflake` (pure functions, no I/O)
   spotql_ops.py        — Aggregate-function classification (AGGREGATE_FUNCS/is_aggregate_expr/classify_expr/outermost_func/classify_model_columns; incl. semi-additive last_value/first_value → SUM wrapper) behind `ts spotql classify-columns` (pure functions, no I/O)
   promote.py           — Formula promotion merge (extract_answer_formulas/detect_duplicates/map_references/build_merged_model) behind `ts model promote-formula` (pure functions, no I/O; BL-066)
+  aggregate/
+    __init__.py          — package marker
+    signatures.py         — Answer/Liveboard TML -> normalized query signatures (grouping columns, filters, date bucket) behind `ts aggregate signatures` (pure functions, no I/O)
+    measures.py           — measure decomposition rewrite plans (SUM/MIN/MAX/COUNT/AVG/ratio classification) for aggregate models (pure functions, no I/O)
+    lattice.py            — grain lattice: bucket/coverage rule + candidate generation from signatures + rewrite plans behind `ts aggregate recommend` (pure functions, no I/O)
+    scoring.py            — cost-based (profiled) / coverage-based (unprofiled) greedy candidate selection with a marginal-gain curve behind `ts aggregate recommend` (pure functions, no I/O)
+    sqlgen.py             — aggregate SELECT / profiling SQL / DDL emission across snowflake/databricks/bigquery dialects behind `ts aggregate profile`/`generate` (pure functions, no I/O); fallback path only as of Task 18 — see spotql_aggregate.py
+    spotql_aggregate.py   — Task 18/19: build a SpotQL SELECT for a candidate's grain (build_spotql — measures by display name, raw date columns, no bucket fn; single-component SUM/MIN/MAX/COUNT measures only, AVG/RATIO raise UnsupportedMeasureError) and wrap ThoughtSpot-compiled warehouse SQL as aggregate DDL (wrap_as_ddl — outer DATE_TRUNC+reagg aggregating SELECT when a date descriptor carries a bucket, plain positional pass-through otherwise), reusing sqlgen.build_ddl/_date_trunc for materialization shapes and per-dialect date truncation — the default DDL SELECT source behind `ts aggregate profile`/`generate`, because ThoughtSpot's own SQL generation resolves joins correctly on role-playing/ambiguous-path dimensions where sqlgen.build_select's hand-rolled walker can be wrong (pure functions, no I/O)
+    generate.py           — aggregate Table/Model TML assembly + `aggregated_models` association patch on the primary Model, reusing tables.py/model_builder.py rather than hand-assembling TML (pure functions, no I/O)
+    rls.py                — RLS extraction + grain-conflict detection + rule propagation onto the aggregate table (extract_rls/rls_filter_columns/candidate_rls_conflict/add_rls_columns_to_candidate/propagate_rls; tuple-keyed, identical-rule dedup) — wired by commands/aggregate.py + aggregate_rls.py (pure functions, no I/O)
+    history.py            — match Snowflake QUERY_HISTORY GROUP BY shapes to signatures, producing reweighted signature weights behind `ts aggregate history` (pure functions, no I/O)
   dependency/
     __init__.py          — re-exports mutate.py + backup.py public entry points
     mutate.py             — REMOVE/REPOINT TML dict transforms (apply_remove/apply_repoint dispatchers + remove_columns_from_*/repoint_* helpers) behind `ts dependency mutate` (pure functions, no I/O; BL-083)
@@ -50,6 +61,11 @@ ts_cli/
     mv_sql_constructs.py — CASE/CAST/NOT/IS/IN/BETWEEN keyword-construct handlers split out of mv_sql.py under the file-size warn line; late-imports mv_sql's expression primitives to avoid a circular import (pure functions, no I/O; BL-063 PR3)
     mv_translate.py     — parsed Metric View -> translated ThoughtSpot formulas behind `ts databricks translate-formulas`: dot-path resolution, LOD windows, conditional aggregates, cross-measure inlining via dependency DAG; re-exports translate_window_measure from mv_window_translate.py (pure functions, no I/O; BL-063 PR3)
     mv_window_translate.py — windowed-measure translation (trailing/leading/cumulative/current decision tree, BL-098 sparse-data-risk annotations) split out of mv_translate.py under the file-size warn line; late-imports mv_translate's make_resolver/_formula_measure to avoid a circular import (pure functions, no I/O; BL-063 PR3)
+    mv_emit_expr.py     — TS-formula tokenizer + recursive-descent parser -> dict-AST (reverse direction) behind `ts databricks build-mv`; re-exports UntranslatableError from formula_common.py (pure functions, no I/O; Genie-vendorable)
+    mv_emit_sql.py      — dict-AST -> Databricks-SQL string (reverse direction): AGG_MAP/SCALAR_FN_MAP/COND_AGG/PASSTHROUGH_FN dicts, operator-precedence-aware emit_sql, plus the raw-measure aggregation wrapper (is_aggregate_present/wrap_measure_if_needed, Task 18 Finding 1) that matches ThoughtSpot's own SUM-at-query-time semantics for a no-aggregate formula measure (pure functions, no I/O; Genie-vendorable)
+    mv_emit.py          — ThoughtSpot Model TML -> Databricks Metric View YAML orchestrator (reverse direction) behind `ts databricks build-mv`: column classification/routing, join assembly (build_joins), LOD dimension emission, cross-measure/LOD reference resolution + dangling-ref cascade, detect_fact_tables, build_metric_view top-level entry point; re-exports the window-measure API from mv_emit_window.py (pure functions, no I/O; at the 1000-line file-size cap — any further growth needs a split, not an in-place addition)
+    mv_emit_window.py   — window-measure emission (moving/cumulative/semi-additive/period-offset), split out of mv_emit.py under the file-size gate; mirrors the mv_translate.py/mv_window_translate.py split for the reverse direction (pure functions, no I/O; Genie-vendorable)
+    mv_build_view.py    — Metric View YAML doc -> `CREATE VIEW ... WITH METRICS LANGUAGE YAML AS $$...$$` DDL + build_summary (the `ts databricks build-mv` stdout JSON contract) + default_view_name; the one place an MV YAML body is dumped via `yaml.safe_dump` directly, with a fail-loud guard against a literal `$$` inside the body (pure + PyYAML only, no HTTP/auth/typer deps; Genie-vendorable)
   commands/
     auth.py       — ts auth (whoami, logout)
     profiles.py   — ts profiles list
@@ -64,7 +80,9 @@ ts_cli/
     dependency.py — ts dependency (mutate, backup, rollback) — BL-083
     dependency_apply.py — ts dependency apply-change (Step 9 destructive orchestrator; attaches to dependency.app) — BL-083 PR2
     audit.py      — ts audit run / report
-    databricks.py — ts databricks (parse-mv, translate-formulas, build-model) — BL-063 PR2/PR3/PR4
+    databricks.py — ts databricks (parse-mv, translate-formulas, build-model, build-mv) — BL-063 PR2/PR3/PR4; build-mv is the reverse (TS Model -> Databricks Metric View) deterministic emitter over mv_emit.py/mv_build_view.py, emit-only (no --profile, no ThoughtSpot/Databricks connection)
+    aggregate.py  — ts aggregate (signatures, recommend, profile, history, generate) — aggregate-model advisor engine
+    aggregate_rls.py — RLS command-layer wiring for `ts aggregate` (Task 23): _attach_rls_conflicts (recommend advisory surfacing) + _propagate_rls_or_fail_closed (generate security gate — fails closed on incomplete tables-dir or grain missing an RLS filter column) over the pure aggregate/rls.py engine; split out of aggregate.py to stay under the file-size gate, imported lazily from recommend/generate
   audit/
     __init__.py       — run_audit() entry point, angle module registry
     context.py        — AuditContext dataclass + build_context()
@@ -85,7 +103,7 @@ Each command group is a separate module in `commands/`. `cli.py` imports and reg
 ## Version sync
 
 `ts_cli/__init__.py __version__` must always match `pyproject.toml version`. Bump both together.
-Current version: **0.52.0**. Run `python tools/validate/check_version_sync.py` to verify.
+Current version: **0.55.0**. Run `python tools/validate/check_version_sync.py` to verify.
 
 ## Required dependencies
 

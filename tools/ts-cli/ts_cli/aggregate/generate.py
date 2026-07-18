@@ -1,0 +1,362 @@
+"""Aggregate Table/Model TML + aggregated_models association patch (pure, no I/O).
+
+The aggregated_models emission shape follows the 26.6 docs example and is
+unverified on a live cluster — skill Open Item #2. Ordering is most-aggregated-
+first (spec: correct under first-match routing, harmless under auto-pick).
+
+Reuse, not reimplementation: this module deliberately does NOT hand-assemble
+TML dicts that ts_cli.commands.tables._build_table_tml and
+ts_cli.model_builder.build_model_tml already build (data-type normalization,
+db_column_name wiring, formula_ prefixing, double-aggregation collapse,
+formula_id wiring). See build_aggregate_model_tml's docstring for the one
+place this module had to reconcile its input shape against what those
+functions actually consume (Step 3b of the task-6 brief).
+"""
+from __future__ import annotations
+
+import copy
+import re
+from typing import Optional
+
+
+def _sql_type(display_name: str, model_tml: dict, default: str = "DOUBLE") -> str:
+    for c in model_tml["model"].get("columns", []) or []:
+        if c["name"] == display_name:
+            return c.get("data_type", default)
+    return default
+
+
+def _cand_date_grains(candidate: dict) -> list:
+    """Candidate's date grains (Task 15). Falls back to a 1-item list derived
+    from the date_column/bucket compat shim (Task 14) when date_grains is
+    absent, so hand-built single-date candidate dicts (existing callers/tests)
+    keep working unchanged. Same shim-fallback pattern as sqlgen.py's and
+    lattice.py's private helpers of the same name (deliberately duplicated,
+    not shared, to keep each module's date-grain reading self-contained)."""
+    grains = candidate.get("date_grains")
+    if grains is not None:
+        return grains
+    col = candidate.get("date_column")
+    return [{"column": col, "bucket": candidate.get("bucket")}] if col else []
+
+
+def _grain_columns(candidate: dict, model_tml: dict):
+    """(name, data_type, column_type) for dims + EVERY date grain (Task 15:
+    generalized from the single date_column to the full date_grains list —
+    a raw/unbucketed grain is emitted as just another ATTRIBUTE column, same
+    as a bucketed one)."""
+    out = [(d, _sql_type(d, model_tml, "VARCHAR"), "ATTRIBUTE")
+           for d in candidate["dimensions"]]
+    for g in _cand_date_grains(candidate):
+        out.append((g["column"], "DATE", "ATTRIBUTE"))
+    return out
+
+
+def _component_columns(candidate: dict, plans: dict):
+    """(alias, plan, comp) for every stored component of decomposable measures."""
+    out = []
+    for m in candidate.get("measure_columns", []):
+        plan = plans.get(m)
+        if plan and plan["decomposable"]:
+            for comp in plan["components"]:
+                out.append((comp["alias"], plan, comp))
+    return out
+
+
+_MEASURE_SRC_REF = re.compile(r"\[([^\]:]+)::([^\]]+)\]")
+_NUMERIC_DTYPES = {"INT32", "INT64", "DOUBLE", "FLOAT"}
+
+
+def _measure_physical_ref(measure_name: str, model_tml: dict):
+    """(table, physical_col) the measure aggregates over, or (None, None).
+
+    Plain measure → its `column_id` (`TABLE::COL`); formula measure → the first
+    `[TABLE::COL]` ref in its expr (model MEASURE columns carry no data_type)."""
+    m = model_tml["model"]
+    for c in m.get("columns", []) or []:
+        if c.get("name") != measure_name:
+            continue
+        cid = c.get("column_id")
+        if cid and "::" in cid:
+            tbl, col = cid.split("::", 1)
+            return tbl, col
+        expr = next((f.get("expr", "") for f in m.get("formulas", []) or []
+                     if f.get("id") == c.get("formula_id")), "")
+        mo = _MEASURE_SRC_REF.search(expr)
+        return (mo.group(1), mo.group(2)) if mo else (None, None)
+    return None, None
+
+
+def _column_dtype(tbl: Optional[str], col: Optional[str],
+                  table_tmls: dict) -> Optional[str]:
+    """The base Table TML's `db_column_properties.data_type` for (tbl, col)."""
+    tdoc = (table_tmls.get(tbl) or {}).get("table", {}) if tbl else {}
+    for cc in tdoc.get("columns", []) or []:
+        if col in (cc.get("name"), cc.get("db_column_name")):
+            return (cc.get("db_column_properties") or {}).get("data_type")
+    return None
+
+
+def _component_source_type(comp: dict, model_tml: dict,
+                           table_tmls: Optional[dict]) -> Optional[str]:
+    """TS data_type of the physical column ONE component aggregates over, from
+    the base Table TMLs. A component's `source_column` is either a physical
+    `TABLE::COL` path (formula measures, and each of a ratio's num/den — which
+    reference DIFFERENT columns, so they must be typed independently) or a model
+    column display name (plain measure columns). None when unresolvable (caller
+    falls back to DOUBLE)."""
+    if not table_tmls:
+        return None
+    src = comp.get("source_column") or ""
+    if "::" in src:
+        tbl, col = src.split("::", 1)
+    else:
+        tbl, col = _measure_physical_ref(src, model_tml)
+    return _column_dtype(tbl, col, table_tmls) if col else None
+
+
+def build_aggregate_table_spec(candidate: dict, plans: dict, model_tml: dict,
+                               db: str, schema: str, table_name: str,
+                               connection_name: str,
+                               table_tmls: Optional[dict] = None) -> dict:
+    """Spec dict for ts_cli.commands.tables._build_table_tml / `ts tables create`.
+
+    Grain columns (dimensions + date) are ATTRIBUTE; each stored component of a
+    decomposable measure is a MEASURE column carrying its `reagg` aggregation
+    (the aggregation that correctly re-combines partial results across the
+    grain — e.g. SUM over a pre-summed column, SUM over a pre-counted column
+    for COUNT/AVG components). Keys match `_build_table_tml`'s spec contract
+    exactly: name/data_type/column_type/aggregation.
+
+    Component column types: COUNT components are INT64; SUM/MIN/MAX preserve the
+    source column's type (SUM of an integer stays integer in the warehouse, so
+    emitting DOUBLE makes `ts tables create` fail the CDW type check). The
+    source type is read from `table_tmls` when provided; without it (older
+    callers/tests) SUM/MIN/MAX fall back to DOUBLE as before.
+    """
+    columns = []
+    for name, dtype, _ in _grain_columns(candidate, model_tml):
+        columns.append({"name": name, "data_type": dtype,
+                        "column_type": "ATTRIBUTE"})
+    for m_name in candidate.get("measure_columns", []):
+        plan = plans.get(m_name)
+        if not (plan and plan["decomposable"]):
+            continue
+        for comp in plan["components"]:
+            if comp["func"] == "COUNT":
+                dtype = "INT64"
+            else:
+                src = _component_source_type(comp, model_tml, table_tmls)
+                dtype = src if src in _NUMERIC_DTYPES else "DOUBLE"
+            columns.append({"name": comp["alias"], "data_type": dtype,
+                            "column_type": "MEASURE", "aggregation": comp["reagg"]})
+    return {"name": table_name, "db": db, "schema": schema,
+            "db_table": table_name, "connection_name": connection_name,
+            "columns": columns}
+
+
+def build_aggregate_model_tml(candidate: dict, plans: dict, model_tml: dict,
+                              agg_table_name: str, model_name: str,
+                              connection_name: str,
+                              description: Optional[str] = None) -> dict:
+    """Adapter over model_builder.build_model_tml + aggregate-specific post-pass.
+
+    Reuses the conversion substrate's assembly (formula_ prefixing, double-agg
+    fix, formula_id wiring) rather than hand-building the model dict.
+
+    Step 3b reconciliation (read _build_model_tables / _build_model_columns in
+    ts_cli/model_builder.py before touching this): the task-6 brief's illustrative
+    column dict used a `db_column` key. The real functions need `db_column_name`:
+    `_build_model_tables` does `c["db_column_name"]` with NO default (KeyError
+    without it), and `_build_model_columns` does
+    `c.get("db_column_name", c["name"])`. `column_type` must be a flat key on
+    each column dict (not nested under `properties`) — that's what
+    `_build_model_columns` reads. Both functions turned out adaptable (not
+    "too Tableau-shaped"), so this stays an adapter, not hand-assembly.
+
+    Task 17 (routing fix): a live aggregate-aware cluster (2026-07-13) proved
+    query routing to an aggregate fires ONLY when the primary's measure is a
+    FORMULA — never a plain measure column (default-aggregation switching on
+    columns isn't coded on the product side). Every decomposable measure's
+    plan (`measures.classify_measure`) therefore now carries a non-None
+    `model_expr`, including direct SUM/MIN/MAX, and every one of them is
+    emitted the same way here: a hidden stored component column (carrying its
+    `reagg` aggregation) plus a formula named exactly as the primary measure
+    (`expr = plan["model_expr"]`, e.g. `sum ( [sales_sum] )`), wired via
+    `formula_id`. There is deliberately NO plain MEASURE column emitted under
+    a primary measure's own display name any more — see skill Open Item #0.
+
+    Reuse quirk, still corrected in the post-pass below (widened by Task 17,
+    not retired by it): `_build_model_columns` hardcodes `aggregation: SUM`
+    for every MEASURE column regardless of per-column input. Before Task 17
+    this only mattered for a MIN/MAX *primary* measure's plain column; now
+    that MIN/MAX components are always hidden (never surfaced under the
+    primary's own name), it's the hidden component column's aggregation that
+    must be corrected to its `reagg` — SUM-of-monthly-maxes would be wrong
+    numbers. Rather than fork shared model_builder.py (the Tableau conversion
+    path depends on it), the post-pass rewrites each hidden component's
+    aggregation from `reagg_overrides` (keyed by alias, not primary name).
+    The physical column in the aggregate *table* (build_aggregate_table_spec)
+    already carries the correct MIN/MAX independently of this.
+    """
+    from ts_cli.model_builder import build_model_tml
+
+    tables = [{"name": agg_table_name, "db_table": agg_table_name}]
+    columns, translated_formulas = [], []
+    hidden_aliases = set()
+    # alias -> reagg for hidden component columns whose model aggregation must
+    # be corrected away from _build_model_columns' hardcoded SUM (see the
+    # post-pass below).
+    reagg_overrides: dict = {}
+    for name, dtype, _ in _grain_columns(candidate, model_tml):
+        columns.append({"name": name, "table": agg_table_name,
+                        "db_column_name": name, "data_type": dtype,
+                        "column_type": "ATTRIBUTE"})
+    emitted_formula = set()
+    for alias, plan, comp in _component_columns(candidate, plans):
+        # Every stored component (direct SUM/MIN/MAX included) is hidden and
+        # recombined via a formula named as the primary measure — see the
+        # Task 17 docstring note above.
+        columns.append({"name": alias, "table": agg_table_name,
+                        "db_column_name": alias, "data_type": "DOUBLE",
+                        "column_type": "MEASURE", "aggregation": comp["reagg"]})
+        hidden_aliases.add(alias)
+        reagg_overrides[alias] = comp["reagg"]
+        if plan["name"] not in emitted_formula:
+            emitted_formula.add(plan["name"])
+            translated_formulas.append({"name": plan["name"],
+                                        "expr": plan["model_expr"]})
+
+    tml = build_model_tml(model_name=model_name,
+                          connection_name=connection_name,
+                          tables=tables, columns=columns, joins=[],
+                          parameters=[],
+                          translated_formulas=translated_formulas)
+
+    # Aggregate-specific post-pass.
+    #
+    # is_spotter_enabled lives under properties.spotter_config, never flat
+    # under properties — verified against
+    # agents/shared/schemas/thoughtspot-model-tml.md (top-level field-reference
+    # table: "spotter_config.is_spotter_enabled") and the live precedent in
+    # ts_cli/databricks/mv_build_model.py:build_model_tml_dbx
+    # (`props["spotter_config"] = {"is_spotter_enabled": ...}`), which
+    # ts_cli/audit/checks_perf.py also reads back from that same nested path.
+    # A flat `properties.is_spotter_enabled` (as in the task-6 brief's
+    # illustrative Step 3 code/test) would be inert TML noise, not an actual
+    # Spotter-enable — corrected here and in the test.
+    tml["model"].setdefault("properties", {})["spotter_config"] = {
+        "is_spotter_enabled": True,
+    }
+    if description:
+        tml["model"]["description"] = description
+    for c in tml["model"]["columns"]:
+        if c["name"] in hidden_aliases:
+            c.setdefault("properties", {})["is_hidden"] = True
+        # Correct a hidden component's aggregation for measures whose reagg
+        # is not SUM (MIN/MAX components). See the Task 17 docstring note.
+        override = reagg_overrides.get(c["name"])
+        if override:
+            c.setdefault("properties", {})["aggregation"] = override
+    return tml
+
+
+def _entry_date_grains(entry: dict) -> list:
+    """Entry's date grains for `date_aggregation_info` (Task 15). Falls back to
+    a 1-item list derived from the single-date `date_column`/`bucket` form
+    when `date_grains` is absent, so existing single-date callers (commands/
+    aggregate.py's `_patch_and_write_primary`, hand-built entries in tests)
+    keep working unchanged. Same shim-fallback pattern as `_cand_date_grains`
+    above."""
+    grains = entry.get("date_grains")
+    if grains is not None:
+        return grains
+    col = entry.get("date_column")
+    return [{"column": col, "bucket": entry.get("bucket")}] if col else []
+
+
+def date_aggregation_info_to_grains(entry: dict) -> list:
+    """Reconstruct `date_grains` ([{"column", "bucket"}]) from an already-
+    patched `aggregated_models` entry's `date_aggregation_info`
+    ([{"column_id", "bucket"}]) — the exact inverse of the emission mapping
+    in `patch_association` below (`"NO_BUCKET"` <-> internal `bucket=None`).
+
+    Needed because a primary Model's EXISTING `aggregated_models` entries
+    (re-exported from the live TML on every `generate` call — see
+    `_patch_and_write_primary` in commands/aggregate.py) carry
+    `date_aggregation_info`, never `date_grains`/`date_column`. Re-feeding
+    those entries straight into `patch_association` without this conversion
+    reads no grains at all (`_entry_date_grains` only understands the
+    `date_grains`/`date_column` input shapes), which silently strips every
+    pre-existing entry's date association on re-patch — Task 16 bug.
+
+    An entry with no `date_aggregation_info` (a dateless aggregate, e.g.
+    dimensional-only) round-trips to `[]` — unchanged, no date association.
+
+    emit ∘ parse and parse ∘ emit must be identity against
+    `patch_association`'s emission mapping — see
+    test_date_aggregation_info_to_grains_round_trip.
+    """
+    grains = []
+    for g in entry.get("date_aggregation_info") or []:
+        column = g.get("column_id")
+        if column is None:
+            # A grain with no column_id is meaningless (no date column to
+            # associate) — skip rather than emit a column-less grain that would
+            # KeyError on re-emission. Defensive against hand-authored TML.
+            continue
+        # A missing/None/"NO_BUCKET" bucket all mean the same internal thing:
+        # the date carried at full (raw) grain. `.get()` keeps a hand-authored
+        # entry that omits `bucket` from KeyError-ing.
+        bucket = g.get("bucket")
+        grains.append({"column": column,
+                       "bucket": None if bucket == "NO_BUCKET" else bucket})
+    return grains
+
+
+def patch_association(primary_tml: dict, entries: list) -> dict:
+    """Set model.aggregated_models, most-aggregated (smallest projected_rows) first.
+
+    entries: [{"id": guid_or_name, "projected_rows": int|None, ...}] where the
+    date grain(s) come from either the multi-date `date_grains`
+    ([{"column", "bucket"}], Task 15) or the single-date compat shim
+    (`date_column`/`bucket`, Task 14) — see `_entry_date_grains`. Emits {id,
+    optional date_aggregation_info: [{column_id, bucket}]}, one entry per date
+    grain; projected_rows is an internal sort key, stripped before emission.
+
+    date_aggregation_info is a LIST — confirmed against a real live 26.9
+    export (skill Open Item #2, VERIFIED 2026-07-11/12). That same live
+    export showed multi-date associations (multiple {column_id, bucket}
+    entries) and a raw/unbucketed date grain emitted as `bucket: NO_BUCKET`
+    — both reproduced here: internal `bucket=None` (raw date) maps to the
+    string `"NO_BUCKET"` only at this emission boundary; `lattice.BUCKETS`
+    itself is untouched (NO_BUCKET is not a matchable bucket value there). A
+    candidate/entry with no date grains at all still omits
+    `date_aggregation_info` entirely, unchanged from before Task 15.
+    """
+    patched = copy.deepcopy(primary_tml)
+    # Dedup by id, last entry wins. `_aggregate_name` is deterministic, so
+    # re-generating an already-imported aggregate produces the same id; the
+    # re-exported primary already carries that entry, so it appears twice in
+    # `entries` (existing + new). Keep the LAST occurrence (the freshly
+    # generated entry) so re-generate replaces the stale entry in place rather
+    # than appending a duplicate. dict assignment overwrites the value while
+    # keeping first-seen key order, which is irrelevant here — we re-sort next.
+    deduped = {}
+    for e in entries:
+        deduped[e["id"]] = e
+    ordered = sorted(deduped.values(),
+                     key=lambda e: (e.get("projected_rows") is None,
+                                    e.get("projected_rows") or 0))
+    block = []
+    for e in ordered:
+        item = {"id": e["id"]}
+        grains = _entry_date_grains(e)
+        if grains:
+            item["date_aggregation_info"] = [
+                {"column_id": g["column"], "bucket": g["bucket"] or "NO_BUCKET"}
+                for g in grains
+            ]
+        block.append(item)
+    patched["model"]["aggregated_models"] = block
+    return patched
