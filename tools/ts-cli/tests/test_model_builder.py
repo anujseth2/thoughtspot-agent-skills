@@ -1219,9 +1219,11 @@ def test_aggregation_avg_vs_sum_heuristic():
     Summing a normalized score is meaningless (golden §2)."""
     from ts_cli.model_builder import _aggregation_for_name
     for name in ["SPEEDING_NORMALIZEDBEHAVIOR", "Speeding KI Value", "Normalised Days",
-                 "Completion Rate", "CSAT Score", "Win Ratio", "Price Index"]:
+                 "Completion Rate", "CSAT Score", "Win Ratio", "Price Index",
+                 "safety_score", "SpeedingScore"]:   # snake / camelCase averaged quantities
         assert _aggregation_for_name(name) == "AVERAGE", name
-    for name in ["Speeding Events", "Total Days Active", "EVENTSCOUNTS", "Sales", "Order Qty"]:
+    for name in ["Speeding Events", "Total Days Active", "EVENTSCOUNTS", "Sales", "Order Qty",
+                 "Corporate Revenue", "Separate Charges", "Operating Expense"]:  # embed "rate": NOT avg
         assert _aggregation_for_name(name) == "SUM", name
 
 

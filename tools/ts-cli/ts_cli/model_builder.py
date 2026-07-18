@@ -53,18 +53,35 @@ from ts_cli.tableau.twb import (  # noqa: F401 — re-exported for back-compat
 
 # AVG-vs-SUM heuristic (golden §2/§3): summing a normalized/rate/score is meaningless — a
 # numeric column is NOT automatically a SUM measure. Name tokens that imply an averaged
-# quantity → AVERAGE; everything else → SUM. Heuristic, not proof: log/flag when it matters.
-_AVG_NAME_TOKENS = (
-    "normaliz", "normalis",           # normalized / normalised behavior, days
-    "rate", "ratio", "percent", "pct", "score", "index", "average", "mean", " avg",
-    "ki value",                        # per-KI value columns (the golden's AVG measures)
-)
+# quantity → AVERAGE; everything else → SUM. Heuristic, not proof — a post-build
+# double-count/total check is the real gate.
+#
+# Matched on WHOLE word tokens (name split on separators + camelCase humps), NOT raw
+# substrings: a bare "rate" substring misfires on "Corporate"/"Separate"/"Operate",
+# silently switching a SUM money/count measure to AVERAGE and changing every number.
+_AVG_WORD_TOKENS = frozenset({
+    "rate", "ratio", "percent", "pct", "score", "index", "average", "mean", "avg",
+})
+_AVG_PREFIX_TOKENS = ("normaliz", "normalis")   # normalized / normalised (often concatenated)
+_AVG_PHRASES = ("ki value",)                     # per-KI value columns (the golden's AVG measures)
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Lower-case word tokens: split on non-alphanumerics AND camelCase humps, so
+    `safety_score`, `SpeedingScore` and `Completion Rate` all tokenize to real words."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name or "")
+    return [t for t in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if t]
 
 
 def _aggregation_for_name(name: str) -> str:
     """SUM by default; AVERAGE when the column name implies an averaged quantity."""
-    n = (name or "").lower()
-    return "AVERAGE" if any(tok in n for tok in _AVG_NAME_TOKENS) else "SUM"
+    tokens = _name_tokens(name)
+    joined = " ".join(tokens)
+    if (any(t in _AVG_WORD_TOKENS for t in tokens)
+            or any(t.startswith(_AVG_PREFIX_TOKENS) for t in tokens)
+            or any(p in joined for p in _AVG_PHRASES)):
+        return "AVERAGE"
+    return "SUM"
 
 
 def _resolve_view_key(sv: dict, phys: str) -> str:
