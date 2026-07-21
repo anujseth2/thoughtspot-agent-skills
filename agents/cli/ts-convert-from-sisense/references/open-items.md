@@ -4,15 +4,22 @@ Unverified assumptions / follow-ups. Status vocabulary: `TO VERIFY | VERIFIED | 
 DEFERRED | WONT-FIX`. Each must reach VERIFIED (live or via MCP spec) or be explicitly
 deferred before this ships live.
 
-## #1 — Live end-to-end conversion on a real cluster — TO VERIFY (merge gate)
+## #1 — Live end-to-end conversion on a real cluster — VERIFIED 2026-07-21
 
-The full chain (`parse` → `build-model` → `ts tml lint` → `ts tml import` → `build-liveboard`)
-has been exercised only against synthetic/sample bundles, not a live ThoughtSpot cluster with a
-real warehouse connection. Before merge, run a captured Sisense bundle end-to-end on
-ps-internal: confirm the Table + Model TMLs validate against a real connection, the model
-creates clean (with the prune step removing any engine-rejected formula), and a spot-checked
-measure returns faithful numbers (grouped sum equals the ungrouped total, so a `MANY_TO_ONE`
-join does not fan out). This is the blocking item for shipping live.
+Ran the full chain (`parse` → `build-model` → `ts tml lint` → `ts tml import` → `build-liveboard`
+→ import) on **ps-internal**, AnujSeth org, against the live **"Sisense Migration - Databricks"**
+connection (`workspace.sisense_demo`, the captured `sample_ecommerce` bundle):
+
+- **Model TML validated + imported OK** against the real connection, binding to the live
+  Databricks tables (Commerce/Category/Brand/Country); `ts tml lint` CLEAN.
+- **Numbers reconcile (no fan-out):** total `SUM(Revenue) = 5315.0`; `Revenue` grouped by
+  `Category` (Electronics 2190 + Home 910 + Apparel 835 + Sports 820 + Toys 560) = **5315.0** —
+  the `Commerce → Category` MANY_TO_ONE join does not inflate the measure.
+- **Liveboard path:** `build-liveboard` emitted 9 Answers (8 Migrated, 1 Approximated =
+  bubble→scatter) + 1 tabbed Liveboard; all 10 objects imported OK (0 errors) against the model.
+
+Test objects were deleted after verification (`metadata/delete` → 204); the pre-existing
+warehouse tables were left untouched. Merge gate satisfied.
 
 ## #2 — Chart-type fidelity via the shared emitter — VERIFIED (design)
 
