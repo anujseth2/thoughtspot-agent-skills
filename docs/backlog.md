@@ -3204,3 +3204,19 @@ backlog item is the dated exit that exemption's comment references. Author
 `parse → build-model → build-liveboard` chain can be exercised end-to-end.
 
 **Target:** first live end-to-end verification against a captured Sisense bundle (open-item #1).
+## BL-118 — Live end-to-end verification for `ts-convert-from-qlik`
+
+**Filed:** 2026-07-21.
+**Source:** initial `ts-convert-from-qlik` release (PR #254).
+**Affects:** `agents/cli/ts-convert-from-qlik/references/open-items.md` (#1, #2, #6).
+**Status:** OPEN.
+
+ts-convert-from-qlik shipped code-backed (`ts qlik`, 58 unit tests + an **offline smoke test**
+`tools/smoke-tests/smoke_ts_convert_from_qlik.py` — no longer on the ALLOWLIST). Still needs
+verification against real infrastructure: (a) live import on a ThoughtSpot cluster —
+parse→build-model→import→build-liveboard→import + a numbers/double-count check (open-items #1);
+(b) chart-type enum validity on the target build (open-items #2); (c) the live Qlik Cloud/Engine
+extraction paths against a real tenant/engine (open-items #6) — currently mocked-only. Also
+recover table joins/associations from engine-artifacts mode (open-items #3).
+
+**Target:** first live-verification pass against a real Qlik app + ThoughtSpot instance.

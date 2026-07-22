@@ -36,6 +36,8 @@ mappings/looker/
 
 mappings/sisense/
   sisense-formula-translation.md      — Sisense JAQL → ThoughtSpot formula and function mapping (AGG_MAP/FUNCTION_MAP/UNSUPPORTED, mirrors ts_cli/sisense/functions.py)
+mappings/qlik/
+  qlik-thoughtspot-formula-translation.md — Qlik Sense expressions → ThoughtSpot formula and function mapping (199 rows, 17 categories)
 
 schemas/
   thoughtspot-tml.md                  — TML export parsing (PyYAML pitfalls, type detection)
@@ -55,6 +57,7 @@ schemas/
   thoughtspot-connection.md           — connection object structure
   snowflake-schema.md                 — Snowflake Semantic View YAML reference
   databricks-metric-view.md           — Databricks Metric View YAML schema (v0.1/v1.1)
+  qlik-app-ir.md                      — Qlik App IR: the extract↔transform contract for the ts qlik converter
 
 references/
   profile-select-and-authenticate.md  — canonical profile select + verify flow for conversion skills
