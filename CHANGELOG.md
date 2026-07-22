@@ -5,6 +5,9 @@ Skill-level changes are tracked in each skill's own `## Changelog` section.
 
 ---
 
+## 2026-07-22
+- feat: add quality gates catalog generator (`generate_quality_gates.py`); auto-generates `docs/quality-gates.md` from pre-commit.sh, validate.yml, and validator docstrings
+
 ## 2026-07-21
 - feat: add `ts-convert-from-qlik` skill + `ts qlik` command group (parse / build-model / build-liveboard) — Qlik Sense → ThoughtSpot converter across four sources (`--mode offline|engine-artifacts|qlik-cloud|engine`; qlik-cloud/engine are live SOURCE-provenance paths behind the `[qlik]` extra); flags Set Analysis `$`-context, variables, and no-equivalent functions NEEDS REVIEW rather than downgrading
 - docs: add `agents/shared/mappings/qlik/qlik-thoughtspot-formula-translation.md` (199-row Qlik→TS formula map) + `schemas/qlik-app-ir.md`; fixed Upper/Lower → `sql_string_op` passthrough (no native TS `upper()`/`lower()`)
