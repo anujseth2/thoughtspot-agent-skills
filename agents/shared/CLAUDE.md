@@ -34,6 +34,8 @@ mappings/looker/
   lookml-to-ts-formula-translation.md — LookML measure/dimension expressions → ThoughtSpot formula mapping
   lookml-tml-rules.md                 — verified TML generation rules for LookML → ThoughtSpot conversion (joins, key dedup, batch import)
 
+mappings/sisense/
+  sisense-formula-translation.md      — Sisense JAQL → ThoughtSpot formula and function mapping (AGG_MAP/FUNCTION_MAP/UNSUPPORTED, mirrors ts_cli/sisense/functions.py)
 mappings/qlik/
   qlik-thoughtspot-formula-translation.md — Qlik Sense expressions → ThoughtSpot formula and function mapping (199 rows, 17 categories)
 
@@ -72,6 +74,10 @@ worked-examples/snowflake/
   ts-from-snowflake.md                — end-to-end SV → TS conversion — BIRD_SUPERHEROS_SV (verified against live instance)
   ts-from-snowflake-dunder.md         — end-to-end SV → TS conversion — DUNDER_MIFFLIN_SALES_INVENTORY (multi-value synonyms, descriptions, semi-additive, unique count, concat; verified against live instance)
   ts-from-snowflake-identifier-resolution.md — end-to-end SV → TS conversion — COMPANY_WORKFORCE_SV (facts, metric-on-fact inlining, double aggregation via group_count/group_sum, duplicate column_id fix; verified against live instance 2026-06-13)
+
+worked-examples/sisense/
+  numeric-range-filter-to-chip.md     — Sisense dashboard numeric-range filter → ThoughtSpot Liveboard filter chip preset (from/to/NotEqual/equals → GE/GT/LE/LT/BW_INC/BW/EQ)
+  date-bucket-granularity.md          — Sisense date `level` → ThoughtSpot date bucket (hours…years → HOURLY…YEARLY; cyclic parts dropped)
 
 worked-examples/databricks/
   ts-to-databricks.md                 — end-to-end TS → MV conversion — DUNDER_MIFFLIN (multi-fact split, flattened views, LOD dimensions, semi-additive, MEASURE()/ANY_VALUE() cross-refs; verified against live instance 2026-05-25)

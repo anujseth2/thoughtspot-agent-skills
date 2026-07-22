@@ -121,6 +121,8 @@ ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-databricks-mv \
 ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-looker \
       ~/.snowflake/cortex/skills/ts-convert-from-looker
 
+ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-sisense \
+      ~/.snowflake/cortex/skills/ts-convert-from-sisense
 ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-qlik \
       ~/.snowflake/cortex/skills/ts-convert-from-qlik
 
@@ -195,6 +197,8 @@ ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-databricks-mv \
 ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-looker \
       ~/.claude/skills/ts-convert-from-looker
 
+ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-sisense \
+      ~/.claude/skills/ts-convert-from-sisense
 ln -s ~/thoughtspot-agent-skills/agents/cli/ts-convert-from-qlik \
       ~/.claude/skills/ts-convert-from-qlik
 

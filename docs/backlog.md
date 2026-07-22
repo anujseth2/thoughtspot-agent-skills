@@ -3188,6 +3188,22 @@ validators PR rather than bundled.
 
 ---
 
+## BL-118 — Write a smoke test for `ts-convert-from-sisense`
+
+**Filed:** 2026-07-17.
+**Source:** new wip skill `ts-convert-from-sisense` (Sisense offline-bundle → ThoughtSpot).
+**Affects:** `tools/smoke-tests/smoke_ts_convert_from_sisense.py` (new);
+`tools/validate/check_smoke_tests.py` (ALLOWLIST entry).
+**Status:** OPEN.
+
+`ts-convert-from-sisense` (wip) has an `ALLOWLIST` exemption in check_smoke_tests.py; this
+backlog item is the dated exit that exemption's comment references. Author
+`tools/smoke-tests/smoke_ts_convert_from_sisense.py` once a captured Sisense bundle fixture
+(`{dashboard, widgets, datamodel}`) exists and the shared liveboard emitter
+(`ts_cli.tableau.liveboard.build_from_spec`, open-item #2) has landed so the full
+`parse → build-model → build-liveboard` chain can be exercised end-to-end.
+
+**Target:** first live end-to-end verification against a captured Sisense bundle (open-item #1).
 ## BL-118 — Live end-to-end verification for `ts-convert-from-qlik`
 
 **Filed:** 2026-07-21.
