@@ -5,6 +5,43 @@ Skill-level changes are tracked in each skill's own `## Changelog` section.
 
 ---
 
+## 2026-09-17
+- fix: `ts tableau parse` abandoned the **entire** workbook over one addressing token
+  (introduced in v0.32.0, 2026-07-04, #180; found at v0.138.0). Tableau writes a
+  non-numeric token into `<table-calc><address><value>` for non-offset addressing modes
+  (`false`, `"All Pages"`), and `_read_table_calc`'s bare `int()` raised an uncaught
+  `ValueError` out of `parse_cmd`: no tables, joins, formulas, parameters or dashboards
+  were extracted, no output file was written at all, and the skill's Steps 4+ were
+  unreachable. Not a partial result — a full stop, from one `<column-instance>` on one
+  worksheet. The unit fixture only ever asserted a numeric address, so no test
+  contradicted the assumption. That entry's `address_offset` now degrades to `null` —
+  what the element-absent path already produced — and the skip is reported in the new
+  `table_calc_addressing.warnings` (echoed to stderr) instead of raising. `try`/`except`,
+  never `.isdigit()`: **every** numeric address in the 33-workbook corpus is negative
+  (`-1` ×37, `-2` ×3), so an `isdigit` pre-check would have silently nulled 26 working
+  values across 4 workbooks that parse fine today — trading a loud crash in 2 files for
+  silent data loss in 6. Found migrating two real customer workbooks that were 100%
+  unmigratable as a direct result; both now parse (121 calculated fields, 22 dashboards,
+  96 viz previously unreachable). Corpus-verified: 33/33 parse, and the warning fires in
+  exactly those 2 files — no other workbook changes behaviour (SCAL-338450)
+- fix: `extract_table_calc_addressing` never scanned a `.tds`/`.tdsx` published datasource.
+  It searched `.//datasource//column`, which cannot match a tree whose **root is** the
+  `<datasource>` — the shape `datasource_elements()` exists for, and whose docstring names
+  the trap verbatim. `parse` accepted those inputs, exited 0 and wrote an empty
+  `table_calc_addressing`, indistinguishable from a datasource with no table calcs, so
+  Step 3f reasoned about LOOKUP/INDEX addressing from an empty map. Now iterates
+  `datasource_elements(root)`, which also lets each warning name the datasource it came
+  from. The 33-workbook corpus is all workbooks, so it never covered this path (BL-270,
+  which stays open for the two remaining sites: `set_extract.py` `count_native_sets` and
+  `extract_blends`)
+- feat: table-calc entries carry `address_value`, the raw `<address><value>` token, beside
+  `address_offset`. Three states were previously collapsed into one: no `<address>` element,
+  a non-offset addressing mode (`false`, `"All Pages"`), and a real offset all produced
+  `address_offset: null`. Consumers can now tell them apart from the structured output
+  instead of parsing the warning prose. Whitespace-only text is treated as absent, so a
+  pretty-printed TWB behaves like its compact equivalent
+- chore: bump ts-cli to v0.140.0
+
 ## 2026-09-16
 - feat: add ts-object-calendar-builder skill
 - chore: bump ts-cli to v0.139.0
