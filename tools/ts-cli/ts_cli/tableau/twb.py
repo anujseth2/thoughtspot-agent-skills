@@ -51,6 +51,18 @@ def datasource_elements(root: ET.Element) -> list[ET.Element]:
     return root.findall(".//datasource")
 
 
+def datasource_name(ds: ET.Element) -> str:
+    """A datasource's display name, across all four accepted file shapes.
+
+    A ``.twb`` carries ``caption``/``name``; a standalone ``.tds`` root carries
+    neither and names itself with ``formatted-name``. Blank or whitespace-only
+    falls through rather than winning. Companion to ``datasource_elements``.
+    """
+    return ((ds.get("caption") or "").strip()
+            or (ds.get("name") or "").strip()
+            or (ds.get("formatted-name") or "").strip())
+
+
 # ---------------------------------------------------------------------------
 # 6. Parameter extraction from TWB XML
 # ---------------------------------------------------------------------------
@@ -202,17 +214,30 @@ def parse_twb(twb_path: str | Path) -> dict:
 
     datasources = []
     seen_ds = set()
+    # Datasources lost, with a reason, so a zero result is never silent. The
+    # `Parameters` and duplicate-name skips are deliberately not recorded —
+    # neither loses anything, and duplicates outnumber kept datasources ~20:1.
+    skipped: list[dict] = []
 
-    for ds in datasource_elements(root):
-        ds_name = ds.get("caption", ds.get("name", ""))
+    for idx, ds in enumerate(datasource_elements(root), 1):
+        ds_name = datasource_name(ds)
         if ds_name == "Parameters":
             continue
-        if not ds_name or ds_name in seen_ds:
+        if not ds_name:
+            skipped.append({
+                "reason": "no usable name",
+                "detail": f"element #{idx}; looked for caption, name, formatted-name",
+            })
+            continue
+        if ds_name in seen_ds:
             continue
 
         tables = _extract_tables(ds)
         sql_views = _extract_sql_views(ds)
         if not tables and not sql_views:
+            # e.g. a .tds whose only relation is the [Extract] hyper cache.
+            skipped.append({"reason": "no tables or SQL views",
+                            "detail": f"element #{idx}; {ds_name}"})
             continue
         seen_ds.add(ds_name)
 
@@ -249,6 +274,9 @@ def parse_twb(twb_path: str | Path) -> dict:
         # GENERATE pass (set->cohort is an agent-guided Phase-2a/2b/2c step) —
         # surfaced here so the caller can nudge instead of silently skipping.
         "sets_detected": count_native_sets(root),
+        # Datasources found but not migrated, each with a reason. Rendered by
+        # format_parse_warnings so a zero result is never silent.
+        "skipped_datasources": skipped,
     }
 
 
@@ -264,7 +292,7 @@ def extract_blends(root: ET.Element) -> dict:
         return {}
 
     fed_to_caption = {
-        ds.get("name"): ds.get("caption", ds.get("name", ""))
+        ds.get("name"): datasource_name(ds)
         for ds in root.findall(".//datasource")
         if ds.get("name")
     }
@@ -360,7 +388,7 @@ def extract_table_calc_addressing(root: ET.Element) -> dict:
     # both define [Calculation_1] (Step 3g's copied-datasource case).
     column_level: dict = {}
     for ds in datasource_elements(root):
-        ds_name = ds.get("caption") or ds.get("name") or ""
+        ds_name = datasource_name(ds)
         for column in ds.findall(".//column"):
             calc = column.find("calculation[@class='tableau']")
             if calc is None:
@@ -400,15 +428,31 @@ def extract_table_calc_addressing(root: ET.Element) -> dict:
     }
 
 
-def format_parse_warnings(addressing: dict) -> str:
-    """Render ``extract_table_calc_addressing``'s warnings as stderr lines.
+def format_parse_warnings(parsed: dict) -> str:
+    """Render a parse result's non-fatal warnings as stderr lines.
 
-    Takes the addressing dict so the caller appends one call to its existing
+    Takes the whole parse result so the caller appends one call to its existing
     summary echo. Lives here, beside the code that produces the warnings, rather
     than in ``commands/tableau.py`` — that module is ratcheted under BL-089 and
     must not grow to carry it. Pure string formatting; the caller does the I/O.
+
+    Two sources today: non-numeric table-calc addressing, and datasources found
+    but not migrated. The second exists because "0 datasources" and "0
+    datasources, and here is one we threw away" are indistinguishable otherwise
+    — which is how every published datasource read as an empty file for months.
+
+    Both keys are `.get`-guarded rather than indexed: ``parse_cmd`` adds
+    ``table_calc_addressing`` after ``parse_twb`` returns, and this function is
+    re-exported for back-compat, so it is also handed results written by an
+    older ts-cli. Staying total means an old input degrades instead of raising.
     """
-    return "".join(f"\nWARNING: {w}" for w in addressing["warnings"])
+    addressing = parsed.get("table_calc_addressing") or {}
+    out = [f"\nWARNING: {w}" for w in addressing.get("warnings", [])]
+    out += [
+        f"\nWARNING: datasource skipped — {s['reason']} ({s['detail']})"
+        for s in parsed.get("skipped_datasources") or []
+    ]
+    return "".join(out)
 
 
 def _strip_brackets(s: str) -> str:
@@ -784,7 +828,7 @@ def _extract_calculated_fields(ds: ET.Element) -> tuple[list[dict], dict[str, st
     """
     calcs = []
     calc_map = {}
-    ds_name = ds.get("caption", ds.get("name", ""))
+    ds_name = datasource_name(ds)
 
     for col in ds.findall("./column"):
         calc_el = col.find("calculation")

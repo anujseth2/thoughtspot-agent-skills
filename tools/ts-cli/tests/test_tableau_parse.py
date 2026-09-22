@@ -161,6 +161,50 @@ def test_parse_includes_blend_plan(tmp_path):
     assert plan["joins"][0]["on"] == "[ORDERS::Cat] = [TARGETS::Cat]"
 
 
+BLEND_ODD_CAPTION = """<?xml version='1.0'?>
+<workbook>
+  <datasource name='federated.a' caption='{cap}'>
+    <relation name='ORDERS' type='table' table='[db].[s].[ORDERS]'/>
+    <column name='[Cat]' datatype='string' caption='Cat'/>
+  </datasource>
+  <datasource name='federated.b' caption='Targets'>
+    <relation name='TARGETS' type='table' table='[db].[s].[TARGETS]'/>
+    <column name='[Cat]' datatype='string' caption='Cat'/>
+  </datasource>
+  <datasource-relationships>
+    <datasource-dependencies datasource='federated.a'>
+      <column-instance name='[ci_a]' column='[Cat]'/>
+    </datasource-dependencies>
+    <datasource-dependencies datasource='federated.b'>
+      <column-instance name='[ci_b]' column='[Cat]'/>
+    </datasource-dependencies>
+    <datasource-relationship source='federated.a' target='federated.b'>
+      <column-mapping><map key='[federated.a].[ci_a]' value='[federated.b].[ci_b]'/></column-mapping>
+    </datasource-relationship>
+  </datasource-relationships>
+</workbook>
+"""
+
+
+def test_blend_graph_uses_the_same_datasource_names_as_parse(tmp_path):
+    """extract_blends kept its own copy of the naming rule, so an empty or
+    padded caption keyed the graph on a name no datasource has — the edge was
+    detected and then produced no join."""
+    for cap, expected in [("", "federated.a"), ("Orders  ", "Orders")]:
+        twb = tmp_path / "blend.twb"
+        twb.write_text(BLEND_ODD_CAPTION.format(cap=cap))
+        out = tmp_path / "parsed.json"
+
+        result = runner.invoke(app, ["tableau", "parse", str(twb), "--output", str(out)])
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+        data = json.loads(out.read_text())
+        names = [d["name"] for d in data["datasources"]]
+        assert expected in names
+        assert list(data["blends"].keys()) == [expected]      # graph agrees with parse
+        assert data["blend_plan"]["joins"], "blend detected but produced no join"
+
+
 def test_classify_formulas_from_parsed_json(tmp_path):
     parsed = {
         "datasources": [{
@@ -236,6 +280,144 @@ def test_parse_tdsx_file(tmp_path):
     result = runner.invoke(app, ["tableau", "parse", str(tdsx), "--output", str(out)])
     assert result.exit_code == 0, result.stdout + result.stderr
     _assert_tds_parsed(json.loads(out.read_text()))
+
+
+# SCAL-331323 — the fixture above carries BOTH `formatted-name` and `caption`,
+# so it exercised a shape Tableau does not emit for a published datasource and
+# the suite stayed green while every real .tds returned nothing. Real files
+# carry `formatted-name` ALONE: the name lookup returned "", the empty-name
+# guard in parse_twb discarded the datasource, and the command reported
+# "Parsed 0 datasource(s)" with exit code 0.
+TDS_NO_CAPTION = TDS.replace(
+    "<datasource formatted-name='tentpole_prod' caption='Tentpole Prod'>",
+    "<datasource formatted-name='tentpole_prod' inline='true' version='18.1'>",
+)
+
+
+def test_parse_tds_named_only_by_formatted_name(tmp_path):
+    tds = tmp_path / "published.tds"
+    tds.write_text(TDS_NO_CAPTION)
+    out = tmp_path / "parsed.json"
+
+    result = runner.invoke(app, ["tableau", "parse", str(tds), "--output", str(out)])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    data = json.loads(out.read_text())
+    assert len(data["datasources"]) == 1, "the datasource was discarded for having no name"
+    ds = data["datasources"][0]
+    assert ds["name"] == "tentpole_prod"          # falls back to formatted-name
+    assert {t["name"] for t in ds["tables"]} == {"promotion_master", "product_metrics"}
+    assert len(ds["joins"]) == 1
+    # every calc is labelled with the datasource it came from, not ""
+    assert {c["datasource"] for c in ds["calculated_fields"]} == {"tentpole_prod"}
+
+
+def test_parse_warns_when_a_datasource_is_discarded(tmp_path):
+    """The silence is the bug's other half: a file whose datasource is thrown
+    away must not report the same thing as a file that had none."""
+    twb = tmp_path / "nameless.twb"
+    twb.write_text("""<?xml version='1.0'?>
+<workbook>
+  <datasource>
+    <relation name='ORDERS' type='table' table='[db].[s].[ORDERS]'/>
+  </datasource>
+</workbook>
+""")
+    out = tmp_path / "parsed.json"
+
+    result = runner.invoke(app, ["tableau", "parse", str(twb), "--output", str(out)])
+
+    assert result.exit_code == 0
+    assert json.loads(out.read_text())["datasources"] == []
+    assert "datasource skipped" in result.stderr
+    assert "no usable name" in result.stderr
+
+
+def test_parse_warns_when_a_named_datasource_has_nothing_migratable(tmp_path):
+    """The name resolves, so the no-name guard never fires — this is the branch
+    the first instrumentation missed. A .tds whose only relation is the
+    [Extract] hyper cache is filtered by _is_extract_wrapper and leaves here."""
+    tds = tmp_path / "extract_only.tds"
+    tds.write_text("""<?xml version='1.0'?>
+<datasource formatted-name='World Indicators' inline='true' version='18.1'>
+  <connection class='federated'>
+    <relation name='Extract' table='[Extract].[Extract]' type='table'/>
+  </connection>
+  <column caption='Population' datatype='real' name='[Population]' role='measure'/>
+</datasource>
+""")
+    out = tmp_path / "parsed.json"
+
+    result = runner.invoke(app, ["tableau", "parse", str(tds), "--output", str(out)])
+
+    assert result.exit_code == 0
+    assert json.loads(out.read_text())["datasources"] == []
+    assert "no tables or SQL views" in result.stderr
+    assert "World Indicators" in result.stderr     # names which one was lost
+
+
+def test_skipped_datasources_are_individually_identifiable(tmp_path):
+    """Two nameless datasources otherwise emit two identical warnings, which
+    cannot be told apart or acted on — the same defect flagged for duplicate
+    <column-instance> warnings in the previous PR."""
+    twb = tmp_path / "two_nameless.twb"
+    twb.write_text("""<?xml version='1.0'?>
+<workbook>
+  <datasource><relation name='ORDERS' type='table' table='[db].[s].[ORDERS]'/></datasource>
+  <datasource><relation name='RETURNS' type='table' table='[db].[s].[RETURNS]'/></datasource>
+</workbook>
+""")
+    out = tmp_path / "parsed.json"
+
+    result = runner.invoke(app, ["tableau", "parse", str(twb), "--output", str(out)])
+
+    assert result.exit_code == 0
+    skipped = json.loads(out.read_text())["skipped_datasources"]
+    assert len(skipped) == 2
+    assert skipped[0]["detail"] != skipped[1]["detail"]
+    assert "#1" in skipped[0]["detail"] and "#2" in skipped[1]["detail"]
+
+
+def test_parse_does_not_report_duplicate_datasource_stubs(tmp_path):
+    """Tableau writes one <datasource> stub per worksheet, so the duplicate
+    branch fires far more often than datasources are kept. Reporting correct
+    dedupe would bury the two skips that mean something."""
+    twb = tmp_path / "dupes.twb"
+    twb.write_text("""<?xml version='1.0'?>
+<workbook>
+  <datasource name='federated.a' caption='Orders'>
+    <relation name='ORDERS' type='table' table='[db].[s].[ORDERS]'/>
+  </datasource>
+  <datasource name='federated.a' caption='Orders'/>
+  <datasource name='federated.a' caption='Orders'/>
+</workbook>
+""")
+    out = tmp_path / "parsed.json"
+
+    result = runner.invoke(app, ["tableau", "parse", str(twb), "--output", str(out)])
+
+    assert result.exit_code == 0
+    data = json.loads(out.read_text())
+    assert len(data["datasources"]) == 1           # deduped, as intended
+    assert data["skipped_datasources"] == []       # and reported as nothing
+    assert "datasource skipped" not in result.stderr
+
+
+def test_datasource_name_helper():
+    import xml.etree.ElementTree as ET
+    from ts_cli.tableau.twb import datasource_name
+    # .twb shapes win in order; a .tds root has only formatted-name
+    assert datasource_name(ET.fromstring("<datasource caption='C' name='N' formatted-name='F'/>")) == "C"
+    assert datasource_name(ET.fromstring("<datasource name='N' formatted-name='F'/>")) == "N"
+    assert datasource_name(ET.fromstring("<datasource formatted-name='F'/>")) == "F"
+    assert datasource_name(ET.fromstring("<datasource/>")) == ""
+    # an empty caption must fall through, not win — `.get(a, b)` would return ""
+    assert datasource_name(ET.fromstring("<datasource caption='' formatted-name='F'/>")) == "F"
+    # whitespace-only is absent too: truthy otherwise, it would shadow a real
+    # name and reach the slug as "", giving a .model.tml with no filename stem
+    assert datasource_name(ET.fromstring("<datasource caption='   ' name='federated.a'/>")) == "federated.a"
+    assert datasource_name(ET.fromstring("<datasource caption=' ' name=' ' formatted-name=' '/>")) == ""
+    assert datasource_name(ET.fromstring("<datasource caption='  Orders  '/>")) == "Orders"
 
 
 def test_datasource_elements_helper():
