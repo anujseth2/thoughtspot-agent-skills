@@ -5,6 +5,7 @@ each of the 8 failure modes identified in the migration pipeline analysis.
 """
 import pytest
 
+from ts_cli.tableau.joins import _join_key_operand
 from ts_cli.model_builder import (
     _extract_joins,
     _extract_tables,
@@ -857,6 +858,77 @@ class TestExtractJoinsUsesRelationName:
         import xml.etree.ElementTree as ET
         return ET.fromstring(f"<datasource>{xml}</datasource>")
 
+    def test_nested_join_qualified_clauses_stay_separate(self):
+        # `./clause`, not `.//clause`: on a left-deep ((A join B) join C) a
+        # descendant search picks up the inner relation's clause too, welding two
+        # separate joins into one bogus composite — A and B joined on a key that
+        # belongs to B and C — while the inner relation is visited in its own
+        # right anyway, so its keys are emitted twice.
+        ds = self._make_ds('''
+            <relation join="left" type="join">
+                <relation join="inner" type="join">
+                    <relation type="table" name="A" table="[db].[s].[A]" />
+                    <relation type="table" name="B" table="[db].[s].[B]" />
+                    <clause type="join">
+                        <expression op="=">
+                            <expression op="[A].[AId]" />
+                            <expression op="[B].[BId]" />
+                        </expression>
+                    </clause>
+                </relation>
+                <relation type="table" name="C" table="[db].[s].[C]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[B].[BKey]" />
+                        <expression op="[C].[CKey]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == [
+            {
+                "type": "LEFT",
+                "left_table": "B",
+                "right_table": "C",
+                "keys": [{"left": "BKey", "right": "CKey"}],
+            },
+            {
+                "type": "INNER",
+                "left_table": "A",
+                "right_table": "B",
+                "keys": [{"left": "AId", "right": "BId"}],
+            },
+        ]
+        assert warnings == []
+
+    def test_clause_qualifier_beats_child_order(self):
+        # The clause names `returns` first; the children list `orders` first.
+        # `_join_sides` takes the clause's word, and this pins that convention.
+        # Reading child order first is not a wrong join — the keys pair correctly
+        # either way — but it puts the other table in `left_table`, and that is
+        # the side `model_builder` emits the current hardcoded MANY_TO_ONE on.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[returns].[OrderRef]" />
+                        <expression op="[orders].[OrderKey]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == [{
+            "type": "INNER",
+            "left_table": "returns",
+            "right_table": "orders",
+            "keys": [{"left": "OrderRef", "right": "OrderKey"}],
+        }]
+        assert warnings == []
+
     def test_join_uses_alias_names(self):
         ds = self._make_ds('''
             <relation join="inner" type="join">
@@ -868,10 +940,712 @@ class TestExtractJoinsUsesRelationName:
                 </clause>
             </relation>
         ''')
-        joins = _extract_joins(ds)
+        joins, warnings = _extract_joins(ds)
         assert len(joins) == 1
         assert joins[0]["left_table"] == "d_partner1"
         assert joins[0]["right_table"] == "orders"
+        assert warnings == []
+
+    def test_join_with_nested_equality_and_custom_sql_side_not_dropped(self):
+        # BL-275 — a Custom SQL Query joined to a dimension table (a common,
+        # ordinary Tableau pattern, not exotic) writes the clause's equality
+        # nested inside a wrapping <expression op='='>, and the Custom SQL
+        # side is type='text', not type='table'. Reproduces
+        # "Multi level WB v0.twb" live-verified 2026-08-06: ts tableau parse
+        # reported 0 joins before this fix, though the workbook has exactly
+        # one, and a formula spanning both sides
+        # (Commission Earned = SUM([Amount (Custom SQL Query)] *
+        # [Commission Rate (dim_sales_team_clean_updated.csv1)])) got a
+        # validation warning ("Unresolved Custom SQL Query alias") because
+        # the model had no join path between the two relations it referenced.
+        ds = self._make_ds('''
+            <relation join="left" type="join">
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[Custom SQL Query].[Sales Person]" />
+                        <expression op="[dim_sales_team_clean_updated.csv1].[Sales Person]" />
+                    </expression>
+                </clause>
+                <relation name="Custom SQL Query" type="text">SELECT "Sales Person" FROM "Chocolate Sales 2"</relation>
+                <relation name="dim_sales_team_clean_updated.csv1" type="table" table="[dim_sales_team_clean_updated#csv]" />
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert len(joins) == 1
+        assert joins[0]["left_table"] == "Custom SQL Query"
+        assert joins[0]["right_table"] == "dim_sales_team_clean_updated.csv1"
+        # Bare column names — the caller (model_builder.py) prepends its own
+        # `table::` qualifier; a table-qualified key here would corrupt the
+        # emitted join `on:` clause.
+        assert joins[0]["keys"] == [{"left": "Sales Person", "right": "Sales Person"}]
+        assert warnings == []
+
+    def test_join_with_nested_equality_both_sides_table_not_dropped(self):
+        # Isolates the index-shift defect from the type='text' side: even a
+        # plain table-to-table join is silently dropped if Tableau happens to
+        # write the equality nested, independent of whether a Custom SQL
+        # relation is involved at all.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="d_partner1" table="[db].[s].[d_partner]" />
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[PartnerId]" />
+                        <expression op="[OrderPartnerId]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert len(joins) == 1
+        assert joins[0]["left_table"] == "d_partner1"
+        assert joins[0]["right_table"] == "orders"
+        assert joins[0]["keys"] == [{"left": "PartnerId", "right": "OrderPartnerId"}]
+        assert warnings == []
+
+    def test_join_with_range_operator_reported_not_emitted(self):
+        # Non-equi joins are not supported yet. A range clause must be skipped
+        # and REPORTED — never emitted as an equi-join, which would silently
+        # change every measure built on it. main drops this shape with no
+        # warning at all; the warning is the improvement here.
+        ds = self._make_ds('''
+            <relation join="left" type="join">
+                <relation type="table" name="events" table="[db].[s].[events]" />
+                <relation type="table" name="rates" table="[db].[s].[rates]" />
+                <clause type="join">
+                    <expression op="&gt;=">
+                        <expression op="[EventTs]" />
+                        <expression op="[RateTs]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "non-equi" in warnings[0] and ">=" in warnings[0]
+
+    def test_join_with_not_equal_operator_reported_not_emitted(self):
+        # Tableau writes not-equal as '<>'. Skipped and reported like any other
+        # non-equality: a `!=` join is many-to-many, which the MANY_TO_ONE
+        # cardinality every emitted join carries cannot describe.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="d_partner1" table="[db].[s].[d_partner]" />
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <clause type="join">
+                    <expression op="&lt;&gt;">
+                        <expression op="[PartnerId]" />
+                        <expression op="[OrderPartnerId]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "non-equi" in warnings[0] and "<>" in warnings[0]
+
+    def test_join_with_mixed_equi_and_unsupported_sibling_clauses_drops_whole_key(self):
+        # Sibling <clause> nodes are merged into ONE join, so they are conditions
+        # of one composite key — the same thing AND-inside-one-clause spells, just
+        # written differently. Keeping the equi sibling would emit half a key,
+        # which fans out and double-counts silently, exactly what the AND form is
+        # already refused for.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="d_partner1" table="[db].[s].[d_partner]" />
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <clause type="join">
+                    <expression op="[PartnerId]" />
+                    <expression op="[OrderPartnerId]" />
+                </clause>
+                <clause type="join">
+                    <expression op="LIKE">
+                        <expression op="[StartDate]" />
+                        <expression op="[EndDate]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "LIKE" in warnings[0]
+
+    def test_sibling_clauses_and_nested_and_agree(self):
+        # The two spellings of one composite key must produce the same result.
+        # They took different code paths, so an unsupported condition was refused
+        # in the AND form and half-emitted in the sibling form.
+        sides = '''
+                <relation type="table" name="trades" table="[db].[s].[trades]" />
+                <relation type="table" name="rates" table="[db].[s].[rates]" />
+        '''
+        equalities = '''
+                    <expression op="=">
+                        <expression op="[Symbol]" />
+                        <expression op="[Symbol]" />
+                    </expression>
+                    <expression op="=">
+                        <expression op="[Book]" />
+                        <expression op="[Book]" />
+                    </expression>
+        '''
+        siblings = self._make_ds(f'''
+            <relation join="inner" type="join">
+                {sides}
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[Symbol]" />
+                        <expression op="[Symbol]" />
+                    </expression>
+                </clause>
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[Book]" />
+                        <expression op="[Book]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        nested = self._make_ds(f'''
+            <relation join="inner" type="join">
+                {sides}
+                <clause type="join">
+                    <expression op="AND">{equalities}</expression>
+                </clause>
+            </relation>
+        ''')
+        assert _extract_joins(siblings) == _extract_joins(nested)
+        joins, warnings = _extract_joins(siblings)
+        assert joins[0]["keys"] == [
+            {"left": "Symbol", "right": "Symbol"},
+            {"left": "Book", "right": "Book"},
+        ]
+        assert warnings == []
+
+    def test_join_with_composite_key_two_conditions_preserved(self):
+        # Blocking 2 (SCAL-330635 PR review) — a composite-key join (A=B AND
+        # C=D) written as a single <clause> with one <expression op="AND">
+        # wrapping two equalities must yield BOTH keys, not just the first.
+        # A join on half its key doesn't error, it fans out silently.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="AND">
+                        <expression op="=">
+                            <expression op="[OrderId]" />
+                            <expression op="[OrderId]" />
+                        </expression>
+                        <expression op="=">
+                            <expression op="[LineItemId]" />
+                            <expression op="[LineItemId]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert len(joins) == 1
+        assert joins[0]["keys"] == [
+            {"left": "OrderId", "right": "OrderId"},
+            {"left": "LineItemId", "right": "LineItemId"},
+        ]
+        assert warnings == []
+
+    def test_join_clause_with_or_is_reported_as_a_combined_condition(self):
+        # OR's two children are comparison nodes, not columns, so the operand
+        # check fired first and reported the `=` inside one of them — naming the
+        # one operator this parser supports as the problem, and blaming a
+        # function call that is not there. The reason is structural, so the
+        # check is too: any operand carrying two operands of its own.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="OR">
+                        <expression op="=">
+                            <expression op="[orders].[OrderId]" />
+                            <expression op="[returns].[OrderId]" />
+                        </expression>
+                        <expression op="=">
+                            <expression op="[orders].[AltId]" />
+                            <expression op="[returns].[AltId]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "OR" in warnings[0] and "conjunction of key pairs" in warnings[0]
+        assert "orders" in warnings[0] and "returns" in warnings[0]
+        # The old message, which is what made this worth fixing rather than the
+        # skip itself — the skip was always correct.
+        assert "unsupported operand" not in warnings[0]
+        assert "function call" not in warnings[0]
+
+    def test_join_clause_with_xor_names_that_operator_not_a_function_call(self):
+        # The check is on operand shape, not on a list of operators, so a
+        # connective this parser has never seen is still named accurately.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="XOR">
+                        <expression op="=">
+                            <expression op="[orders].[OrderId]" />
+                            <expression op="[returns].[OrderId]" />
+                        </expression>
+                        <expression op="=">
+                            <expression op="[orders].[AltId]" />
+                            <expression op="[returns].[AltId]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "XOR" in warnings[0]
+        assert "unsupported operand" not in warnings[0]
+        assert "function call" not in warnings[0]
+
+    def test_two_comparisons_side_by_side_in_one_clause_are_reported(self):
+        # No connective at all: `_collect_comparisons` reads a <clause> as an
+        # equality, so its two comparison children arrive as one comparison's
+        # operands. Reported as combined conditions rather than as a `=` operand.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[orders].[A]" />
+                        <expression op="[returns].[A]" />
+                    </expression>
+                    <expression op="=">
+                        <expression op="[orders].[B]" />
+                        <expression op="[returns].[B]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "combines conditions" in warnings[0]
+        assert "unsupported operand" not in warnings[0]
+        assert "function call" not in warnings[0]
+
+    def test_two_argument_function_operand_is_reported_as_an_operand(self):
+        # A function taking two arguments has the same child count as a
+        # comparison, so a check on arity alone read CONCAT([A],[B]) as combined
+        # conditions and stopped naming the function. IFNULL and COALESCE in a
+        # join clause have the same shape.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="CONCAT">
+                            <expression op="[orders].[A]" />
+                            <expression op="[orders].[B]" />
+                        </expression>
+                        <expression op="[returns].[Key]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "CONCAT" in warnings[0]
+        assert "not a plain column reference" in warnings[0]
+        assert "combines conditions" not in warnings[0]
+
+    def test_unknown_connective_is_named_rather_than_miscategorised(self):
+        # The condition set is consulted on the operands, not on what combines
+        # them, so a connective the parser has never seen is still reported by
+        # name — its two equalities are conditions whatever sits above them.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="NAND">
+                        <expression op="=">
+                            <expression op="[orders].[A]" />
+                            <expression op="[returns].[A]" />
+                        </expression>
+                        <expression op="=">
+                            <expression op="[orders].[B]" />
+                            <expression op="[returns].[B]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "NAND" in warnings[0]
+        assert "combines conditions" in warnings[0]
+
+    def test_join_key_operand_returns_the_leaf_of_any_qualifier_depth(self):
+        # The table half is compared against `_relation_name`, which is a leaf,
+        # so the qualifier must resolve to one too. A single rsplit left the
+        # separator in anything deeper than [Table].[Col].
+        assert _join_key_operand("[Col]") == ("Col", "")
+        assert _join_key_operand("[orders].[Col]") == ("Col", "orders")
+        assert _join_key_operand("[public].[orders].[Col]") == ("Col", "orders")
+        assert _join_key_operand("[db].[public].[orders].[Col]") == ("Col", "orders")
+
+    def test_join_with_three_part_qualifier_resolves_to_table_leaf(self):
+        # End to end: a schema-qualified clause must still name tables that
+        # match the relations. `public].[orders` matches none, so the join was
+        # emitted looking resolved and then dropped by both `model_tables`
+        # builders — non-empty, so the unresolved-pair guard cannot catch it.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[public].[orders]" />
+                <relation type="table" name="returns" table="[db].[public].[returns]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[public].[orders].[OrderKey]" />
+                        <expression op="[public].[returns].[OrderRef]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == [{
+            "type": "INNER",
+            "left_table": "orders",
+            "right_table": "returns",
+            "keys": [{"left": "OrderKey", "right": "OrderRef"}],
+        }]
+        assert warnings == []
+
+    def test_nested_join_with_unqualified_clause_is_reported_not_emitted_blank(self):
+        # ((A join B) join C) with the legacy flat clause shape: no operand
+        # carries a qualifier, and the outer relation's direct children are a
+        # join node plus one table, so `_join_sides` can resolve neither side.
+        # A blank name binds to no table in either `model_tables` builder, so
+        # the join used to vanish there with nothing said anywhere.
+        ds = self._make_ds('''
+            <relation join="left" type="join">
+                <relation join="inner" type="join">
+                    <relation type="table" name="A" table="[db].[s].[A]" />
+                    <relation type="table" name="B" table="[db].[s].[B]" />
+                    <clause type="join">
+                        <expression op="[AId]" />
+                        <expression op="[BId]" />
+                    </clause>
+                </relation>
+                <relation type="table" name="C" table="[db].[s].[C]" />
+                <clause type="join">
+                    <expression op="[BKey]" />
+                    <expression op="[CKey]" />
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        # The inner join still resolves; only the unresolvable outer one is gone.
+        assert joins == [{
+            "type": "INNER",
+            "left_table": "A",
+            "right_table": "B",
+            "keys": [{"left": "AId", "right": "BId"}],
+        }]
+        assert len(warnings) == 1
+        assert "could not be resolved to a table pair" in warnings[0]
+        assert "carry no table qualifier" in warnings[0]
+
+    def test_join_relation_with_no_clause_is_not_blamed_on_qualifiers(self):
+        # Same guard, different cause: a <relation join> with one table child and
+        # no clause at all has no operands to be unqualified, so the nested-join
+        # wording named a thing that is not there.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "no join clause" in warnings[0]
+        assert "qualifier" not in warnings[0]
+
+    def test_composite_key_condition_written_in_reverse_order_is_reoriented(self):
+        # A relation's orientation is fixed by the first qualified comparison,
+        # but a later condition may name its operands the other way round — the
+        # same join, written in the other direction. Both columns of the second
+        # key used to be attributed to the wrong table, which imports and lints
+        # clean and makes every measure across the join wrong.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="AND">
+                        <expression op="=">
+                            <expression op="[orders].[OrderKey]" />
+                            <expression op="[returns].[OrderRef]" />
+                        </expression>
+                        <expression op="=">
+                            <expression op="[returns].[ReturnLine]" />
+                            <expression op="[orders].[OrderLine]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        # The whole dict, so the key pairing is pinned to the table orientation
+        # it is meant to be read against — `keys` alone cannot show a mis-pairing.
+        assert joins == [{
+            "type": "INNER",
+            "left_table": "orders",
+            "right_table": "returns",
+            "keys": [
+                {"left": "OrderKey", "right": "OrderRef"},
+                {"left": "OrderLine", "right": "ReturnLine"},
+            ],
+        }]
+        assert warnings == []
+
+    def test_self_join_qualifiers_are_not_reoriented(self):
+        # Both operands qualify to the same table, so "which side is which" has
+        # no answer to read off the qualifier — the re-orientation must not fire
+        # and swap a correctly-ordered key.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="emp" table="[db].[s].[emp]" />
+                <relation type="table" name="emp" table="[db].[s].[emp]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="[emp].[ManagerId]" />
+                        <expression op="[emp].[EmpId]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins[0]["keys"] == [{"left": "ManagerId", "right": "EmpId"}]
+        assert warnings == []
+
+    def test_join_with_composite_key_three_conditions_nested_and_preserved(self):
+        # Three-condition composite key written as AND-of-AND (pairwise nested,
+        # not a single flat 3-child AND) — genuinely depth-robust pairing, not
+        # just depth-robust leaf-finding. All three keys must survive.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="A" table="[db].[s].[A]" />
+                <relation type="table" name="B" table="[db].[s].[B]" />
+                <clause type="join">
+                    <expression op="AND">
+                        <expression op="AND">
+                            <expression op="=">
+                                <expression op="[Col1]" />
+                                <expression op="[Col1B]" />
+                            </expression>
+                            <expression op="=">
+                                <expression op="[Col2]" />
+                                <expression op="[Col2B]" />
+                            </expression>
+                        </expression>
+                        <expression op="=">
+                            <expression op="[Col3]" />
+                            <expression op="[Col3B]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert len(joins) == 1
+        assert joins[0]["keys"] == [
+            {"left": "Col1", "right": "Col1B"},
+            {"left": "Col2", "right": "Col2B"},
+            {"left": "Col3", "right": "Col3B"},
+        ]
+        assert warnings == []
+
+    def test_join_with_composite_key_asof_shape_reported_not_partially_emitted(self):
+        # ASOF-join shape (A=B AND C>=D). Non-equi is not supported yet, and the
+        # equality half must NOT be emitted on its own: a join on part of a
+        # composite key fans out and silently double-counts every measure built
+        # on it. So the whole clause is skipped and reported.
+        ds = self._make_ds('''
+            <relation join="left" type="join">
+                <relation type="table" name="trades" table="[db].[s].[trades]" />
+                <relation type="table" name="rates" table="[db].[s].[rates]" />
+                <clause type="join">
+                    <expression op="AND">
+                        <expression op="=">
+                            <expression op="[Symbol]" />
+                            <expression op="[Symbol]" />
+                        </expression>
+                        <expression op="&gt;=">
+                            <expression op="[TradeTs]" />
+                            <expression op="[RateTs]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "non-equi" in warnings[0]
+        assert "(composite key)" in warnings[0]
+
+    def test_join_with_composite_key_mixed_equi_and_unsupported_drops_whole_key(self):
+        # Option (a): a composite key mixing an equi condition with one using
+        # an operator that is not an equality must drop the WHOLE key, not
+        # just the unsupported half — a partial composite key (2 of 3, 1 of 2)
+        # is exactly as dangerous as the original truncation bug: it fans out
+        # and double-counts silently, so it isn't safer than emitting nothing.
+        ds = self._make_ds('''
+            <relation join="left" type="join">
+                <relation type="table" name="trades" table="[db].[s].[trades]" />
+                <relation type="table" name="rates" table="[db].[s].[rates]" />
+                <clause type="join">
+                    <expression op="AND">
+                        <expression op="=">
+                            <expression op="[Symbol]" />
+                            <expression op="[Symbol]" />
+                        </expression>
+                        <expression op="LIKE">
+                            <expression op="[TradeTs]" />
+                            <expression op="[RateTs]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "trades" in warnings[0]
+        assert "rates" in warnings[0]
+        assert "LIKE" in warnings[0]
+        assert "composite key" in warnings[0]
+
+    def test_join_wrapped_in_not_is_skipped_never_inverted(self):
+        # The parser used to unwrap ANY single-child <expression>, so NOT(A=B)
+        # emitted A=B — the logical inverse of the authored join, with clean
+        # TML and a clean lint. Nothing downstream can detect that. Only the
+        # <clause> node is transparent now; an <expression> keeps its operator.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="A" table="[db].[s].[A]" />
+                <relation type="table" name="B" table="[db].[s].[B]" />
+                <clause type="join">
+                    <expression op="NOT">
+                        <expression op="=">
+                            <expression op="[A_id]" />
+                            <expression op="[B_id]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []           # never the inverse of what was authored
+        assert len(warnings) == 1
+        assert "no recognizable comparison" in warnings[0]
+
+    def test_join_with_blank_operator_is_reported_not_assumed_equality(self):
+        # A wrapper carrying no operator used to default to '=', contradicting
+        # the rule that an unrecognised operator is reported rather than
+        # guessed at. The legacy flat <clause> shape (no wrapper at all) is
+        # still equality by construction — covered by the tests above.
+        for attrs in ('op=""', ''):
+            ds = self._make_ds(f'''
+                <relation join="inner" type="join">
+                    <relation type="table" name="A" table="[db].[s].[A]" />
+                    <relation type="table" name="B" table="[db].[s].[B]" />
+                    <clause type="join">
+                        <expression {attrs}>
+                            <expression op="[A_id]" />
+                            <expression op="[B_id]" />
+                        </expression>
+                    </clause>
+                </relation>
+            ''')
+            joins, warnings = _extract_joins(ds)
+            assert joins == []
+            assert len(warnings) == 1
+            assert "non-equality operator" in warnings[0]
+
+    def test_join_with_function_wrapped_operand_skipped_and_warned(self):
+        # Blocking 3 (SCAL-330635 PR review) — UPPER([OrderId]) = [OrderId] (a
+        # case-insensitive join, common in real workbooks) must not be
+        # silently unwrapped to a bare equality (the pre-fix behaviour) or
+        # silently dropped with no trace (this fix's own interim behaviour,
+        # caught before it shipped) — it must be skipped with a warning naming
+        # the unsupported operand.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="orders" table="[db].[s].[orders]" />
+                <relation type="table" name="returns" table="[db].[s].[returns]" />
+                <clause type="join">
+                    <expression op="=">
+                        <expression op="UPPER">
+                            <expression op="[OrderId]" />
+                        </expression>
+                        <expression op="[OrderId]" />
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "orders" in warnings[0]
+        assert "returns" in warnings[0]
+        assert "UPPER" in warnings[0]
+
+    def test_join_with_function_wrapped_operand_in_composite_key_drops_whole_key(self):
+        # A function-wrapped operand inside one condition of a composite key
+        # (A=B AND UPPER(C)=D) must drop the whole key, same option-(a)
+        # reasoning as the non-equi composite case — a partial composite key
+        # is exactly as dangerous as the original truncation bug.
+        ds = self._make_ds('''
+            <relation join="inner" type="join">
+                <relation type="table" name="A" table="[db].[s].[A]" />
+                <relation type="table" name="B" table="[db].[s].[B]" />
+                <clause type="join">
+                    <expression op="AND">
+                        <expression op="=">
+                            <expression op="[Col1]" />
+                            <expression op="[Col1B]" />
+                        </expression>
+                        <expression op="=">
+                            <expression op="UPPER">
+                                <expression op="[Col2]" />
+                            </expression>
+                            <expression op="[Col2B]" />
+                        </expression>
+                    </expression>
+                </clause>
+            </relation>
+        ''')
+        joins, warnings = _extract_joins(ds)
+        assert joins == []
+        assert len(warnings) == 1
+        assert "UPPER" in warnings[0]
+        assert "composite key" in warnings[0]
 
 
 # ---------------------------------------------------------------------------

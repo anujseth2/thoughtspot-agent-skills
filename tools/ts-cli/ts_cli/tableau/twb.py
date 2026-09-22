@@ -242,7 +242,7 @@ def parse_twb(twb_path: str | Path) -> dict:
         seen_ds.add(ds_name)
 
         columns = _extract_columns(ds, tables)
-        joins = _extract_joins(ds)
+        joins, join_warnings = _extract_joins(ds)
         # Modern Tableau stores joins as logical relationships (the "noodle"), not physical
         # <relation join=...>; pick those up too, or a multi-table model imports with no join
         # and ThoughtSpot rejects it. See reference-tableau-model-discovery-algorithm.
@@ -257,6 +257,11 @@ def parse_twb(twb_path: str | Path) -> dict:
             "sql_views": sql_views,
             "columns": columns,
             "joins": joins,
+            # Non-fatal: clauses _extract_joins skipped — a non-equality
+            # operator, or an operand that is not a plain column reference.
+            # Surfaced to the caller instead of silently dropped, so
+            # build-model can fold them into its warnings/report.
+            "join_warnings": join_warnings,
             "calculated_fields": calcs,
             "calc_map": calc_map,
             "col_table_map": col_table_map,
@@ -436,12 +441,15 @@ def format_parse_warnings(parsed: dict) -> str:
     than in ``commands/tableau.py`` — that module is ratcheted under BL-089 and
     must not grow to carry it. Pure string formatting; the caller does the I/O.
 
-    Two sources today: non-numeric table-calc addressing, and datasources found
-    but not migrated. The second exists because "0 datasources" and "0
-    datasources, and here is one we threw away" are indistinguishable otherwise
-    — which is how every published datasource read as an empty file for months.
+    Three sources today: non-numeric table-calc addressing, datasources found
+    but not migrated, and joins skipped by ``_extract_joins``. The second exists
+    because "0 datasources" and "0 datasources, and here is one we threw away"
+    are indistinguishable otherwise — which is how every published datasource
+    read as an empty file for months. The third is the same argument for joins:
+    `build-model` echoes them, and `parse` reporting a join count that silently
+    excludes the skipped ones is the shape that hid the first two.
 
-    Both keys are `.get`-guarded rather than indexed: ``parse_cmd`` adds
+    Every source key is `.get`-guarded rather than indexed: ``parse_cmd`` adds
     ``table_calc_addressing`` after ``parse_twb`` returns, and this function is
     re-exported for back-compat, so it is also handed results written by an
     older ts-cli. Staying total means an old input degrades instead of raising.
@@ -451,6 +459,11 @@ def format_parse_warnings(parsed: dict) -> str:
     out += [
         f"\nWARNING: datasource skipped — {s['reason']} ({s['detail']})"
         for s in parsed.get("skipped_datasources") or []
+    ]
+    out += [
+        f"\nWARNING: {w}"
+        for ds in parsed.get("datasources") or []
+        for w in ds.get("join_warnings") or []
     ]
     return "".join(out)
 
@@ -723,36 +736,22 @@ def _extract_columns(ds: ET.Element, tables: list[dict]) -> list[dict]:
     return columns
 
 
-def _extract_joins(ds: ET.Element) -> list[dict]:
-    """Extract join definitions from a datasource."""
-    joins = []
-    for rel in ds.findall(".//relation[@join]"):
-        join_type = rel.get("join", "inner").upper()
-        clauses = rel.findall(".//clause")
-        join_keys = []
-        for clause in clauses:
-            exprs = clause.findall(".//expression")
-            if len(exprs) >= 2:
-                left = exprs[0].get("op", "")
-                right = exprs[1].get("op", "")
-                if left.startswith("[") and right.startswith("["):
-                    join_keys.append({
-                        "left": left.strip("[]"),
-                        "right": right.strip("[]"),
-                    })
-        if join_keys:
-            children = rel.findall("./relation[@type='table']")
-            left_table = right_table = ""
-            if len(children) >= 2:
-                left_table = children[0].get("name", "") or _strip_brackets(children[0].get("table", "")).split(".")[-1]
-                right_table = children[1].get("name", "") or _strip_brackets(children[1].get("table", "")).split(".")[-1]
-            joins.append({
-                "type": join_type,
-                "left_table": left_table,
-                "right_table": right_table,
-                "keys": join_keys,
-            })
-    return joins
+# ---------------------------------------------------------------------------
+# Physical join extraction (<relation join=...>)
+#
+# Split into ts_cli.tableau.joins (module-per-concern, BL-069 pattern) to keep
+# this file's line count in budget. Re-exported here so the import path is
+# unchanged — but only the path: `_extract_joins` returns `(joins, warnings)`
+# in this same release, and an unadapted caller iterates that tuple silently.
+# ---------------------------------------------------------------------------
+
+from ts_cli.tableau.joins import (  # noqa: E402,F401
+    _clause_join_keys,
+    _collect_comparisons,
+    _extract_joins,
+    _join_key_operand,
+    _join_sides,
+)
 
 
 def _detail_id_count(view: dict) -> int:
