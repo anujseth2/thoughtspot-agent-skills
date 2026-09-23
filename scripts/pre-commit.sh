@@ -302,6 +302,13 @@ if echo "$STAGED" | grep -qE '(^agents/(cli|coco-snowsight)/ts-convert-.*/SKILL\
   run_check "i7 gate"            "tools/validate/check_i7_gate.py --root $REPO_ROOT"
 fi
 
+# Open-item citations must resolve. `check_open_items` grades the items; nothing
+# resolved a REFERENCE to one, so a citation could name an item that never existed
+# and stay silent (audit 5.3: five such citations in ts-dependency-manager alone).
+if echo "$STAGED" | grep -qE '(^agents/.*\.(md|py)$|tools/validate/check_open_item_citations\.py)'; then
+  run_check "open-item citations" "tools/validate/check_open_item_citations.py --root $REPO_ROOT"
+fi
+
 # No inline Python TML assembly — CLI convert skills must use `ts tableau build-model`,
 # not hand-rolled Python heredocs for formula import. Runs when a convert skill or the
 # validator changes.
@@ -312,7 +319,7 @@ fi
 # No inline requests/urllib — Claude skills use the `ts` CLI, never direct
 # requests/urllib calls to a ThoughtSpot endpoint (.claude/rules/ts-cli.md; audit
 # finding 5.2). Runs when a CLI/Claude SKILL.md or the validator changes.
-if echo "$STAGED" | grep -qE '(^agents/(cli|claude)/.*/SKILL\.md|tools/validate/check_no_inline_requests\.py)'; then
+if echo "$STAGED" | grep -qE '(^agents/(cli|claude)/.*\.(md|py)$|tools/validate/check_no_inline_requests\.py)'; then
   run_check "no inline requests" "tools/validate/check_no_inline_requests.py --root $REPO_ROOT"
 fi
 

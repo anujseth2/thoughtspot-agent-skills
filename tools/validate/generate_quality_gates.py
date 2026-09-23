@@ -545,9 +545,13 @@ def _humanise_trigger(pattern: str) -> str:
         return "Shared mappings/schemas staged"
     if "pre-commit" in p or ("validate/" in p and "quality-gates" in p):
         return "Validators or pre-commit infrastructure staged"
-    if "\\.py" in p and "\\.md" not in p:
+    # `\.(md|py)` spells markdown inside an alternation, so a literal `\.md` test
+    # misses it — while `\.py` matches the validator's own filename in the same
+    # trigger, which is how a markdown-triggered gate got labelled "Python files".
+    has_md = "\\.md" in p or "(md|" in p or "|md)" in p
+    if "\\.py" in p and not has_md:
         return "Python files staged"
-    if "agents/" in p and "\\.md" in p:
+    if "agents/" in p and has_md:
         return "Agent docs staged"
     if "references/" in p:
         return "Reference files staged"

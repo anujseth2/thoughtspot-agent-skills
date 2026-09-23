@@ -77,7 +77,7 @@ into a single prompt to cut round-trips.
 ## Prerequisites
 
 - ThoughtSpot profile configured — run `/ts-profile-thoughtspot` if not
-- `ts` CLI installed: `pip install -e tools/ts-cli` (v0.46.0+ — the `ts aggregate` group)
+- `ts` CLI installed: `pip install -e tools/ts-cli` (v0.109.0+ — `ts aggregate`, and `ts security column-rules` for Step 6e)
 - Python package: `pyyaml` (`pip install pyyaml`)
 - Snowflake profile (optional — only for connected-mode profiling/history/DDL
   execution) — `/ts-profile-snowflake` (Claude Code) or an active `cortex connections`
@@ -722,7 +722,7 @@ rls = table_tml["table"].get("rls_rules")
 ```
 
 If `rls` is falsy, no base table carried RLS — nothing to show or confirm, proceed
-straight to the CLS question below.
+straight to the column-security step below.
 
 Otherwise, **confirm it actually attached live** — 6d's pass 2 can fail independently
 of pass 1 (the table exists either way), so a non-null GUID in 6d's output is not
@@ -769,20 +769,94 @@ Confirm this matches your intent before the aggregate Model is imported. (type C
 to proceed, anything else cancels this candidate)
 ```
 
-**Column-Level Security (CLS) is unchanged — still a manual gate.** It cannot be
-reliably auto-detected today — retrieval of `column_security_rules` TML is itself an
-open item on `ts-dependency-manager` (unverified). Ask explicitly instead of silently
-skipping the check:
+**Column security — CSR is read; CLS still has to be asked.** Two independent
+mechanisms restrict columns, and an aggregate that reproduces a secured column without
+reproducing its restriction exposes that data to every user 26.6 aggregate-aware routing
+sends to the aggregate. They are **not** equally readable, and treating them as if they
+were is how this step went wrong before.
+
+**Column Security Rules (CSR) — read them, and handle the read failing.** One row per
+(table, column) with the groups that can see it. `_fetch_rules` raises on any non-2xx, so
+a permissions or feature-flag problem exits non-zero rather than returning empty — which
+means the three outcomes below are genuinely distinguishable, and must be kept apart:
+
+```python
+import json, subprocess
+
+csr_cmd = (
+    "ts security column-rules get "
+    + " ".join(f'"{t}"' for t, _db, _conn in physical_tables)
+    + f' --profile "{profile_name}"'
+)
+proc = subprocess.run(["bash", "-c", f"source ~/.zshenv && {csr_cmd}"],
+                      capture_output=True, text=True)
+csr_readable = proc.returncode == 0
+csr_rows = json.loads(proc.stdout) if csr_readable else []
+```
+
+One call covers every base table — `fetch` takes many identifiers per request.
+
+| Outcome | Meaning | What to do |
+|---|---|---|
+| exit 0, rules present | those columns are restricted, `group_names` lists who can see them | the aggregate must reproduce the restriction |
+| exit 0, every requested table present with no rules | no CSR on these tables | CSR is genuinely covered |
+| **non-zero exit** | CSR is **unreadable here** — Beta 10.12.0.cl+, feature-flagged **off by default**, so this is the expected state on most clusters | treat as **UNKNOWN**, never as "none" |
+
+Print `proc.stderr` when the read fails; `explain_csr_error` has a dedicated feature-flag
+branch and will say which case it is.
+
+Two further reasons an empty result is not proof of absence, both recorded live: reading
+CSR on a **published** table from a tenant Org returns a clean `[]`, and an identifier
+that does not resolve simply contributes no entry. So check each requested table appears
+in `csr_rows` — a missing table is UNKNOWN, not clear.
+
+**Column-level sharing (CLS) — one read cannot answer this, so ask.** `ts share status
+--columns` exists, but it cannot be used as a detector here, for three reasons verified on
+this repo's own cluster (`docs/superpowers/verification/2026-07-26-ts-share-live-verification.md`):
+
+| Why not | Evidence |
+|---|---|
+| Column rows appear on *unsecured* tables | a security-free 25-column table returns 78 rows — 3 table + 75 column — each `MODIFY` for the admins and owner, who always appear |
+| A non-`NO_ACCESS` column row is a **grant**, not a restriction | revoked principals are *removed* from the response, not downgraded, so "non-NO_ACCESS ⇒ restricted" is true of every row that exists |
+| A failed read is indistinguishable from a clean one | `ts share status` prints a warning to **stderr** and returns `[]` with **exit 0** when the permissions call fails — a wrong Org or a missing privilege renders exactly like "nothing is shared" |
+
+`/ts-security-columns` uses the same command correctly: as a **baseline** captured before a
+change and diffed against an after-state. This skill has no before-state to diff against,
+so it must not pretend to a verdict.
+
+Therefore, ask — but ask having already done the half that can be automated:
 
 ```
-Do any of the base tables for this aggregate have Column-Level Security (CLS)
-restricting which users can see specific columns? (Y / N — if unsure, check
-Table → Column Security in the ThoughtSpot UI before answering)
+Column Security Rules found on the base tables (read via `ts security column-rules get`):
+
+  ORDERS     SALARY  → visible to [Finance, Exec]
+  CUSTOMERS  (none)
+
+{CSR_LINE}   <- "CSR: read, no restricted columns" | "CSR: <col> restricted to
+                  [<groups>]" | "CSR: COULD NOT READ (Beta flag off or no
+                  permission) — treat as unknown"
+
+Column-level SHARING (CLS) cannot be read reliably in one pass — it is a grant
+model, and an unsecured table returns column rows too.
+
+Do any base tables use column-level sharing to hide columns from a group?
+(Y / N / UNSURE — if UNSURE, run `/ts-security-columns` against ORDERS, CUSTOMERS
+before continuing; do not guess)
 ```
 
-If Y, require the same kind of explicit confirmation that equivalent CLS has been (or
-will be) applied to the aggregate table before continuing. Do not proceed past this
-gate on an unconfirmed "I'm not sure."
+Require explicit confirmation that equivalent security is applied to the aggregate before
+continuing if **any** of: CSR reported a restricted column, the CSR read failed (UNKNOWN),
+or the operator answered Y. Match CSR's `column_name` values against the aggregate's own
+columns before deciding a restriction is irrelevant — a dimension you grouped by is still
+that column. **Do not proceed on UNSURE, and do not proceed on UNKNOWN** — that is what `/ts-security-columns` is
+for, and an unsecured aggregate is not recoverable by a later check.
+
+Record the CSR result in the run notes as a read result. Record the CLS answer as an
+**operator assertion**, named as such — a later reviewer needs to know which of the two
+was measured.
+
+Choosing *which* mechanism to apply to the aggregate is `/ts-security-columns`'s job, not
+this skill's — route the user there rather than picking for them.
 
 ### 6f. Import the aggregate Model
 
@@ -1043,6 +1117,7 @@ Remove once you're confident every generated aggregate is correct: rm -rf {workd
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.1.0 | 2026-09-22 | **CSR is read; CLS is asked honestly (audit 5.1).** Step 6e asked the operator "do any base tables have Column-Level Security? (Y / N — if unsure, check the UI)", citing CSR retrieval as an unverified open item. CSR **is** now readable — `ts security column-rules get` returns one row per (table, column) with `group_names` and fails loudly rather than returning empty — so that half is automated. CLS is **not**: `ts share status --columns` is a grant model whose column rows appear on unsecured tables too (a security-free 25-column table returns 75 of them), whose revoked principals are removed rather than downgraded, and which returns `[]` with exit 0 when the permissions call fails — so a single read cannot distinguish "nothing secured" from "could not read". `/ts-security-columns` uses the same command correctly, as a baseline for a later diff; this skill has no before-state, so it asks and refuses to proceed on UNSURE. The run notes now separate the read result from the operator assertion. Also corrects a conflation — the old text said "CLS" while citing CSR. |
 | 1.0.3 | 2026-07-24 | Update CLI references `ts spotql` → `ts agentql` (the command was renamed; `ts spotql` still works as a deprecated alias). No behaviour change. |
 | 1.0.2 | 2026-07-24 | Rename SpotQL → AgentQL in prose (external product name only; the `ts spotql` CLI and all identifiers are unchanged). No behaviour change. |
 | 1.0.1 | 2026-07-22 | Relax prompt-batching: allow independent questions in a single prompt (BL-074) |

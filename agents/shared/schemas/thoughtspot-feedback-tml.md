@@ -61,10 +61,10 @@ Imports use `ts tml import --policy ALL_OR_NONE` exactly like other TML types.
 | `feedback_phrase` | Yes | string | The natural-language phrase the user types |
 | `parent_question` | No (BUSINESS_TERM only) | string | Links this BT to a canonical REFERENCE_QUESTION; the parent's phrase is the value. Used for "this phrase is part of question X" coaching grouping |
 | `search_tokens` | Yes | string | The tokenised search bar query — bracketed column names, operators, literals. See [Search tokens](#search-tokens) |
-| `formula_info` | No (REFERENCE_QUESTION only — see open-items) | object | Inline formula definition; **rejected on BUSINESS_TERM** with `EDOC_FEEDBACK_TML_INVALID` (verified — see `ts-object-model-coach/references/open-items.md` #12) |
+| `formula_info` | No (REFERENCE_QUESTION only — see open-items) | object | Inline formula definition; **rejected on BUSINESS_TERM** with `EDOC_FEEDBACK_TML_INVALID` (verified 2026-04-26 against champ-staging; the API parses the expression as a search query, not a formula definition) |
 | `rating` | Yes | `UPVOTE` \| `DOWNVOTE` | DOWNVOTE is anti-coaching — Spotter avoids the mapping. Preserve on import; never silently flip |
 | `display_mode` | Yes | `CHART_MODE` \| `TABLE_MODE` \| `UNDEFINED` | How the answer is rendered. `UNDEFINED` is the safe default |
-| `chart_type` | Yes | enum — see [Chart type](#chart-type) | Required even on BUSINESS_TERM (verified — `open-items.md` #12). `KPI` is the universally safe default |
+| `chart_type` | Yes | enum — see [Chart type](#chart-type) | Required even on BUSINESS_TERM (verified 2026-04-26 against champ-staging; omitting it fails with `Invalid chart_type field`). `KPI` is the universally safe default |
 | `axis_config` | No | array of `{x, y, color}` mappings | Per-entry chart axis hints. Each element keyed by axis name with an array of column display names |
 | `nl_context` | No | string | Free-text creator note — appears in the TS UI as "context for Spotter". Keep brief (`"testing where this coaching goes"` is typical) |
 
@@ -113,7 +113,7 @@ For REFERENCE_QUESTION entries, `search_tokens` is the full canonical query:
 ## Chart type
 
 Verified valid values (probed on champ-staging 2026-04-26, see
-`ts-object-model-coach/references/open-items.md` #11):
+verified 2026-04-26 against champ-staging):
 
 | Value | Use for |
 |---|---|
@@ -246,7 +246,7 @@ For a phrase that maps to a column / formula but isn't tied to a parent question
   chart_type: KPI
 ```
 
-Per `ts-object-model-coach/references/open-items.md` #12: BUSINESS_TERM cannot define a
+Verified 2026-04-26 against champ-staging: BUSINESS_TERM cannot define a
 new formula inline. `search_tokens` must reference artifacts already on the
 Model.
 
@@ -326,7 +326,8 @@ Per `feedback_ts_tml_import_constraints` memory and verified open-items:
 2. `chart_type` must be UPPERCASE and from the verified valid set above.
    `TABLE` is rejected.
 3. `chart_type` and `display_mode` are required on every entry, including
-   BUSINESS_TERM (open-items #12).
+   BUSINESS_TERM (verified 2026-04-26 against champ-staging; omitting either
+   fails the import with `EDOC_FEEDBACK_TML_INVALID`).
 4. `formula_info` on BUSINESS_TERM is rejected — the API parses the expression
    as a search query, not a formula definition. Promote the formula to the
    Model first via `/ts-object-answer-promote`, then reference it in

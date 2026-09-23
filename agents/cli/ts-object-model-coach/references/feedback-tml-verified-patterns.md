@@ -9,7 +9,8 @@ without rejection**.
 > with `metadata[].type: FEEDBACK` (4 source objects, 53 entries). Updated as
 > new patterns are observed.
 >
-> The mining script lives in [`open-items.md`](open-items.md) #16 and runs
+> The mining script — the one that produced these patterns from 53 entries across
+> four champ-staging Models (2026-04-27) — runs
 > against any reachable profile.
 
 ---
@@ -140,8 +141,12 @@ From 53 entries, every observed `chart_type` was accepted:
 | `ADVANCED_PIVOT_TABLE` | 1 |
 
 Corpus did NOT include: `BAR`, `PIE`, `STACKED_COLUMN`, `AREA`, `SCATTER`,
-`TREEMAP`, `WATERFALL` — but [open-items.md #11](open-items.md) verified
-those separately. Universal whitelist: any value listed in #11 except `TABLE`.
+`TREEMAP`, `WATERFALL` — those were probed separately on champ-staging
+(2026-04-26) and every one was accepted. The verified whitelist, corpus plus
+probe, is: `KPI`, `COLUMN`, `BAR`, `LINE`, `PIE`, `STACKED_COLUMN`, `AREA`,
+`SCATTER`, `TREEMAP`, `HEATMAP`, `WATERFALL`, `ADVANCED_PIVOT_TABLE`. Values
+must be UPPERCASE — lowercase variants are rejected, as is `TABLE_MODE` (that
+is a `display_mode` value, not a `chart_type`).
 
 `TABLE` remains rejected — for tabular display use `chart_type: COLUMN` +
 `display_mode: TABLE_MODE`.
@@ -237,8 +242,9 @@ alone is not a complete question).
 
 ## access — verified values
 
-`GLOBAL` and `USER` both observed. Per the skill's existing convention
-([open-items.md #2 sub](open-items.md)):
+`GLOBAL` and `USER` both observed — `access` comes back on every entry from the
+`tml/export` → `type: FEEDBACK` call above (verified 2026-04-27), which is what
+lets the skill split them. Per the skill's existing convention:
 - `GLOBAL` = visible to all Spotter users on the Model — shared coaching
 - `USER` = visible only to the entry's author — personal / experimental
 
@@ -266,7 +272,7 @@ Mark each as VERIFIED here once observed.
 ## Maintenance
 
 This file is built from the mining script in
-[open-items.md](open-items.md) #16. Re-run quarterly (or when a new TS
+the mining pass described above. Re-run quarterly (or when a new TS
 release lands) to pick up new verified patterns. The script:
 
 1. Enumerates Models on each profile (`ts metadata search --subtype WORKSHEET --all`)
