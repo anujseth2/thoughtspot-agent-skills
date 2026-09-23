@@ -217,6 +217,13 @@ references a dimension. Build a DAG and inline bottom-up.
 
 After Step 3c inline resolution, classify each field.
 
+> **MANDATORY (I7) — before classifying any LookML measure or dimension expression as
+> untranslatable, open
+> [`../../shared/mappings/looker/lookml-to-ts-formula-translation.md`](../../shared/mappings/looker/lookml-to-ts-formula-translation.md)
+> and check its measure-type mapping, dimension-type mapping and SQL-expression pattern
+> tables. Do not decide from syntax alone.**
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I7).
+
 ### Dimensions → ThoughtSpot columns
 
 Map each LookML dimension `type:` to a ThoughtSpot `column_type` — most types become
@@ -883,6 +890,7 @@ to the user and ask them to provide the resolved database/schema string.
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.0.5 | 2026-09-22 | **I7 marker added at the classification step.** The skill already stated the rule in prose at §4a and checklisted it at step 6e — what it lacked was the machine-checkable marker, so no gate could tell it apart from a skill that said nothing, and the prose sat *after* the dimension and measure verdicts it needed to govern. The gate now heads Step 4, ahead of all three untranslatable verdicts; the §4a prose and the 6e checklist are unchanged. Now gated by `check_i7_gate.py`, which requires the literal `MANDATORY (I7)` marker in a blockquote citing this skill's own dialect mapping and the invariants doc (2026-09-22 audit finding 9.3). |
 | 1.0.4 | 2026-07-29 | **BL-170 — `REPLACE` corrected and `TRIM` added as a pass-through.** Live verification on se-thoughtspot 2026-07-29 proved neither `replace` nor `trim` is a native ThoughtSpot formula function. `lookml-to-ts-formula-translation.md`'s String functions table now maps `REPLACE(col, old, new)` to `sql_string_op ( "REPLACE({0}, {1}, {2})" , ... )` instead of the invalid bare `replace ( )` call, and gained a `TRIM(col)` row using the same pass-through shape — matching how `UPPER`/`LOWER` were already handled in that table. |
 | 1.0.3 | 2026-07-28 | Extract reference-heavy detail into references/ step files (BL-128) — no logic change; SKILL.md context cost ~21k → ~11.8k est. tokens. |
 | 1.0.2 | 2026-07-15 | JSON/VARIANT path access: emit `['key']` bracket notation in `sql_*_op` pass-throughs — ThoughtSpot's formula parser rejects warehouse colon-and-dot path syntax (e.g. Snowflake `PARSE_JSON(...):a.b`) carried in a LookML `sql:`. Verified for Snowflake 2026-07-15. |

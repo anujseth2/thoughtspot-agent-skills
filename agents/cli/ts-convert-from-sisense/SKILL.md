@@ -57,6 +57,13 @@ and dashboard filters. Read it; note any `warnings` (the parser flags what it co
 confidently read rather than guessing).
 
 ### Step 1 — Build the model
+
+> **MANDATORY (I7) — before classifying any JAQL formula as untranslatable, open
+> [`../../shared/mappings/sisense/sisense-formula-translation.md`](../../shared/mappings/sisense/sisense-formula-translation.md)
+> and check its `AGG_MAP` aggregation table, its `FUNCTION_MAP` function table, and the
+> Approximated table. Do not decide from syntax alone.**
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I7).
+
 ```bash
 ts sisense build-model --input <bundle.json> --connection "<TS connection>" \
   --database <DATABASE> --schema <SCHEMA> --model-name "<Model name>" --out out/ \
@@ -121,4 +128,5 @@ widgets, unresolved fields) for manual rebuild.
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.0.1 | 2026-09-22 | **I7 untranslatable gate added.** Step 1 flagged JAQL formulas NEEDS REVIEW with no instruction to open [sisense-formula-translation.md](../../shared/mappings/sisense/sisense-formula-translation.md) first. Now gated by `check_i7_gate.py`, which requires the literal `MANDATORY (I7)` marker in a blockquote citing this skill's own dialect mapping and the invariants doc (2026-09-22 audit finding 9.3). |
 | 1.0.0 | 2026-07-17 | Initial release — `ts sisense` parse / build-model / build-liveboard |
