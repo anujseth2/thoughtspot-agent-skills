@@ -65,11 +65,84 @@ def resolve_parts(tables: dict, path: str) -> tuple[str, str]:
     return node, column
 
 
-def make_resolver(tables: dict) -> Callable[[str], str]:
+def formula_id(title: str) -> str:
+    """The formulas[].id build-model stamps for a formula column named `title`.
+    One owner (I13): build-model and the formula-ordered window both use it."""
+    return f"formula_{title}"
+
+
+def display_title(entry: dict) -> str:
+    """The ThoughtSpot column name build-model gives a parsed/translated entry."""
+    return entry.get("display_name") or entry["name"].replace("_", " ").title()
+
+
+_SCALAR_RE = re.compile(r"^__MVSCALAR_(\d+)__$")
+# Option (a), agreed 2026-09-28: inside a window, the whole-table LOD cannot be
+# used (ThoughtSpot fails to compile group_aggregate nested in moving_sum —
+# "Failed to transform QuerySpec", live-probed on nebula-ts-semview), so
+# MAX(<date>) of the actuals is taken to be yesterday.
+_SCALAR_IN_WINDOW = "add_days ( today ( ) , -1 )"
+SCALAR_WINDOW_ASSUMPTION = (
+    "scalar subquery {sql} is emitted as add_days ( today ( ) , -1 ): "
+    "ThoughtSpot cannot nest group_aggregate inside moving_sum, so the latest "
+    "{arg}{where} is assumed to be yesterday. Exact only while that data is "
+    "loaded through yesterday; on a stale load the cap drifts one day per day.")
+SCALAR_LOD_NOTE = (
+    "scalar subquery {sql} -> group_aggregate ( … , {{ }} , {{ }} ): whole-table, "
+    "blind to the query's grouping and search filters, like the subquery "
+    "(BL-316 item 1).")
+
+def make_resolver(tables: dict, scalars: list[dict] | None = None,
+                  in_window: bool = False,
+                  window_date_ref: str | None = None) -> Callable[[str], str]:
+    """Column resolver; also expands `__MVSCALAR_n__` placeholders that
+    parse-mv lifted out of the measure (BL-316 item 1).
+
+    window_date_ref: inside a windowed measure, the resolved date column the
+    window is ordered by — the only column a scalar MAX may stand in for."""
     def resolve(path: str) -> str:
+        m = _SCALAR_RE.match(path.strip())
+        if m:
+            return _scalar_text(scalars or [], int(m.group(1)), tables, in_window,
+                                window_date_ref)
         table, column = resolve_parts(tables, path)
         return f"[{table}::{column}]"
     return resolve
+
+
+def _scalar_text(scalars: list[dict], n: int, tables: dict,
+                 in_window: bool, window_date_ref: str | None = None) -> str:
+    if n >= len(scalars):
+        raise UntranslatableError(f"scalar placeholder #{n} has no parsed subquery")
+    sc = scalars[n]
+    base = make_resolver(tables)
+    if in_window:
+        # The yesterday stand-in is only meaningful for the latest value of the
+        # window's OWN date column — the one column proven to be a date. MAX of
+        # anything else (an amount, another date) is refused, not guessed.
+        try:
+            arg_ref = base(sc["arg"])
+        except UntranslatableError:
+            arg_ref = None
+        if sc["agg"] != "MAX" or window_date_ref is None or arg_ref != window_date_ref:
+            raise UntranslatableError(
+                f"scalar subquery {sc['sql']} inside a windowed measure: only "
+                f"MAX(<the window's order date column>) has a row-level stand-in "
+                f"(group_aggregate cannot nest inside moving_sum)")
+        return _SCALAR_IN_WINDOW
+    arg = "1" if sc["arg"].strip() == "*" else translate_sql_expr(sc["arg"], base)
+    if sc["where"] is not None:
+        arg = f"if ( {translate_sql_expr(sc['where'], base)} ) then {arg} else null"
+    return f"group_aggregate ( {_LOD_AGG[sc['agg']]} ( {arg} ) , {{ }} , {{ }} )"
+
+
+def scalar_annotations(measure: dict, in_window: bool) -> list[dict]:
+    template = SCALAR_WINDOW_ASSUMPTION if in_window else SCALAR_LOD_NOTE
+    kind = "cap_assumption" if in_window else "scalar_subquery"
+    return [{"kind": kind, "detail": template.format(
+                sql=sc["sql"], arg=sc["arg"],
+                where=(f" where {sc['where']}" if sc.get("where") else ""))}
+            for sc in measure.get("scalar_subqueries") or []]
 
 
 _LOD_AGG = {"SUM": "sum", "COUNT": "count", "AVG": "average",
@@ -163,7 +236,14 @@ def translate_measure(measure: dict, tables: dict) -> dict:
             "translate_measure received a windowed measure — route via "
             "translate_window_measure")
     kind = measure["expr_kind"]
-    resolver = make_resolver(tables)
+    resolver = make_resolver(tables, measure.get("scalar_subqueries"))
+    entry = _translate_measure_kind(measure, kind, tables, resolver)
+    entry["annotations"].extend(scalar_annotations(measure, in_window=False))
+    return entry
+
+
+def _translate_measure_kind(measure: dict, kind: str, tables: dict,
+                            resolver) -> dict:
     if kind == "simple":
         return _translate_simple(measure, tables)
     if kind == "count_distinct":
@@ -211,14 +291,21 @@ def _translate_simple(measure: dict, tables: dict) -> dict:
 
 def _translate_conditional(measure: dict, resolver) -> str:
     e = strip_sql_comments(measure["expr"])
-    m = _FILTER_SPLIT_RE.match(mask_string_literals(e))
-    if not m:
-        raise UntranslatableError(
-            "FILTER (WHERE …) shape not recognized — expected "
-            "AGG(expr) FILTER (WHERE cond)")
+    masked = mask_string_literals(e)
+    m = _FILTER_SPLIT_RE.match(masked)
+    if not m or not (_balanced(masked[m.start("inner"):m.end("inner")])
+                     and _balanced(masked[m.start("cond"):m.end("cond")])):
+        # Not ONE whole-expression `AGG(x) FILTER (WHERE c)` — e.g.
+        # `SUM(a) FILTER (…) / NULLIF(SUM(b), 0)`, where the greedy split used
+        # to hand a half-expression to the tokenizer ("unexpected trailing
+        # token ')'"). The tokenizer handles FILTER per call (BL-316 item 4).
+        return translate_sql_expr(e, resolver)
     agg = e[m.start("agg"):m.end("agg")].upper()
     distinct = bool(m.group("distinct"))
-    inner = translate_sql_expr(e[m.start("inner"):m.end("inner")], resolver)
+    inner_sql = e[m.start("inner"):m.end("inner")]
+    # COUNT(*) FILTER (…) -> count_if ( c , 1 ), as count ( 1 ) everywhere else
+    inner = ("1" if inner_sql.strip() == "*"
+             else translate_sql_expr(inner_sql, resolver))
     cond = translate_sql_expr(e[m.start("cond"):m.end("cond")], resolver)
     if agg == "COUNT" and distinct:
         return f"unique_count_if ( {cond} , {inner} )"
@@ -257,6 +344,18 @@ def _prepare_cross_measure(expr: str) -> tuple[str, list[str]]:
     return "".join(out), refs
 
 
+def _balanced(s: str) -> bool:
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 _PLACEHOLDER_RE = re.compile(r"__MVREF_(\d+)__")
 
 
@@ -278,6 +377,18 @@ def translate_metric_view(parsed: dict, tables: dict) -> dict:
 
     deferred: list[dict] = []
     for m in parsed["measures"]:
+        if parsed.get("filter") is not None and m.get("scalar_subqueries"):
+            # group_aggregate ( … , { } , { } ) is model-filter-AWARE (A3) and
+            # build-model mirrors the MV filter: into the model, while the
+            # Databricks subquery reads the unfiltered source — the numbers
+            # would differ with nothing flagging it (review 2026-09-28).
+            skipped.append({"name": m["name"], "role": "measure", "reason": (
+                "scalar subquery on an MV with a global filter: — the Databricks "
+                "subquery reads the unfiltered source, but group_aggregate ( … , { } , "
+                "{ } ) would apply the mirrored model filter. Move the filter into "
+                "the subquery's WHERE (or accept the difference) and build manually")})
+            skip_names.add(m["name"])
+            continue
         refs = list(m["cross_refs"]) + list(m["lod_refs"])
         if refs:
             dag[m["name"]] = refs

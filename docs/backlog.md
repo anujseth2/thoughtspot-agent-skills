@@ -89,6 +89,7 @@ are roughly ordered by value÷effort.
 | BL-242 | fixed `PARTITION BY` silently dropped from every cumulative/moving window — YTD becomes a lifetime total | next formula pass, with BL-180 |
 | BL-243 | `with tag` folded into the metric expr — destroys all 5 metrics, `build-model` still exits 0 | next SF converter pass |
 | BL-244 | SV `variables` translate 8/8 / 0 skipped (false success), then fail at import and re-deploy | next SF converter pass, with BL-031 |
+| ~~BL-315~~ | ~~from-Databricks: a `range: current` + `offset:` window ordered by a raw date drops the offset silently — prior-year measures return this year's number~~ | DONE (2026-09-28) |
 
 ### Tier 2 — Schedule soon
 
@@ -196,6 +197,8 @@ are roughly ordered by value÷effort.
 | ~~BL-304~~ | ~~the data/perf check split was made by copying, not extracting: `d4`≡`p4`, `s9`≡`p14` verbatim, `s8` ⊇ `p15`, `_join_depth`≡`p7`, `_table_role` twice, `d1`'s column rule ≡ `p8`~~ | DONE (2026-09-22) |
 | ~~BL-305~~ | ~~alias blindness in `d6`/`d10`/`d11`/`s2`, and join findings reported with an empty `object_name`~~ | DONE (2026-09-23) |
 | BL-283 | `check-catalog.md` and the audit `check_id`s can drift with nothing to notice — 51 documented vs 50 emitted today, and the deferred-id table means a naive comparison is wrong | next validator pass |
+| ~~BL-316~~ | ~~from-Databricks translator gaps found converting a 136-measure budget/forecast MV — 88 needed hand authoring; two ThoughtSpot window limits to document~~ | DONE (2026-09-28) |
+| BL-317 | `IN`/`NOT IN` and share-of-total have 2–3 ThoughtSpot spellings across converters; the DBX to-direction `in(…)` row is one the catalog says fails import | next converter-parity pass |
 
 ### Tier 3 — Opportunistic
 
@@ -11658,3 +11661,121 @@ is 159 lines), a `$STAGED` grep in `pre-commit.sh`, and a `generate_quality_gate
 regeneration, which is why it did not ride along with the one-line map row.
 
 **Target:** next validator pass.
+
+## ~~BL-315~~ — a day-grain `offset:` window is translated with its offset dropped `Tier 1` — DONE (2026-09-28)
+
+**Filed:** 2026-09-28.
+**Source:** live conversion of a 136-measure budget/forecast Metric View
+(`agent_skills.business_forecast.business_reporting_mv`) on nebula-ts-semview.
+
+**Affects:** `tools/ts-cli/ts_cli/databricks/mv_window_translate.py` (`_window_current`).
+
+**The defect.** When the window's `order:` dimension resolves to a raw date
+(`order["grain"] == "day"`), `_window_current` returns
+`last_value ( sum ( … ) , query_groups ( ) , { [date] } )` **before it reads
+`window["offset"]`**. So
+
+```yaml
+window:
+  - order: date
+    semiadditive: last
+    range: current
+    offset: -364 day
+```
+
+— a prior-year measure — becomes a plain same-day snapshot. It imports, lints clean,
+carries no annotation, and returns **this year's value** under a `py_` name. 19 measures
+in the source MV hit it. Live-caught by number-matching against Databricks, not by any
+gate.
+
+**The correct translation** (live-verified 2026-09-28, exact match on dense daily data):
+`moving_sum ( <inner> , 364 , -364 , [date] )` — the same LAG idiom the month grain already
+uses, with the `one_row_per_period` annotation. The raw-date branch should route to it
+whenever `offset` is set; `last_value` is right only for an offset-less semi-additive window.
+
+**Test to add:** a day-grain `offset: -N day` window must yield `moving_sum (…, N, -N, …)`
+and never `last_value`.
+
+**Resolution (2026-09-28, ts-cli v0.149.0).** `_current_wrap` now checks `offset` before
+the raw-date branch, so an offset always routes to the LAG; `-N week` at day grain lags 7N
+rows, and a month/quarter/year offset at day grain is refused rather than approximated.
+Regression guard: `TestBL315DayGrainOffset` asserts `last_value` never appears when an
+offset is set. Re-running the budget/forecast MV through the fixed CLI reproduced the
+live-verified prior-year numbers exactly.
+
+## ~~BL-316~~ — from-Databricks translator gaps from a budget/forecast Metric View `Tier 2` — DONE (2026-09-28)
+
+**Filed:** 2026-09-28.
+**Source:** same conversion as BL-315. 48 of 136 measures translated unaided; the other 88
+were hand-authored, then number-matched against Databricks on every grain (exact, apart
+from the NULL-vs-0 already tracked as BL-180).
+
+**Affects:** `ts_cli/databricks/mv_parse*`, `mv_sql.py`, `mv_window_translate.py`,
+`agents/shared/mappings/ts-databricks/ts-databricks-formula-translation.md`.
+
+| # | Construct | Measures | What worked (live-verified 2026-09-28) |
+|---|---|---|---|
+| 1 | Uncorrelated scalar subquery over the MV's own source — `(SELECT MAX(dt) FROM <source> WHERE observation = 'current')` — rejected by `parse-mv` as "subquery in measure expr" | 63 | `group_aggregate ( max ( if ( … ) then [dt] else null ) , { } , { } )`. Filter-blind and grain-blind, like the subquery. The mapping doc calls every subquery untranslatable; this whole-table-scalar shape is not |
+| 2 | `AGG(x) FILTER (WHERE c)` as the expr of a `window:` measure — "must be AGG(expression)" | 19 | rewrite to `AGG(CASE WHEN c THEN x END)` first (FILTER-equivalent; NULL for non-matching rows) |
+| 3 | `col NOT IN ('a','b')` — "no documented mapping" | 3 | `[col] != 'a' and [col] != 'b'` |
+| 4 | `SUM(x) FILTER (…) / NULLIF(…)` — "unexpected trailing token ')'" | 2 | parser bug; the same FILTER→CASE rewrite parses |
+| 5 | `SUM(SUM(x)) OVER ()` (share of total) | 1 | `safe_divide ( sum ( x ) * 100 , group_aggregate ( sum ( x ) , { } , query_filters ( ) ) )` |
+| 6 | `window: order: <dim>` where the dim is a non-bucket expression (`DATE_ADD(DATE_TRUNC('WEEK', DATE_ADD(dt, 3)), -3)`) — "cannot determine the physical sort column" | 19 | order `moving_sum` by the dimension's formula: `[formula_Week]`. Ordering by `[dt]` instead forces the query to daily grain and returns NULL |
+| 7 | Ratio window measures (`SUM(a)/NULLIF(SUM(b),0)` + `window:`) | 12 | `safe_divide ( moving_sum ( a … ) , moving_sum ( b … ) )` |
+
+**Two ThoughtSpot limits to document** in the translation doc (both live-probed 2026-09-28):
+
+- **`group_aggregate` cannot sit inside a `moving_sum`.** Every variant — `{ }`/`query_filters ( )`
+  filters, with or without a column predicate — fails at query compile with
+  `Failed to transform QuerySpec`. Items 1 and 2 therefore cannot compose. The conversion used
+  `add_days ( today ( ) , -365 )`, which equals `MAX(current dt) - 364` only while actuals
+  load through yesterday. That is a data-freshness assumption, not an equivalence.
+- **A `moving_sum` LAG only sees rows that survive the query's filters.** Filtered to May–Sep 2026,
+  the prior-year value is NULL in ThoughtSpot and present in Databricks. The `one_row_per_period`
+  annotation should also say "and the query's date filter must include the lag period".
+
+**Two-bucket exit.** Items 1–7 are translator work (one PR, each with a test). The two limits
+are mapping-doc rows plus annotation text.
+
+**Resolution (2026-09-28, ts-cli v0.149.0).** All seven items are translator code with unit
+tests, and both limits are documented (the `one_row_per_period` annotation now states the
+filter limit; the scalar-in-window stand-in `add_days ( today ( ) , -1 )` carries a
+`cap_assumption` annotation — option (a), chosen by the user). The windowed-measure
+translator now applies the window to **every** aggregate via a tokenizer hook, instead of
+stripping one outer aggregate. The unmodified MV now translates **158/158, 0 skipped** (was
+70/158 plus the BL-315 silent wrong answer); 157 of 158 formulas are text-identical to the
+hand-verified conversion after normalising equivalent spellings, and the model rebuilt from
+the CLI's output alone number-matched Databricks on channel share, budget/eCPC variance,
+revenue per booking and daily/weekly/monthly prior-year measures.
+
+## BL-317 — one construct, several ThoughtSpot spellings: `IN`/`NOT IN` and share-of-total `Tier 2`
+
+**Filed:** 2026-09-28.
+**Source:** the conversion-consistency audit of the BL-315/BL-316 PR (angle 9,
+implementation drift). Not fixed there because each item reaches past the Databricks
+converter into a sibling's code or the shared catalog.
+
+**Affects:** `ts_cli/sv_sql.py` (`_construct_in`/`_construct_not`),
+`ts_cli/databricks/mv_sql_constructs.py`, `ts_cli/sv_translate.py`,
+`agents/shared/schemas/thoughtspot-formula-patterns.md`,
+`agents/shared/mappings/ts-snowflake/ts-snowflake-formula-translation.md`,
+`agents/shared/mappings/ts-databricks/ts-databricks-formula-translation.md`.
+
+| Construct | Spellings today |
+|---|---|
+| `x NOT IN (a, b)` | DBX code: `( [x] != a and [x] != b )`. Snowflake doc, Qlik CL07, formula-patterns: `not ( [x] in { a , b } )`. Snowflake **code refuses it** (`sv_sql.py`), so that converter's doc and code also disagree |
+| `x IN (a, b)` | DBX code and Snowflake code: `( [x] = a or [x] = b )` (the two `_construct_in` bodies are copies). Formula-patterns: `[x] in { a , b }`. DBX formula-translation's **to-direction** row still shows `in(x, a, b, c)`, a form the catalog says fails import |
+| `SUM(m) OVER ()` (share of total) | DBX, Tableau, Looker: `group_aggregate ( sum ( m ) , { } , query_filters ( ) )`. Snowflake SV: `group_sum ( m )` |
+
+Every pair means the same thing, NULL handling included, so none of these is a wrong
+number. Each is a second spelling of one target construct, which is what BL-217 exists
+to stop.
+
+**Approach.** Pick one canonical form per construct in `thoughtspot-formula-patterns.md`
+(live-check `not ( [x] in { … } )` first, since it needs `>-` YAML because of the braces);
+add `emit_in_list(operand, values, negate)` to `formula_common.py` and import it from both
+`_construct_in`s; correct the DBX to-direction `in(…)` row; give Snowflake NOT IN the
+shared emitter. Then add a `check_converter_parity` spelling rule for share-of-total, so a
+third spelling cannot appear.
+
+**Target:** next converter-parity pass.
