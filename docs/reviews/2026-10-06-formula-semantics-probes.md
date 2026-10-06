@@ -139,3 +139,87 @@ Five quantities were checked per range:
 - 2026-12-26 → 2027-01-04 = 6
 
 The `<= 5` test fits weekend code 1 only. Other codes need "h's weekday is not a weekend day". Duplicate holidays were not probed. `WORKDAY` / `WORKDAY.INTL` with holidays was not probed and does not follow this form: the end date shifts rather than a count being reduced.
+
+## 7. Division, NULL and concat: `safe_divide`, `nullif`, `concat`
+
+Probed 2026-10-06 while reviewing a 60-formula Excel batch (BL-339). The division rows come from
+that review's scratch-Model probe (`ts agentql generate-sql` / `fetch-data`; the Model was deleted).
+Every parser row below was re-run for this record with `ts tml import --policy VALIDATE_ONLY`
+against a one-formula Model over `SALARY_RATES`, which creates nothing.
+
+**Division.**
+
+| Formula | Compiled SQL / result |
+|---|---|
+| `safe_divide ( a , b )` | `CASE WHEN b = 0 THEN 0 ELSE a / NULLIF(b, 0) END` — a zero divisor gives **0**; a NULL divisor or NULL numerator gives **NULL** |
+| `a / b` | a zero divisor gives **NULL** (ThoughtSpot guards the divisor); the query does not fail |
+
+**`nullif` is not a ThoughtSpot formula function.**
+
+| Formula | Parser |
+|---|---|
+| `nullif ( [SALARY_RATES::BASE_RATE] , 0 )` | rejected: *Search did not find "nullif (" in your data or metadata* |
+| `null_if ( [SALARY_RATES::BASE_RATE] , 0 )` | rejected: *Search did not find "null_if ("* |
+| `nullif ( 0 , 0 )` (the Excel map's former NULL-literal idiom) | rejected |
+| `if ( [SALARY_RATES::BASE_RATE] = 0 ) then null else [SALARY_RATES::BASE_RATE]` | accepted |
+
+The formula reference listed `nullif ( [a] , [b] )` in its Conditional Functions table until
+this probe, and the Excel, Sheets and Omni maps and the `ts-object-formula-translate` skill
+used it; a 60-formula batch composed from them failed import 36 times on it (BL-339).
+Replacements: `safe_divide ( a , b )` (0 on zero), plain `a / b` (NULL on zero), or
+`if ( b = 0 ) then null else a / b`.
+
+**`concat` and `to_string`.**
+
+| Formula | Parser |
+|---|---|
+| `concat ( 'a' , 'b' , 'c' , 'd' )` | accepted — `concat` takes 2 or more arguments |
+| `concat ( [SALARY_RATES::DEPARTMENT] , ' ' , to_string ( [SALARY_RATES::BASE_RATE] ) )` | accepted |
+| `concat ( 'a' , [SALARY_RATES::BASE_RATE] )` | rejected: *Function concat expects 2nd argument to be Text* |
+| `concat ( to_string ( [SALARY_RATES::DEPARTMENT] ) , 'x' )` | rejected: *Function to_string expects 1st argument to be Boolean or Date or DateTime or Numeric or Time* |
+
+So every `concat` argument must be Text, and `to_string` must wrap **only** the non-text ones.
+
+**`isnotnull` is not a ThoughtSpot formula function either.** `isnotnull ( [SALARY_RATES::DEPARTMENT] )`
+and `isnotnull ( [SALARY_RATES::BASE_RATE] * 2 )` are rejected (*Search did not find "isnotnull ("*);
+`not ( isnull ( to_double ( [SALARY_RATES::DEPARTMENT] ) ) )` is accepted. The formula reference listed
+`isnotnull` as native; the repo's translators already emitted `not ( isnull ( … ) )`, so only
+documents were wrong (BL-339).
+
+**`null` as a branch value.** Accepted in either position and in a chain:
+`if ( c ) then [x] else null`, `if ( c ) then null else [x]`, `if ( c ) then 'a' else null`,
+`if ( c1 ) then 'a' else if ( c2 ) then 'b' else null`. By contrast
+`if ( c ) then [SALARY_RATES::BASE_RATE] else ''` is rejected (*Expecting a Numeric token*):
+the branches must share a type.
+
+**`null_if_zero` is not a ThoughtSpot function** (BL-344). `null_if_zero ( [SALARY_RATES::BASE_RATE] )`
+is rejected (*Search did not find "null_if_zero ("*), alone and as a divisor. `sv_sql` and `mv_sql`
+emitted it for a standalone SQL `NULLIF(x, 0)`; they now emit
+`( if ( x = 0 ) then null else x )` — the parenthesised `if` is accepted inside arithmetic
+(`1 + ( if … )`) and as a function argument (`isnull ( if … )`).
+
+**Booleans in arithmetic.** `true + 1` and `( [SALARY_RATES::BASE_RATE] > 0 ) + 1` are rejected
+(*Search did not find "+ 1"*); `( if ( c ) then 1 else 0 ) + 1` and the sum of two such terms are
+accepted. Excel's TRUE-is-1 coercion has to be written out. A number is not a condition either:
+`if ( [x] != 0 )` is the form for Excel's `IF(x, …)`.
+
+**Blank tests.** `[SALARY_RATES::BASE_RATE] = ''` (a number against an empty string) is rejected
+(*Expecting a List token*); `isnull ( [n] )` is the numeric blank test, and
+`isnull ( [s] ) or [s] = ''` the text one (accepted).
+
+**`mod` takes the dividend's sign** (scratch-Model execute, compiled SQL `MOD(…)`, deleted and
+confirmed absent): `mod ( -3 , 2 )` = −1 and `mod ( 3 , -2 )` = 1, as Snowflake `MOD`. Excel `MOD`
+takes the divisor's sign (`MOD(-3, 2)` = 1). So Excel `MOD(a, b)` is `a - b * floor ( a / b )`
+in ThoughtSpot, and ThoughtSpot `mod ( a , b )` is `a-b*TRUNC(a/b)` in Excel.
+
+**`diff_time ( end , start )` is in seconds, end first** (scratch-Model execute, compiled to
+`TIMESTAMPDIFF(second, start, end)`, deleted and confirmed absent):
+`diff_time ( add_days ( d , 1 ) , d )` = 86400, on DATE columns too. So an Excel DATETIME
+difference (a day count with a time fraction) is `diff_time ( t , u ) / 86400`; `diff_days` would
+drop the hours.
+
+**Other parser checks in the same pass (all accepted):** `least ( [SALARY_RATES::BASE_RATE] , 10 )`
+(the formula reference listed only `greatest`), `!=` between a column and a string literal,
+`ifnull ( x , 0 )`, `quarter_number ( today ( ) )`, `ceil ( month_number ( today ( ) ) / 3 )` inside
+`to_string`, `add_days ( add_months ( start_of_month ( d ) , 1 ) , -1 )`, `pow ( x , 2 )`, unary
+`- x`. Case behaviour of `!=` was not probed (only its parse).

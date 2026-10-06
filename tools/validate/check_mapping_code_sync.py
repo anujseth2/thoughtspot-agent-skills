@@ -43,6 +43,25 @@ BL-171 generalised from the two hand-written tests to every converter.
 ``LOCATE -> strpos`` and no Snowflake mapping doc mentions ``LOCATE``, so the CoCo
 runtime — which has only the doc — cannot translate it.
 
+**C — the Excel / Google Sheets translator agrees with its function maps.** (gate)
+``ts_cli/excel/`` has no ``ts-convert-*`` skill, so discovery never finds it; it is checked
+here directly, more strictly than the converters, because its rule table is data
+(``ts_cli/excel/rules.py``, read with ``ast``). For every rule: the map
+(``docs/function-maps/ts-excel-function-mapping.md`` or the Sheets delta map) rows the function;
+every ThoughtSpot name the rule emits appears in that row's text (``CRITERIA_EMITS`` in the
+criteria-string table) and is a catalogued function (the formula reference's table, or the
+vendored ``EXTRAS`` in ``formula_translate/catalog.py``), never a disproved one; and each map's
+*Translator coverage* list names exactly the rule table's keys for that map. Requirement A
+also runs over ``ts_cli/excel/*.py``.
+
+The declared ``emits`` are only half of it (PR #570 review L1): a handler could emit a name it
+never declared. So C also **runs every handler** — ``translate_excel`` over synthetic calls of
+arity 0–4 drawn from a small argument pool (a row reference, a range, numbers, strings) — and
+fails when an emitted function is outside that rule's ``emits`` plus ``SHARED_EMITS`` (the
+names the shared machinery adds whatever the rule: ``to_string`` in ``&``, ``isnull`` / ``not``
+in blank tests), or is disproved or uncatalogued. And a disproved name written as a call
+(``"nullif ("``) in any string literal of ``ts_cli/excel/`` fails, whatever path builds it.
+
 A third requirement was drafted and **cut**: "an emitted name absent from the
 catalog entirely is *unverified*, report it". Measured against the real tree it
 produced **190 findings and no unique true positives** — a translator is full of
@@ -250,6 +269,217 @@ def check_platform(platform: str, code_files: list[Path], doc_text: str,
     return errors, warnings
 
 
+# ---------------------------------------------------------------------------
+# C — the Excel / Sheets translator (no ts-convert-* skill, so not discovered)
+# ---------------------------------------------------------------------------
+
+EXCEL_CODE_REL = "tools/ts-cli/ts_cli/excel"
+EXCEL_RULES_REL = "tools/ts-cli/ts_cli/excel/rules.py"
+VENDORED_CATALOG_REL = "tools/ts-cli/ts_cli/formula_translate/catalog.py"
+EXCEL_MAPS = {"excel": "docs/function-maps/ts-excel-function-mapping.md",
+              "sheets": "docs/function-maps/ts-sheets-function-mapping.md"}
+COVERAGE_START = "<!-- translator-coverage:start -->"
+COVERAGE_END = "<!-- translator-coverage:end -->"
+
+
+def literal_assignments(source: str) -> dict:
+    """Top-level ``NAME = <literal>`` assignments of a module, evaluated with ``ast``."""
+    out = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            try:
+                out[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                continue
+    return out
+
+
+def map_rows(text: str) -> dict[str, str]:
+    """``NAME`` -> that function row's full line, for every ``| `NAME(…)` |`` row."""
+    rows = {}
+    for line in text.splitlines():
+        m = re.match(r"^\| `([A-Z][A-Z0-9_.]*)\(", line)
+        if m:
+            rows[m.group(1)] = line
+    return rows
+
+
+def coverage_list(text: str):
+    """Backticked names between the coverage markers, or None when the markers are absent."""
+    if COVERAGE_START not in text or COVERAGE_END not in text:
+        return None
+    block = text.split(COVERAGE_START, 1)[1].split(COVERAGE_END, 1)[0]
+    return set(re.findall(r"`([A-Z][A-Z0-9_.]*)`", block))
+
+
+def _mentions(text: str, name: str) -> bool:
+    return re.search(r"(?<![\w])" + re.escape(name) + r"(?![\w])", text) is not None
+
+
+def excel_rule_errors(rules_src: str, maps: dict[str, str], valid: set[str],
+                      nonexistent: set[str], extras: set[str]) -> list[str]:
+    """Requirement C over a rules module's source and the two maps' texts."""
+    data = literal_assignments(rules_src)
+    errors: list[str] = []
+    tables = {"FUNCTION_RULES": data.get("FUNCTION_RULES", {}),
+              "SHEETS_RULES": data.get("SHEETS_RULES", {})}
+    known = valid | extras
+    for table, rules in tables.items():
+        for name, rule in rules.items():
+            key = rule.get("map", "excel")
+            text = maps.get(key, "")
+            row = map_rows(text).get(rule.get("row", name))
+            if row is None:
+                errors.append(f"{table}[{name!r}]: the {key} map has no `{name}(` row — the "
+                              "translator implements a function its map does not row")
+                continue
+            for emitted in rule.get("emits", ()):
+                errors.extend(_emitted_errors(table, name, emitted, row, key, known, nonexistent))
+    criteria = text_between(maps.get("excel", ""), "### Criteria strings", "\n## ")
+    for emitted in data.get("CRITERIA_EMITS", ()):
+        if not _mentions(criteria, emitted):
+            errors.append(f"CRITERIA_EMITS: `{emitted}` does not appear in the Excel map's "
+                          "criteria-string table")
+    for key, keys in (("excel", set(tables["FUNCTION_RULES"])), ("sheets", set(tables["SHEETS_RULES"]))):
+        listed = coverage_list(maps.get(key, ""))
+        if listed is None:
+            errors.append(f"the {key} map has no translator-coverage list ({COVERAGE_START} … "
+                          f"{COVERAGE_END}) naming the rows the translator backs")
+        elif listed != keys:
+            errors.append(f"the {key} map's translator-coverage list disagrees with rules.py: "
+                          f"listed but not translated {sorted(listed - keys)}, translated but "
+                          f"not listed {sorted(keys - listed)}")
+    return errors
+
+
+def _emitted_errors(table, name, emitted, row, key, known, nonexistent) -> list[str]:
+    out = []
+    if emitted in nonexistent:
+        out.append(f"{table}[{name!r}] emits `{emitted}`, which the catalog marks as NOT a "
+                   "ThoughtSpot function")
+    elif emitted not in known and not emitted.startswith("sql_"):
+        out.append(f"{table}[{name!r}] emits `{emitted}`, which is not in the formula catalog")
+    if not _mentions(row, emitted):
+        out.append(f"{table}[{name!r}] emits `{emitted}`, but the {key} map's `{name}` row never "
+                   "mentions it — the code does something its row does not say")
+    return out
+
+
+def text_between(text: str, start: str, end: str) -> str:
+    if start not in text:
+        return ""
+    rest = text.split(start, 1)[1]
+    return rest.split(end, 1)[0] if end in rest else rest
+
+
+_ARG_POOL = ("[@a]", "T[b]", "2", "0", '"M"', '""')
+_WIDE_POOL = ("T[b]", '"x"', "[@a]>1", "[@a]")
+# Nested shapes the idiom rules key on: IFERROR(a/b, 0), ISNUMBER(SEARCH(…)), IF(b=0,0,a/b).
+_NESTED_POOL = ("[@a]/[@b]", 'SEARCH("x",[@a])', "VALUE([@a])", "[@b]=0", "0", "[@a]")
+_CALL_NAME = re.compile(r"(?<![\w])([a-z_][a-z0-9_]*(?: count)?)\s*\(")
+_QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"")
+
+
+def _synthetic_calls(name: str):
+    """(formula, its arguments) for the call shapes the gate runs."""
+    from itertools import product
+    shapes = [(_ARG_POOL, a) for a in range(0, 4)] + [(_WIDE_POOL, 4)] + \
+        [(_NESTED_POOL, a) for a in range(1, 4)]
+    for pool, arity in shapes:
+        for args in product(pool, repeat=arity):
+            yield f"={name}({','.join(args)})", args
+
+
+def emitted_by_handlers(root: Path) -> dict:
+    """{(table, rule): set of function names its handler actually emitted}, by running it."""
+    code_root = str(root / "tools" / "ts-cli")
+    sys.path.insert(0, code_root)
+    try:
+        from ts_cli.excel import rules
+        from ts_cli.excel.translate import translate_excel
+        from ts_cli.formula_translate.context import ColumnContext
+    finally:
+        sys.path.remove(code_root)
+    def names(src: str, dialect: str) -> set:
+        expr = translate_excel(src, ColumnContext(), dialect=dialect).expr
+        return set(_CALL_NAME.findall(_QUOTED.sub("''", expr))) if expr else set()
+
+    out: dict = {}
+    for table, dialect, rule_table in (("FUNCTION_RULES", "excel", rules.FUNCTION_RULES),
+                                       ("SHEETS_RULES", "google_sheets", rules.SHEETS_RULES)):
+        own = {a: names("=" + a, dialect) for a in set(_ARG_POOL + _WIDE_POOL + _NESTED_POOL)}
+        for name in rule_table:
+            seen: set = set()
+            for src, args in _synthetic_calls(name):
+                # what the arguments emit on their own is not this handler's emission
+                seen.update(names(src, dialect) - set().union(*(own[a] for a in args)))
+            out[(table, name)] = seen - {"if", "and", "or", "not", "in"} | (
+                {"not"} & seen)
+    return out
+
+
+def emission_errors(emitted: dict, rules_src: str, valid: set[str], nonexistent: set[str],
+                    extras: set[str]) -> list[str]:
+    data = literal_assignments(rules_src)
+    shared = set(data.get("SHARED_EMITS", ()))
+    errors = []
+    for (table, name), names in sorted(emitted.items()):
+        declared = set(data.get(table, {}).get(name, {}).get("emits", ())) | shared
+        for fn in sorted(names):
+            if fn in nonexistent:
+                errors.append(f"{table}[{name!r}]'s handler emitted `{fn}`, which the catalog "
+                              "marks as NOT a ThoughtSpot function")
+            elif fn not in valid | extras and not fn.startswith("sql_"):
+                errors.append(f"{table}[{name!r}]'s handler emitted `{fn}`, which is not in "
+                              "the formula catalog")
+            elif fn not in declared:
+                errors.append(f"{table}[{name!r}]'s handler emitted `{fn}`, which its rule does "
+                              "not declare in `emits` (so its map row is never checked for it)")
+    return errors
+
+
+def disproved_literal_errors(code_files: list, nonexistent: set[str], root: Path) -> list[str]:
+    """A disproved name written as a call inside any string literal (not a docstring)."""
+    errors = []
+    pattern = re.compile(r"(?<![\w`])(" + "|".join(sorted(map(re.escape, nonexistent))) +
+                         r")\s*\(") if nonexistent else None
+    for path in code_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        skip = _docstring_nodes(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and id(node) not in skip and pattern and pattern.search(node.value):
+                errors.append(f"{path.relative_to(root)}:{node.lineno}: a string literal "
+                              f"builds `{pattern.search(node.value).group(1)} (`, which the "
+                              "catalog marks as NOT a ThoughtSpot function")
+    return errors
+
+
+def check_excel(root: Path, valid: set[str], nonexistent: set[str]) -> tuple[list, list]:
+    code_dir = root / EXCEL_CODE_REL
+    if not code_dir.is_dir():
+        return [], []
+    maps = {k: (root / v).read_text(encoding="utf-8") if (root / v).exists() else ""
+            for k, v in EXCEL_MAPS.items()}
+    extras = set(literal_assignments(
+        (root / VENDORED_CATALOG_REL).read_text(encoding="utf-8")).get("EXTRAS", {}))
+    rules_src = (root / EXCEL_RULES_REL).read_text(encoding="utf-8")
+    code_files = sorted(code_dir.glob("*.py"))
+    errors = excel_rule_errors(rules_src, maps, valid, nonexistent, extras)
+    errors += disproved_literal_errors(code_files, nonexistent, root)
+    try:
+        emitted = emitted_by_handlers(root)
+    except Exception as exc:  # the gate must not pass because the code failed to import
+        errors.append(f"could not run the Excel handlers to check what they emit: "
+                      f"{type(exc).__name__}: {exc}")
+        emitted = {}
+    errors += emission_errors(emitted, rules_src, valid, nonexistent, extras)
+    e, w = check_platform("excel", code_files, "\n".join(maps.values()),
+                          valid, nonexistent, root)
+    return errors + e, w
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="Repository root (default: cwd)")
@@ -265,7 +495,7 @@ def main() -> int:
     valid, nonexistent = parse_catalog(catalog.read_text(encoding="utf-8"))
 
     platforms = discover_platforms(root)
-    if not platforms:
+    if not platforms and not (root / EXCEL_CODE_REL).is_dir():
         print(f"No ts-convert-* skills found under {root}/agents/cli/. Nothing to check.")
         return 0
 
@@ -299,6 +529,10 @@ def main() -> int:
         errors.extend(e)
         warnings.extend(w)
 
+    e, w = check_excel(root, valid, nonexistent)
+    errors.extend(e)
+    warnings.extend(w)
+
     for e in errors:
         print(f"ERROR: {e}", file=sys.stderr)
     if args.warnings:
@@ -312,8 +546,9 @@ def main() -> int:
 
     suffix = (f" ({len(warnings)} soft finding(s); re-run with --warnings)"
               if warnings and not args.warnings else "")
-    print(f"PASS  mapping/code sync: {len(platforms)} platform(s) checked, "
-          f"no translator emits a disproved ThoughtSpot function{suffix}.")
+    print(f"PASS  mapping/code sync: {len(platforms)} platform(s) + the Excel/Sheets "
+          f"translator checked, no translator emits a disproved ThoughtSpot function, and "
+          f"every Excel/Sheets rule agrees with its map row{suffix}.")
     return 0
 
 

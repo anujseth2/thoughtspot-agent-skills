@@ -166,3 +166,153 @@ def test_real_repo_passes(tmp_path):
     repo_root = Path(__file__).resolve().parents[3]
     r = _run(repo_root)
     assert r.returncode == 0, r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Requirement C — the Excel / Sheets translator's rule table vs its maps (BL-339)
+# ---------------------------------------------------------------------------
+
+_EXCEL_MAP = """# Excel map
+
+### Criteria strings
+
+| `"*es*"` | `contains ( [T::x] , 'es' )` | |
+
+## Math
+
+| `SUM(number1, ...)` | direct | range: `sum ( [x] )` | |
+| `ABS(x)` | direct | `abs ( [x] )` | |
+
+<!-- translator-coverage:start -->
+`ABS` `SUM`
+<!-- translator-coverage:end -->
+"""
+_SHEETS_MAP = """# Sheets map
+
+| `QUERY(data, query)` | structural | an Answer | |
+
+<!-- translator-coverage:start -->
+`QUERY`
+<!-- translator-coverage:end -->
+"""
+
+
+def _rules(function_rules: str, sheets_rules: str = '{"QUERY": {"map": "sheets", "emits": ()}}',
+           criteria: str = '("contains",)') -> str:
+    return (f"FUNCTION_RULES = {function_rules}\nSHEETS_RULES = {sheets_rules}\n"
+            f"CRITERIA_EMITS = {criteria}\n")
+
+
+def _c_errors(rules_src, excel_map=_EXCEL_MAP, sheets_map=_SHEETS_MAP):
+    import check_mapping_code_sync as m
+    return m.excel_rule_errors(rules_src, {"excel": excel_map, "sheets": sheets_map},
+                               valid={"sum", "abs", "contains"}, nonexistent={"nullif"},
+                               extras=set())
+
+
+_OK_RULES = ('{"SUM": {"map": "excel", "emits": ("sum",)}, '
+             '"ABS": {"map": "excel", "emits": ("abs",)}}')
+
+
+def test_excel_rules_agreeing_with_their_rows_pass():
+    assert _c_errors(_rules(_OK_RULES)) == []
+
+
+def test_excel_rule_emitting_a_name_its_row_does_not_say_fails():
+    errs = _c_errors(_rules('{"SUM": {"map": "excel", "emits": ("sum", "abs")}, '
+                            '"ABS": {"map": "excel", "emits": ("abs",)}}'))
+    assert any("`SUM` row never mentions it" in e for e in errs)
+
+
+def test_excel_rule_emitting_a_disproved_name_fails():
+    errs = _c_errors(_rules('{"SUM": {"map": "excel", "emits": ("nullif",)}, '
+                            '"ABS": {"map": "excel", "emits": ("abs",)}}'))
+    assert any("NOT a ThoughtSpot function" in e for e in errs)
+
+
+def test_excel_rule_for_an_unrowed_function_fails():
+    errs = _c_errors(_rules(_OK_RULES[:-1] + ', "VLOOKUP": {"map": "excel", "emits": ()}}'))
+    assert any("no `VLOOKUP(` row" in e for e in errs)
+
+
+def test_coverage_list_must_equal_the_rule_keys():
+    errs = _c_errors(_rules('{"SUM": {"map": "excel", "emits": ("sum",)}}'))
+    assert any("listed but not translated ['ABS']" in e for e in errs)
+    no_list = _EXCEL_MAP.split("<!-- translator-coverage:start -->")[0]
+    assert any("no translator-coverage list" in e for e in _c_errors(_rules(_OK_RULES), no_list))
+
+
+def test_criteria_emits_checked_against_the_criteria_table():
+    errs = _c_errors(_rules(_OK_RULES, criteria='("contains", "strpos")'))
+    assert any("CRITERIA_EMITS: `strpos`" in e for e in errs)
+
+
+def test_real_repo_passes_requirement_c():
+    """The shipped rule table and the shipped maps agree (the gate the CI runs)."""
+    import check_mapping_code_sync as m
+    from check_formula_catalog import parse_catalog
+    root = Path(__file__).resolve().parents[3]
+    valid, nonexistent = parse_catalog((root / m.CATALOG_REL).read_text(encoding="utf-8"))
+    errors, _warnings = m.check_excel(root, valid, nonexistent)
+    assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# Requirement C runs the handlers (PR #570 review L1): the four reviewer mutations
+# ---------------------------------------------------------------------------
+
+import shutil
+
+import pytest
+
+_REAL_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _excel_repo(tmp_path):
+    """A copy of the shipped Excel translator, its maps and the catalog — nothing else."""
+    shutil.copytree(_REAL_ROOT / "tools" / "ts-cli" / "ts_cli", tmp_path / "tools" / "ts-cli" / "ts_cli",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    for rel in ("agents/shared/schemas/thoughtspot-formula-patterns.md",
+                "docs/function-maps/ts-excel-function-mapping.md",
+                "docs/function-maps/ts-sheets-function-mapping.md"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(_REAL_ROOT / rel, tmp_path / rel)
+    (tmp_path / "agents" / "cli").mkdir(parents=True, exist_ok=True)
+    return tmp_path / "tools" / "ts-cli" / "ts_cli" / "excel"
+
+
+def _gate(root):
+    return subprocess.run([sys.executable, str(VALIDATOR), "--root", str(root)],
+                          capture_output=True, text=True)
+
+
+def _mutate(path, old, new):
+    text = path.read_text()
+    assert old in text, old
+    path.write_text(text.replace(old, new, 1))
+
+
+def test_unmutated_copy_passes(tmp_path):
+    _excel_repo(tmp_path)
+    res = _gate(tmp_path)
+    assert res.returncode == 0, res.stderr
+
+
+@pytest.mark.parametrize("file,old,new,expect", [
+    # 1. a handler emits a disproved name
+    ("functions.py", '"ABS": _unary_fn("abs")', '"ABS": _unary_fn("nullif")', "NOT a ThoughtSpot"),
+    # 2. a handler emits a catalogued name its rule never declared
+    ("functions_text.py", 'T.call("strlen", tr.expr(n.args[0]))',
+     'T.call("strpos", tr.expr(n.args[0]))', "does not declare"),
+    # 3. a rule's emits emptied while the handler still emits
+    ("rules.py", '"SUM": {"map": "excel", "emits": ("sum",)}',
+     '"SUM": {"map": "excel", "emits": ()}', "does not declare"),
+    # 4. a disproved call spelled inside a string literal
+    ("forward.py", 'BLANK_TRAP = (', '_BAD = "[a] / nullif ( [b] , 0 )"\nBLANK_TRAP = (',
+     "string literal"),
+])
+def test_reviewer_mutations_fail(tmp_path, file, old, new, expect):
+    excel = _excel_repo(tmp_path)
+    _mutate(excel / file, old, new)
+    res = _gate(tmp_path)
+    assert res.returncode == 1 and expect in res.stderr, res.stderr[-2000:]

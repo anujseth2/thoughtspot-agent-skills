@@ -704,9 +704,12 @@ def _call_dateadd(cur: _Cursor, resolver) -> str:
 
 
 def _call_nullif(args: list[str]) -> str:
+    """``NULLIF(a, b)``. ThoughtSpot has no ``nullif`` (rejected at import, probe record
+    §7, BL-339), so a non-zero ``b`` becomes ``if ( a = b ) then null else a`` — ``then
+    null`` is accepted. ``NULLIF(x, 0)`` keeps its marker (the divisor idiom)."""
     _need(args, 2, "NULLIF")
     if args[1] != "0":
-        return _emit("nullif", args)
+        return f"( if ( {args[0]} = {args[1]} ) then null else {args[0]} )"
     return _NULLIF0 + args[0]
 
 
@@ -765,7 +768,7 @@ def _pop_operand(units: list[str], construct: str) -> str:
             f"(e.g. (a * b) {construct} ...)")
     unit = units.pop()
     if unit.startswith(_NULLIF0):
-        return f"null_if_zero ( {unit[len(_NULLIF0):]} )"
+        return f"( if ( {unit[len(_NULLIF0):]} = 0 ) then null else {unit[len(_NULLIF0):]} )"
     return unit
 
 
@@ -927,7 +930,8 @@ def _construct_between(cur, resolver, units: list[str]) -> None:
 
 
 def _collapse_nullif_markers(units: list[str]) -> None:
-    """x / NULLIF(y, 0) -> safe_divide ( x , y ); stray marker -> null_if_zero."""
+    """x / NULLIF(y, 0) -> safe_divide ( x , y ); stray marker -> ( if ( y = 0 ) then null else y ) —
+    ThoughtSpot has no null_if_zero (rejected at import, probe record §7, BL-344)."""
     i = 0
     while i < len(units):
         if units[i].startswith(_NULLIF0):
@@ -937,5 +941,5 @@ def _collapse_nullif_markers(units: list[str]) -> None:
                 units[i - 2:i + 1] = [f"safe_divide ( {x} , {y} )"]
                 i -= 2
             else:
-                units[i] = f"null_if_zero ( {y} )"
+                units[i] = f"( if ( {y} = 0 ) then null else {y} )"
         i += 1

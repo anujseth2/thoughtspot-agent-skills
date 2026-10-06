@@ -169,8 +169,10 @@ class TestRefs:
 class TestAdapters:
     def test_dialect_names(self):
         assert normalise_dialect("PowerBI") == "dax"
+        assert normalise_dialect("excel") == "excel"  # translator-backed since v0.158.0
+        assert normalise_dialect("Sheets") == "google_sheets"
         with pytest.raises(ValueError):
-            normalise_dialect("excel")  # map-backed in v1: the skill, not the CLI
+            normalise_dialect("sigma")  # still map-backed: the skill, not the CLI
 
     def test_tableau(self):
         r = translate("ROUND(SUM([Sales]) / COUNTD([Customer]), 2)", "tableau")
@@ -529,6 +531,7 @@ class TestSheets:
         assert "fallback_map" not in c["excel"]
         for x in ("google_sheets", "excel"):
             assert (_REPO / c[x]["map"]).is_file()
+            assert c[x]["backing"] == "translator"  # the map is the NEEDS_REVIEW fallback
 
     def test_fallback_map_rows_a_name_the_delta_does_not(self):
         """E1: VLOOKUP has no Sheets row, so it is read from the Excel row."""
@@ -968,3 +971,25 @@ class TestEditorForm:
         r = translate("COUNT(*)", "snowflake")
         assert r["formula_editor"] == "count ( [<primary key>] )"
         assert len(r["formula_editor_notes"]) == 1
+
+
+class TestNullifRefused:
+    """BL-339: `nullif` is not a ThoughtSpot function (VALIDATE_ONLY 2026-10-06, probe §7)."""
+
+    def test_catalog_does_not_know_nullif(self):
+        from ts_cli.formula_translate.catalog import is_known
+        assert not is_known("nullif")
+        assert not is_known("null_if")
+        assert is_known("least") and is_known("safe_divide")
+
+    def test_output_guard_rejects_nullif(self):
+        from ts_cli.formula_translate.traps import output_guard
+        assert "nullif" in output_guard("[T::a] / nullif ( [T::b] , 0 )")
+
+    def test_thoughtspot_input_using_nullif_is_needs_review(self):
+        r = translate("[a] / nullif ( [b] , 0 )", "thoughtspot")
+        assert r["status"] == "NEEDS_REVIEW" and r["formula"] is None
+
+    def test_snowflake_nullif_non_zero_is_case_form(self):
+        r = translate("NULLIF(a, b)", "snowflake")
+        assert r["formula"] == "( if ( [TABLE::a] = [TABLE::b] ) then null else [TABLE::a] )"
