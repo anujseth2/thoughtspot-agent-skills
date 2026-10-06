@@ -61,7 +61,8 @@ here directly, more strictly than the converters, because its rule table is data
 (``ts_cli/excel/rules.py``, read with ``ast``). For every rule: the map
 (``docs/function-maps/ts-excel-function-mapping.md`` or the Sheets delta map) rows the function;
 every ThoughtSpot name the rule emits appears in that row's text (``CRITERIA_EMITS`` in the
-criteria-string table) and is a catalogued function (the formula reference's table, or the
+criteria-string table; ``COERCION_EMITS`` in the implicit-type-coercion table) and is a
+catalogued function (the formula reference's table, or the
 vendored ``EXTRAS`` in ``formula_translate/catalog.py``), never a disproved one; and each map's
 *Translator coverage* list names exactly the rule table's keys for that map. Requirement A
 also runs over ``ts_cli/excel/*.py``.
@@ -69,7 +70,9 @@ also runs over ``ts_cli/excel/*.py``.
 The declared ``emits`` are only half of it (PR #570 review L1): a handler could emit a name it
 never declared. So C also **runs every handler** — ``translate_excel`` over synthetic calls of
 arity 0–4 drawn from a small argument pool (a row reference, a range, numbers, strings) — and
-fails when an emitted function is outside that rule's ``emits`` plus ``SHARED_EMITS`` (the
+fails when an emitted function is outside that rule's ``emits`` plus ``SHARED_EMITS`` (a
+name added by Excel's implicit coercion, a ``via: coerce`` node, may instead be in
+``COERCION_EMITS`` — only those occurrences; the handler's own calls still need ``emits``) (the
 names the shared machinery adds whatever the rule: ``to_string`` in ``&``, ``isnull`` / ``not``
 in blank tests), or is disproved or uncatalogued. And a disproved name written as a call
 (``"nullif ("``) in any string literal of ``ts_cli/excel/`` fails, whatever path builds it.
@@ -421,6 +424,13 @@ def excel_rule_errors(rules_src: str, maps: dict[str, str], valid: set[str],
         if not _mentions(criteria, emitted):
             errors.append(f"CRITERIA_EMITS: `{emitted}` does not appear in the Excel map's "
                           "criteria-string table")
+    coercion = text_between(maps.get("excel", ""), "### Implicit type coercion", "\n## ")
+    for emitted in data.get("COERCION_EMITS", ()):
+        if not _mentions(coercion, emitted):
+            errors.append(f"COERCION_EMITS: `{emitted}` does not appear in the Excel map's "
+                          "implicit-type-coercion table")
+        if emitted in nonexistent or emitted not in known:
+            errors.append(f"COERCION_EMITS: `{emitted}` is not a catalogued ThoughtSpot function")
     for key, keys in (("excel", set(tables["FUNCTION_RULES"])), ("sheets", set(tables["SHEETS_RULES"]))):
         listed = coverage_list(maps.get(key, ""))
         if listed is None:
@@ -481,9 +491,22 @@ def emitted_by_handlers(root: Path) -> dict:
         from ts_cli.formula_translate.context import ColumnContext
     finally:
         sys.path.remove(code_root)
+    from ts_cli.excel.tsast import walk
+
     def names(src: str, dialect: str) -> set:
-        expr = translate_excel(src, ColumnContext(), dialect=dialect).expr
-        return set(_CALL_NAME.findall(_QUOTED.sub("''", expr))) if expr else set()
+        """Called function names; a name added by Excel's implicit coercion (``coerce.py``,
+        tagged ``via: coerce``) is reported as ``coerce:<name>``, so only those occurrences
+        are allowed by ``COERCION_EMITS`` — the handler's own calls still need ``emits``."""
+        tree = translate_excel(src, ColumnContext(), dialect=dialect).tree
+        if tree is None:
+            return set()
+        out = set()
+        for n in walk(tree):
+            if n.get("node") == "call":
+                out.add(("coerce:" if n.get("via") == "coerce" else "") + n["fn"])
+            elif n.get("node") == "unop" and n["op"] == "not":
+                out.add("not")
+        return out
 
     out: dict = {}
     for table, dialect, rule_table in (("FUNCTION_RULES", "excel", rules.FUNCTION_RULES),
@@ -494,8 +517,7 @@ def emitted_by_handlers(root: Path) -> dict:
             for src, args in _synthetic_calls(name):
                 # what the arguments emit on their own is not this handler's emission
                 seen.update(names(src, dialect) - set().union(*(own[a] for a in args)))
-            out[(table, name)] = seen - {"if", "and", "or", "not", "in"} | (
-                {"not"} & seen)
+            out[(table, name)] = seen - {"in", "between"}
     return out
 
 
@@ -503,17 +525,23 @@ def emission_errors(emitted: dict, rules_src: str, valid: set[str], nonexistent:
                     extras: set[str]) -> list[str]:
     data = literal_assignments(rules_src)
     shared = set(data.get("SHARED_EMITS", ()))
+    coercion = set(data.get("COERCION_EMITS", ()))
     errors = []
     for (table, name), names in sorted(emitted.items()):
         declared = set(data.get(table, {}).get(name, {}).get("emits", ())) | shared
-        for fn in sorted(names):
+        for tagged in sorted(names):
+            via_coerce = tagged.startswith("coerce:")
+            fn = tagged.split(":", 1)[1] if via_coerce else tagged
             if fn in nonexistent:
                 errors.append(f"{table}[{name!r}]'s handler emitted `{fn}`, which the catalog "
                               "marks as NOT a ThoughtSpot function")
             elif fn not in valid | extras and not fn.startswith("sql_"):
                 errors.append(f"{table}[{name!r}]'s handler emitted `{fn}`, which is not in "
                               "the formula catalog")
-            elif fn not in declared:
+            elif via_coerce and fn not in coercion | declared:
+                errors.append(f"{table}[{name!r}]: Excel's implicit coercion emitted `{fn}`, "
+                              "which COERCION_EMITS does not declare")
+            elif not via_coerce and fn not in declared:
                 errors.append(f"{table}[{name!r}]'s handler emitted `{fn}`, which its rule does "
                               "not declare in `emits` (so its map row is never checked for it)")
     return errors

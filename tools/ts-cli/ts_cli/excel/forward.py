@@ -34,6 +34,21 @@ TYPE_UNKNOWN_NOTE = ("column types unknown: {name} was left bare inside concat; 
                      "--columns, or --model, to decide")
 
 
+DECIMAL_CONSTANT_TRAP = (
+    "constant decimal arithmetic (BL-351): the warehouse computes literals as exact decimals, "
+    "Excel as binary doubles, so a result can differ from Excel's in the 13th significant "
+    "digit or beyond (Excel's 0.1 + 0.2 carries the double's error, 0.30000000000000004; "
+    "the warehouse returns 0.3). Over a DOUBLE column both compute in double. A documented "
+    "platform divergence, not a translation error")
+
+
+CROSS_TYPE_TRAP = (
+    "a comparison across types was folded to the constant {result}: that assumes every Excel "
+    "cell of the column holds the warehouse column's type. A blank cell is 0 or '' to Excel "
+    "(and NULL here), and a sheet column can mix numbers, text and booleans, which Excel "
+    "would compare by value — check the column before relying on the constant")
+
+
 class NeedsReview(Exception):
     """The construct has no rule; the message is the user-facing reason."""
 
@@ -49,6 +64,7 @@ class Translator:
         self.division_mode: Optional[str] = None   # None | "safe" (IFERROR …, 0)
         self.divisions = 0
         self.elementwise = False                   # inside Sheets ARRAYFORMULA
+        self.try_conversion = False                # inside IFERROR: VALUE → TRY_TO_DOUBLE
         # (target, reason, note) for each column whose unknown type changed the output —
         # formula_translate.prompts turns these into the result's needs_types[]
         self.type_needs: list[tuple[str, str, str]] = []
@@ -92,6 +108,42 @@ class Translator:
 
     def type_of(self, node: dict) -> Optional[str]:
         return T.type_of(node, self.column_type)
+
+    def column_fine_type(self, node: dict) -> Optional[str]:
+        """A reference's type with int and double kept apart (``typecheck``)."""
+        from ts_cli.excel.typecheck import type_of_data_type
+
+        spec = self.ctx.spec_for_target(T.to_text(node))
+        return type_of_data_type(spec.data_type) if spec else None
+
+    def fine_type(self, node: dict) -> Optional[str]:
+        """``int`` / ``double`` / ``number`` / ``text`` / ``date`` / … of an emitted node."""
+        from ts_cli.excel.typecheck import infer
+
+        return infer(node, self.column_fine_type)
+
+    # -- Excel's implicit coercion, per slot (coerce.py) ---------------------------------
+    def date(self, node) -> dict:
+        """An Excel argument in a date slot: a date, date text or a serial (BL-352/353)."""
+        from ts_cli.excel.coerce import as_date
+
+        return as_date(self, self.expr(node))
+
+    def num(self, node) -> dict:
+        """An Excel argument in a number slot (a boolean or numeric text converted)."""
+        return self.as_number(self.expr(node))
+
+    def text(self, node) -> dict:
+        """An Excel argument in a text function: a number / boolean / date as Excel's text."""
+        from ts_cli.excel.coerce import as_text
+
+        return as_text(self, self.expr(node), quiet=True)
+
+    def int_arg(self, node, signed: bool = False) -> dict:
+        """An Excel count or position: ThoughtSpot's integer slots reject a DOUBLE (BL-355)."""
+        from ts_cli.excel.coerce import as_int
+
+        return as_int(self, self.expr(node), signed)
 
     # -- dispatch ----------------------------------------------------------------------
     def expr(self, node) -> dict:
@@ -148,6 +200,9 @@ class Translator:
         if node.op in ("=", "<>", "<", "<=", ">", ">="):
             return self.compare(node.op, left, right)
         left, right = self.as_number(left), self.as_number(right)
+        if _constant_decimal(left) and _constant_decimal(right) and (
+                _has_decimal(left) or _has_decimal(right)):
+            self.trap(DECIMAL_CONSTANT_TRAP)
         if node.op == "^":
             return T.call("pow", left, right)
         if node.op in ("+", "-"):
@@ -157,11 +212,12 @@ class Translator:
         return T.binop(node.op, left, right)
 
     def as_number(self, node: dict) -> dict:
-        """Excel coerces TRUE to 1 in arithmetic; ThoughtSpot rejects a boolean operand
-        (``true + 1`` fails import — probe record §7), so coerce it explicitly."""
-        if self.type_of(node) == "bool":
-            return T.ifelse(node, T.lit_number("1"), T.lit_number("0"))
-        return node
+        """Excel coerces TRUE to 1 and numeric text to its number in arithmetic; ThoughtSpot
+        rejects both (``true + 1`` fails import — probe record §7), so the conversion is
+        written out (``coerce.as_number``)."""
+        from ts_cli.excel.coerce import as_number
+
+        return as_number(self, node)
 
     def as_condition(self, node: dict) -> dict:
         """Excel reads a number as a condition (0 is FALSE); ThoughtSpot needs a boolean."""
@@ -182,7 +238,29 @@ class Translator:
         for value, other in ((left, right), (right, left)):
             if T.is_lit(value, "string", "''") and op in ("=", "<>"):
                 return self._blank_test(op, other)
+        ranked = self._compare_across_types(op, left, right)
+        if ranked is not None:
+            return ranked
         return T.binop("!=" if op == "<>" else op, left, right)
+
+    def _compare_across_types(self, op: str, left: dict, right: dict) -> Optional[dict]:
+        """Excel never finds values of different types equal and orders them by type
+        (numbers < text < booleans), so a text literal compared with a boolean cell is a
+        constant; ThoughtSpot rejects the comparison (*Expecting a List token*). The fold
+        assumes each Excel cell holds the warehouse column's type — a blank cell is 0 / ''
+        to Excel, and a text-typed sheet column may hold numbers — so it is APPROXIMATED with
+        a trap saying so (review of #574). A date beside text is left to the type checker
+        (NEEDS_REVIEW): a date there is usually a mistake."""
+        lt, rt = (_RANK_FAMILY.get(self.fine_type(x)) for x in (left, right))
+        if lt is None or rt is None or lt == rt:
+            return None
+        a, b = _RANK[lt], _RANK[rt]
+        result = {"=": False, "<>": True, "<": a < b, "<=": a < b, ">": a > b, ">=": a > b}[op]
+        self.note(f"Excel compares {lt} with {rt} by type (numbers < text < booleans; never "
+                  f"equal), so this comparison is always {str(result).upper()}")
+        if T.has_column(left) or T.has_column(right):
+            self.trap(CROSS_TYPE_TRAP.format(result=str(result).upper()), downgrade=True)
+        return T.lit_bool(result)
 
     def _blank_test(self, op: str, x: dict) -> dict:
         """``x = ""`` is TRUE for a blank cell in Excel: ``isnull ( x )`` (number / date — a
@@ -249,7 +327,8 @@ class Translator:
         return T.binop(op, left, right)
 
     def _whole_days(self, amount: dict) -> dict:
-        """add_days takes whole days; Excel's date + 0.5 (or + 1/24) adds a time of day."""
+        """add_days takes whole days (an INT64 — a DOUBLE is rejected at import); Excel's
+        date + 0.5 (or + 1/24) adds a time of day."""
         value = T.number_value(amount)
         if value is not None and value != value.to_integral_value():
             self.review("adding a fraction of a day to a date or datetime (+0.5, +1/24) has no "
@@ -259,7 +338,14 @@ class Translator:
                                             for n in T.walk(amount)):
             self.review("a computed number of days (e.g. 1/24) added to a date may be "
                         "fractional — add_days takes whole days")
+        if value is None and self.fine_type(amount) in ("double", "number"):
+            # review of #574: a DOUBLE day count is floored (add_days needs an integer)
+            self.trap("a DOUBLE number of days added to a date: add_days takes whole days, so "
+                      "it is floor ( n ); Excel would add the fraction as a time of day",
+                      downgrade=True)
+            return T.call("floor", amount)
         return amount
+
 
     def concat(self, operands: list) -> dict:
         """Excel ``&`` / CONCAT: one N-argument ``concat`` of Text arguments (probe §7)."""
@@ -272,27 +358,21 @@ class Translator:
         return texts[0] if len(texts) == 1 else T.call("concat", *texts)
 
     def as_text(self, node: dict) -> dict:
-        t = self.type_of(node)
-        if t == "text":
-            return node
-        if t is None:
-            # Left bare: to_string rejects a Text argument at import, so wrapping a column
-            # that turns out to be text would break the formula (PR #570 review H4).
-            note = TYPE_UNKNOWN_NOTE.format(name=T.to_text(node))
-            self.trap(note, downgrade=True)
-            self.need_type(node, "text join", note)
-            return node
-        if t == "bool":
-            self.note("to_string of a boolean gives 'true' / 'false'; Excel's & shows TRUE / "
-                      "FALSE")
-        if t in T.TEMPORAL:
-            self.trap("a date joined with & is its serial number in Excel; ThoughtSpot's "
-                      "to_string gives the date text — use TEXT() semantics deliberately",
-                      downgrade=True)
-        elif t == "number" and node.get("node") != "lit":
-            self.trap("to_string of a DOUBLE may render a decimal ('12.0') where Excel shows "
-                      "12 — exact for an integer column")
-        return T.call("to_string", node)
+        from ts_cli.excel.coerce import as_text
+
+        return as_text(self, node)
+
+    def unknown_text(self, node: dict) -> None:
+        # Left bare: to_string rejects a Text argument at import, so wrapping a column
+        # that turns out to be text would break the formula (PR #570 review H4).
+        note = TYPE_UNKNOWN_NOTE.format(name=T.to_text(node))
+        self.trap(note, downgrade=True)
+        self.need_type(node, "text join", note)
+
+
+_RANK_FAMILY = {"int": "number", "double": "number", "number": "number", "text": "text",
+                "bool": "bool"}
+_RANK = {"number": 0, "text": 1, "bool": 2}
 
 
 _CELL = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)(\d+)")
@@ -335,6 +415,17 @@ def check_a1(tree) -> None:
 _NUMERIC_ARGS = frozenset({"greatest", "least", "abs", "round", "floor", "ceil", "pow", "sqrt",
                            "ln", "exp", "log10", "sum", "average", "max", "min", "median",
                            "stddev", "variance"})
+
+
+def _constant_decimal(node: dict) -> bool:
+    """Only number literals and arithmetic on them."""
+    return all(n.get("node") in ("lit", "binop", "unop") and (
+        n.get("node") != "lit" or n["kind"] == "number") and (
+        n.get("node") != "binop" or n["op"] in "+-*/") for n in T.walk(node))
+
+
+def _has_decimal(node: dict) -> bool:
+    return any(T.is_lit(n, "number") and "." in n["value"] for n in T.walk(node))
 
 
 def _flatten_concat(node) -> list:

@@ -324,6 +324,20 @@ def test_criteria_emits_checked_against_the_criteria_table():
     assert any("CRITERIA_EMITS: `strpos`" in e for e in errs)
 
 
+def test_coercion_emits_checked_against_the_coercion_table():
+    """COERCION_EMITS (BL-352..355): each name must appear in the Excel map's implicit-type-
+    coercion table and be a catalogued function."""
+    table = "\n### Implicit type coercion\n\n| a text date | `abs` |\n\n## Next\n"
+    with_table = _EXCEL_MAP.replace("<!-- translator-coverage:start -->",
+                                    table + "<!-- translator-coverage:start -->")
+    ok = _rules(_OK_RULES) + 'COERCION_EMITS = ("abs",)\n'
+    assert _c_errors(ok, with_table) == []
+    errs = _c_errors(_rules(_OK_RULES) + 'COERCION_EMITS = ("abs", "sum")\n', with_table)
+    assert any("COERCION_EMITS: `sum` does not appear" in e for e in errs)
+    errs = _c_errors(_rules(_OK_RULES) + 'COERCION_EMITS = ("nullif",)\n', with_table)
+    assert any("COERCION_EMITS: `nullif` is not a catalogued" in e for e in errs)
+
+
 def test_real_repo_passes_requirement_c():
     """The shipped rule table and the shipped maps agree (the gate the CI runs)."""
     import check_mapping_code_sync as m
@@ -379,8 +393,14 @@ def test_unmutated_copy_passes(tmp_path):
     # 1. a handler emits a disproved name
     ("functions.py", '"ABS": _unary_fn("abs")', '"ABS": _unary_fn("nullif")', "NOT a ThoughtSpot"),
     # 2. a handler emits a catalogued name its rule never declared
-    ("functions_text.py", 'T.call("strlen", tr.expr(n.args[0]))',
+    ("functions_text.py", 'T.call("strlen", tr.text(n.args[0]))',
      'T.call("strpos", tr.expr(n.args[0]))', "does not declare"),
+    # 2b. (review of #574) a rule whose own names are all COERCION_EMITS names: emptying its
+    # emits must still fail — the coercion exemption covers only via=coerce nodes
+    ("rules.py", '"CEILING": {"map": "excel", "emits": ("ceil", "round")}',
+     '"CEILING": {"map": "excel", "emits": ()}', "does not declare"),
+    ("rules.py", '"FLOOR": {"map": "excel", "emits": ("floor", "round")}',
+     '"FLOOR": {"map": "excel", "emits": ("round",)}', "does not declare"),
     # 3. a rule's emits emptied while the handler still emits
     ("rules.py", '"SUM": {"map": "excel", "emits": ("sum",)}',
      '"SUM": {"map": "excel", "emits": ()}', "does not declare"),

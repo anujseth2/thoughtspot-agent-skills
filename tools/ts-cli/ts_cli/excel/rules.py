@@ -19,10 +19,10 @@ from __future__ import annotations
 FUNCTION_RULES = {
     # --- Math and trigonometry
     "ABS": {"map": "excel", "emits": ("abs",)},
-    "CEILING": {"map": "excel", "emits": ("ceil",)},
-    "CEILING.MATH": {"map": "excel", "emits": ("ceil",)},
+    "CEILING": {"map": "excel", "emits": ("ceil", "round")},
+    "CEILING.MATH": {"map": "excel", "emits": ("ceil", "floor", "abs", "round")},
     "EXP": {"map": "excel", "emits": ("exp",)},
-    "FLOOR": {"map": "excel", "emits": ("floor",)},
+    "FLOOR": {"map": "excel", "emits": ("floor", "round")},
     "INT": {"map": "excel", "emits": ("floor",)},
     "LN": {"map": "excel", "emits": ("ln",)},
     "LOG10": {"map": "excel", "emits": ("log10",)},
@@ -30,8 +30,8 @@ FUNCTION_RULES = {
     "MROUND": {"map": "excel", "emits": ("round", "abs")},
     "POWER": {"map": "excel", "emits": ("pow",)},
     "ROUND": {"map": "excel", "emits": ("round", "sql_double_op")},
-    "ROUNDDOWN": {"map": "excel", "emits": ("floor", "ceil")},
-    "ROUNDUP": {"map": "excel", "emits": ("ceil", "floor", "quarter_number")},
+    "ROUNDDOWN": {"map": "excel", "emits": ("floor", "ceil", "round")},
+    "ROUNDUP": {"map": "excel", "emits": ("ceil", "floor", "quarter_number", "round")},
     "SIGN": {"map": "excel", "emits": ()},
     "SQRT": {"map": "excel", "emits": ("sqrt",)},
     "SUM": {"map": "excel", "emits": ("sum",)},
@@ -67,7 +67,7 @@ FUNCTION_RULES = {
     "TEXTJOIN": {"map": "excel", "emits": ("concat",)},
     "TRIM": {"map": "excel", "emits": ("sql_string_op",)},
     "UPPER": {"map": "excel", "emits": ("sql_string_op",)},
-    "VALUE": {"map": "excel", "emits": ("to_double",)},
+    "VALUE": {"map": "excel", "emits": ("to_double", "sql_double_op")},
     # --- Date and time
     "DATEDIF": {"map": "excel", "emits": ("diff_days", "diff_months", "day", "floor")},
     "DAY": {"map": "excel", "emits": ("day",)},
@@ -86,7 +86,7 @@ FUNCTION_RULES = {
     "AND": {"map": "excel", "emits": ()},
     "FALSE": {"map": "excel", "emits": ()},
     "IF": {"map": "excel", "emits": ("safe_divide",)},
-    "IFERROR": {"map": "excel", "emits": ("safe_divide", "ifnull")},
+    "IFERROR": {"map": "excel", "emits": ("safe_divide", "ifnull", "sql_double_op")},
     "IFS": {"map": "excel", "emits": ()},
     "NOT": {"map": "excel", "emits": ("not",)},
     "OR": {"map": "excel", "emits": ()},
@@ -94,12 +94,19 @@ FUNCTION_RULES = {
     "TRUE": {"map": "excel", "emits": ()},
     # --- Information
     "ISBLANK": {"map": "excel", "emits": ("isnull",)},
-    "ISNUMBER": {"map": "excel", "emits": ("contains", "not", "isnull", "to_double")},
+    "ISNUMBER": {"map": "excel", "emits": ("contains", "not", "isnull", "sql_bool_op")},
 }
 
 # The criteria-string table (Excel map E11, "Criteria strings") that every *IF / *IFS rule
 # translates its criteria through (``criteria.py``) — checked against that table's text.
 CRITERIA_EMITS = ("isnull", "not", "contains", "strpos", "sql_bool_op")
+
+# Excel's implicit type coercion (``coerce.py``), applied per argument slot whatever the rule:
+# a text date or a serial in a date slot, numeric text in arithmetic, a DOUBLE in an integer
+# slot, a number / boolean / date where text is expected. Checked against the Excel map's
+# "Implicit type coercion" table, and allowed in every handler's emissions (BL-352..355).
+COERCION_EMITS = ("to_date", "add_days", "floor", "ceil", "diff_days", "to_double",
+                  "to_string")
 
 # Google Sheets delta rules (the Sheets map). A Sheets formula is handled by these first, then
 # by FUNCTION_RULES for every name the Sheets map does not row (its rule E1).
@@ -112,7 +119,7 @@ SHEETS_RULES = {
     "EQ": {"map": "sheets", "emits": ()},
     "GT": {"map": "sheets", "emits": ()},
     "GTE": {"map": "sheets", "emits": ()},
-    "IFERROR": {"map": "sheets", "emits": ("safe_divide", "ifnull")},  # 2 args: the Excel rule
+    "IFERROR": {"map": "sheets", "emits": ("safe_divide", "ifnull", "sql_double_op")},  # 2 args: the Excel rule
     "LT": {"map": "sheets", "emits": ()},
     "LTE": {"map": "sheets", "emits": ()},
     "MINUS": {"map": "sheets", "emits": ()},

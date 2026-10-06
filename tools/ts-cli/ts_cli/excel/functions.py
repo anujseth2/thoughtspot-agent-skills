@@ -139,7 +139,7 @@ def _countifs(tr, n):
 
 def _round(tr, n):
     need(tr, n, 2, 2)
-    x = tr.expr(n.args[0])
+    x = tr.num(n.args[0])
     digits = tr.expr(n.args[1])
     try:
         text = ts_round_from_sql_digits(T.to_text(x), T.to_text(digits),
@@ -162,14 +162,44 @@ def _quarter_idiom(node):
     return None
 
 
-def _scaled(x: dict, digits: int, inner_fn: str) -> dict:
-    """``fn ( x * F ) / F`` (digits > 0), ``fn ( x )`` (0), ``fn ( x / F ) * F`` (< 0)."""
+SNAP = "0.000000001"
+SNAP_NOTE = ("a DOUBLE scaled for rounding is snapped to 1e-9 first — round ( x * F , "
+             "0.000000001 ) — because binary representation error would otherwise push an "
+             "exact step over the edge (1.1 * 100 is 110.00000000000001, so ceil gave 1.11 "
+             "where Excel, which works to 15 significant digits, gives 1.1). A value with a "
+             "genuine difference beyond the 9th decimal of the scaled number is snapped too")
+
+
+def _snap(tr, x: dict, scaled: dict) -> dict:
+    """``round ( scaled , 1e-9 )`` when ``x`` may be a DOUBLE (a DOUBLE or an unknown column
+    type); exact literals and integer or DECIMAL columns are left alone. Live 2026-10-07:
+    the snapped forms return Excel's 1.1, 0.29 and CEILING's 1.1 where the raw ones gave 1.11,
+    0.28 and 1.2 (probe record §7)."""
+    if not T.has_column(x) or tr.fine_type(x) not in ("double", None):
+        return scaled
+    tr.note(SNAP_NOTE)
+    return T.call("round", scaled, T.lit_number(SNAP))
+
+
+def _scaled(tr, x: dict, digits: int, inner_fn: str) -> dict:
+    """``fn ( x * F ) * I`` (digits > 0, ``I`` = 1 / ``F``), ``fn ( x )`` (0),
+    ``fn ( x / F ) * F`` (< 0), the scaled value snapped for a DOUBLE (``_snap``).
+
+    Multiplying by the increment, not dividing by the factor (BL-348): ``ceil ( … ) / F``
+    divides two integers, and Snowflake keeps a division's result at scale 6, so more than
+    6 digits came back cut to 6 (live, se-thoughtspot 2026-10-07: ``/ to_double ( F )`` and
+    ``to_double ( ceil ( … ) ) / F`` are cut the same way; ``* 0.00000000001`` keeps 11)."""
+    if abs(digits) > 15:
+        tr.review(f"rounding to {digits} digits: beyond a double's 15 significant digits, and "
+                  "the 10^n factor overflows ceil / floor's INT64 result")
     if digits == 0:
-        return T.call(inner_fn, x)
+        return T.call(inner_fn, _snap(tr, x, x))
     factor = T.lit_number(sql_digits_to_ts_increment(str(-abs(digits))))
     if digits > 0:
-        return T.binop("/", T.call(inner_fn, T.binop("*", x, factor)), factor)
-    return T.binop("*", T.call(inner_fn, T.binop("/", x, factor)), factor)
+        increment = T.lit_number(sql_digits_to_ts_increment(str(digits)))
+        scaled = _snap(tr, x, T.binop("*", x, factor))
+        return T.binop("*", T.call(inner_fn, scaled), increment)
+    return T.binop("*", T.call(inner_fn, _snap(tr, x, T.binop("/", x, factor))), factor)
 
 
 def _round_dir(away: bool):
@@ -184,16 +214,16 @@ def _round_dir(away: bool):
         digits = literal_int(n.args[1])
         if digits is None:
             tr.review(f"{n.name} with a non-literal digit count has no native form")
-        x = tr.expr(n.args[0])
+        x = tr.num(n.args[0])
         pos, neg = ("ceil", "floor") if away else ("floor", "ceil")
         cond = T.binop(">=", x, T.lit_number("0"))
-        return T.ifelse(cond, _scaled(x, digits, pos), _scaled(x, digits, neg))
+        return T.ifelse(cond, _scaled(tr, x, digits, pos), _scaled(tr, x, digits, neg))
     return handler
 
 
 def _mround(tr, n):
     need(tr, n, 2, 2)
-    x, m = tr.expr(n.args[0]), tr.expr(n.args[1])
+    x, m = tr.num(n.args[0]), tr.num(n.args[1])
     v = T.number_value(m)
     tr.trap("MROUND: Excel returns #NUM! when the number and multiple differ in sign; "
             "round ( x , abs ( m ) ) returns a value")
@@ -202,29 +232,77 @@ def _mround(tr, n):
 
 def _int(tr, n):
     need(tr, n, 1, 1)
-    return T.call("floor", tr.expr(n.args[0]))
+    return T.call("floor", tr.num(n.args[0]))
+
+
+def _multiple(tr, fn: str, x: dict, sig: dict) -> dict:
+    """``fn ( x / s ) * s``, the quotient snapped for a DOUBLE (``_snap``)."""
+    return T.binop("*", T.call(fn, _snap(tr, x, T.binop("/", x, sig))), sig)
+
+
+def _zero_guard(sig: dict, form: dict) -> dict:
+    """Excel ``CEILING`` / ``CEILING.MATH`` with a zero significance return 0; ``x / 0`` is
+    NULL in ThoughtSpot (BL-347). A non-zero literal needs no guard."""
+    value = T.number_value(sig)
+    if value is not None:
+        return T.lit_number("0") if value == 0 else form
+    return T.ifelse(T.binop("=", sig, T.lit_number("0")), T.lit_number("0"), form)
 
 
 def _ceiling_floor(fn: str):
+    """``CEILING`` / ``FLOOR (x, s)`` → ``fn ( x / s ) * s``. The signed division gives
+    Excel's rounding for every sign pair Excel accepts (a negative number with a negative
+    significance rounds away from zero, with a positive one toward zero); a positive number
+    with a negative significance is ``#NUM!`` in Excel and a number here. ``CEILING`` of a zero
+    significance is 0 (guarded); ``FLOOR``'s is ``#DIV/0!``, and NULL here."""
     def handler(tr, n):
         need(tr, n, 1, 2)
-        x = tr.expr(n.args[0])
+        x = tr.num(n.args[0])
         if len(n.args) == 1:
-            return T.call(fn, x)
-        sig = tr.expr(n.args[1])
-        return T.binop("*", T.call(fn, T.binop("/", x, sig)), sig)
+            return T.call(fn, _snap(tr, x, x))
+        sig = tr.num(n.args[1])
+        form = _multiple(tr, fn, x, sig)
+        return _zero_guard(sig, form) if fn == "ceil" else form
     return handler
+
+
+def _ceiling_math(tr, n):
+    """``CEILING.MATH(x, [s], [mode])`` (BL-346). Excel ignores the significance's sign: a
+    positive number rounds up to a multiple of ``|s|``; a negative one rounds toward zero
+    (``ceil``) by default and away from zero (``floor``) with a non-zero ``mode``. A zero
+    significance returns 0 (BL-347). The default significance is 1."""
+    need(tr, n, 1, 3)
+    x = tr.num(n.args[0])
+    given = len(n.args) > 1 and not isinstance(n.args[1], X.Missing)
+    sig = tr.num(n.args[1]) if given else T.lit_number("1")
+    value = T.number_value(sig)
+    step = T.lit_number(str(abs(value))) if value is not None else T.call("abs", sig)
+    mode = n.args[2] if len(n.args) == 3 and not isinstance(n.args[2], X.Missing) else None
+    away = False
+    if mode is not None:
+        m = T.number_value(tr.num(mode))
+        if m is None:
+            tr.review("CEILING.MATH with a non-literal mode has no rule: the mode decides the "
+                      "rounding direction of negative numbers")
+        away = m != 0
+    up = (T.call("ceil", _snap(tr, x, x)) if T.is_lit(step, "number", "1")
+          else _multiple(tr, "ceil", x, step))
+    if away:
+        down = (T.call("floor", _snap(tr, x, x)) if T.is_lit(step, "number", "1")
+                else _multiple(tr, "floor", x, step))
+        up = T.ifelse(T.binop("<", x, T.lit_number("0")), down, up)
+    return _zero_guard(sig, up) if given else up
 
 
 def _mod(tr, n):
     need(tr, n, 2, 2)
-    x, y = tr.expr(n.args[0]), tr.expr(n.args[1])
+    x, y = tr.num(n.args[0]), tr.num(n.args[1])
     return T.binop("-", x, T.binop("*", y, T.call("floor", T.binop("/", x, y))))
 
 
 def _sign(tr, n):
     need(tr, n, 1, 1)
-    x = tr.expr(n.args[0])
+    x = tr.num(n.args[0])
     zero = T.lit_number("0")
     return T.ifelse(T.binop(">", x, zero), T.lit_number("1"),
                     T.ifelse(T.binop("<", x, zero), T.unop("-", T.lit_number("1")), zero))
@@ -233,19 +311,19 @@ def _sign(tr, n):
 def _unary_fn(fn: str):
     def handler(tr, n):
         need(tr, n, 1, 1)
-        return T.call(fn, tr.expr(n.args[0]))
+        return T.call(fn, tr.num(n.args[0]))
     return handler
 
 
 def _power(tr, n):
     need(tr, n, 2, 2)
-    return T.call("pow", tr.expr(n.args[0]), tr.expr(n.args[1]))
+    return T.call("pow", tr.num(n.args[0]), tr.num(n.args[1]))
 
 
 HANDLERS = {
     "ABS": _unary_fn("abs"), "SQRT": _unary_fn("sqrt"), "EXP": _unary_fn("exp"),
     "LN": _unary_fn("ln"), "LOG10": _unary_fn("log10"), "INT": _int,
-    "CEILING": _ceiling_floor("ceil"), "CEILING.MATH": _ceiling_floor("ceil"), "FLOOR": _ceiling_floor("floor"), "MOD": _mod,
+    "CEILING": _ceiling_floor("ceil"), "CEILING.MATH": _ceiling_math, "FLOOR": _ceiling_floor("floor"), "MOD": _mod,
     "MROUND": _mround, "POWER": _power, "ROUND": _round,
     "ROUNDUP": _round_dir(True), "ROUNDDOWN": _round_dir(False), "SIGN": _sign,
     "SUM": _sum, "SUMIF": _if_agg("sum_if"), "SUMIFS": _ifs_agg("sum_if"),

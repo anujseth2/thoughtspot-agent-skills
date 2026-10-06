@@ -84,7 +84,8 @@ def _branches(tr, a: dict, b: dict) -> tuple:
                     "share a type, so the blank became null", downgrade=True)
             blank = T.lit_null()
             return (blank, other) if blank_first else (other, blank)
-    return a, b
+    from ts_cli.excel.coerce import unify_branches
+    return unify_branches(tr, a, b)
 
 
 def _ifs(tr, n):
@@ -153,8 +154,12 @@ def _isnumber(tr, n):
     if isinstance(arg, X.Call) and arg.name == "FIND":
         return T.binop(">", find_call(tr, arg), T.lit_number("0"))
     if isinstance(arg, X.Call) and arg.name == "VALUE" and len(arg.args) == 1:
-        # not ( isnull ( … ) ): ThoughtSpot has no isnotnull (probe record §7, BL-339)
-        return T.unop("not", T.call("isnull", T.call("to_double", tr.expr(arg.args[0]))))
+        # TRY_TO_DOUBLE, not not ( isnull ( to_double ( … ) ) ): to_double FAILS THE QUERY on
+        # text that is not a number — exactly the rows this test exists to find (live
+        # 2026-10-07, probe record §7)
+        from ts_cli.excel.helpers import template
+        return T.call("sql_bool_op", template("TRY_TO_DOUBLE({0}) IS NOT NULL"),
+                      tr.expr(arg.args[0]))
     value = tr.expr(arg)
     t = tr.type_of(value)
     if t == "number" and value.get("node") in ("col", "ref"):
@@ -211,9 +216,10 @@ def iferror_divisions(tr, value, fallback, divisions: int) -> dict:
         return out
     if divisions == 1 and isinstance(value, X.Binary) and value.op == "/":
         num, den = _with_mode(tr, value.left, "plain"), _with_mode(tr, value.right, "plain")
-        fb = tr.expr(fallback)
+        from ts_cli.excel.coerce import unify_branches
+        fb, ratio = unify_branches(tr, tr.expr(fallback), T.binop("/", num, den), "IFERROR")
         tr.trap(NULL_DIVISOR_TRAP)
-        return T.ifelse(T.binop("=", den, T.lit_number("0")), fb, T.binop("/", num, den))
+        return T.ifelse(T.binop("=", den, T.lit_number("0")), fb, ratio)
     tr.review("IFERROR with a non-zero fallback around more than one division (or a division "
               "inside a larger expression) has no map rule — Excel map IFERROR row")
 
@@ -228,7 +234,13 @@ def _iferror(tr, n):
     if divisions:
         return iferror_divisions(tr, value, fallback, divisions)
     if any(isinstance(x, X.Call) and x.name in _CONVERSIONS for x in X.walk(value)):
-        return T.call("ifnull", tr.expr(value), tr.expr(fallback))
+        from ts_cli.excel.coerce import unify_branches
+        saved, tr.try_conversion = tr.try_conversion, True
+        try:
+            converted = tr.expr(value)
+        finally:
+            tr.try_conversion = saved
+        return T.call("ifnull", *unify_branches(tr, converted, tr.expr(fallback), "IFERROR"))
     tr.review("IFERROR around an expression with no division or conversion: no error cause the "
               "map translates (E8)")
 

@@ -209,7 +209,7 @@ accepted. Excel's TRUE-is-1 coercion has to be written out. A number is not a co
 
 **`mod` takes the dividend's sign** (scratch-Model execute, compiled SQL `MOD(…)`, deleted and
 confirmed absent): `mod ( -3 , 2 )` = −1 and `mod ( 3 , -2 )` = 1, as Snowflake `MOD`. Excel `MOD`
-takes the divisor's sign (`MOD(-3, 2)` = 1). So Excel `MOD(a, b)` is `a - b * floor ( a / b )`
+takes the divisor's sign (Excel's MOD of −3 by 2 is 1). So Excel `MOD(a, b)` is `a - b * floor ( a / b )`
 in ThoughtSpot, and ThoughtSpot `mod ( a , b )` is `a-b*TRUNC(a/b)` in Excel.
 
 **`diff_time ( end , start )` is in seconds, end first** (scratch-Model execute, compiled to
@@ -250,3 +250,72 @@ with double-quoted literal text therefore has no pass-through form, and the tran
 `ifnull ( x , 0 )`, `quarter_number ( today ( ) )`, `ceil ( month_number ( today ( ) ) / 3 )` inside
 `to_string`, `add_days ( add_months ( start_of_month ( d ) , 1 ) , -1 )`, `pow ( x , 2 )`, unary
 `- x`. Case behaviour of `!=` was not probed (only its parse).
+
+**Types, conversions and integer slots (added 2026-10-07, formula fidelity M1 fixes, BL-346..355).**
+Probed on se-thoughtspot with the same `SALARY_RATES` table (`RATE_ID` INT64, `DEPARTMENT`
+VARCHAR, `EFFECTIVE_DATE` DATE, `BASE_RATE` DOUBLE): parser rows by one-formula
+VALIDATE_ONLY imports, values by a scratch Model (`ZZ_PROBE_M1FIX_*_DELETE_ME`, three of them,
+each deleted and confirmed absent with `ts metadata search`) and `ts agentql fetch-data` /
+`generate-sql`. These facts are what `ts_cli/excel/typecheck.py`'s signature table rests on.
+
+*ThoughtSpot's "Numeric" is an integer.* Every error message asking for *Numeric* rejects a
+DOUBLE column and a decimal literal alike:
+
+| Formula | Parser |
+|---|---|
+| `substr ( [DEPARTMENT] , [BASE_RATE] , 2 )`, `substr ( 'abc' , 1 , [BASE_RATE] )`, `substr ( [DEPARTMENT] , 1.5 , 2 )` | rejected: *Function substr expects 2nd (3rd) argument to be Numeric* |
+| `left ( 'a string' , [BASE_RATE] )` | rejected (*left expects 2nd argument to be Numeric*); `right` the same (M1) |
+| `add_days ( [EFFECTIVE_DATE] , [BASE_RATE] )`, `add_days ( [EFFECTIVE_DATE] , 1.5 )`, `add_months ( [EFFECTIVE_DATE] , [BASE_RATE] )` | rejected (*expects 2nd argument to be Numeric*) |
+| `mod ( [BASE_RATE] , 2.5 )`, `mod ( [RATE_ID] , 2.5 )` | rejected (1st, 2nd argument); `mod ( [RATE_ID] , 2 )` accepted |
+| `to_double ( [BASE_RATE] )` | rejected: *Function to_double expects 1st argument to be Boolean or Numeric or Text*; `to_double` of an INT64, a VARCHAR or a boolean is accepted |
+| `substr ( [DEPARTMENT] , floor ( [BASE_RATE] ) - 1 , floor ( [BASE_RATE] ) )`, `substr ( … , to_integer ( [BASE_RATE] ) - 1 , 2 )`, `right ( 'a string' , floor ( [BASE_RATE] ) )`, `add_days ( to_date ( '1899-12-30' , '%Y-%m-%d' ) , floor ( [BASE_RATE] ) )` | accepted: `floor` / `ceil` / `to_integer` return INT64 |
+| `abs`, `ceil`, `floor`, `round`, `pow`, `sqrt`, `ln`, `exp`, `log10`, `safe_divide`, `greatest`, `least`, unary `-`, `*`, `sum`, `average`, `max`, `sum_if` over `[BASE_RATE]` | accepted |
+
+*Other type rules.*
+
+| Formula | Parser |
+|---|---|
+| `to_string ( [EFFECTIVE_DATE] )`, `to_string ( now ( ) )` | rejected: *Function to_string expects 2 arguments, found 1* — no one-argument form for a DATE or DATE_TIME |
+| `strlen ( 5 )`, `strpos ( [DEPARTMENT] , 5 )`, `contains ( [DEPARTMENT] , 5 )`, `concat ( 'a' , [RATE_ID] )` | rejected (*expects … argument to be Text*) |
+| `year`, `day_number_of_week`, `quarter_number` of `[BASE_RATE]` or of text; `start_of_month ( 'x' )`; `diff_days ( [BASE_RATE] , [BASE_RATE] )` | rejected (*expects … Date or DateTime*); `year ( now ( ) )`, `day_number_of_week ( now ( ) )`, `diff_days ( now ( ) , [EFFECTIVE_DATE] )` accepted |
+| `[RATE_ID] = 'a'`, `[RATE_ID] = true` | rejected: *Expecting a List token*; `[RATE_ID] = [BASE_RATE]` accepted |
+| `[EFFECTIVE_DATE] = '2020-01-01'` | rejected (the text re-read as search tokens) |
+| `[EFFECTIVE_DATE] + 1`, `[DEPARTMENT] * 2`, `- [DEPARTMENT]`, `abs ( [RATE_ID] > 1 )` | rejected |
+| `[RATE_ID] and true`, `not ( [RATE_ID] )`, `if ( [RATE_ID] ) then 1 else 0` | rejected (*(If / else if) expects condition to be Boolean*) |
+| `if ( c ) then 1 else 2.5`, `if ( c ) then [RATE_ID] else [BASE_RATE]` | accepted: INT64 and DOUBLE branches join |
+| `if ( c ) then true else 1` | rejected: *Unknown data type* |
+| `if ( c ) then [EFFECTIVE_DATE] else 'x'`, `if ( 0 = 0 ) then 'x' else 0 / 0` | rejected (*Expecting a DateTime / Text token*); `… else to_string ( 0 / 0 )` accepted |
+| `ifnull ( [RATE_ID] , 'x' )` | rejected (*ifnull expects 2nd argument to be Numeric*) |
+| `sql_string_op ( "UPPER({0})" , [RATE_ID] )`, `sql_string_op ( "UPPER({0})" , [EFFECTIVE_DATE] )` | accepted — a pass-through's arguments are not type-checked |
+
+*Values (scratch Model, se-thoughtspot, 2026-10-07).*
+
+| Formula | Result | Compiled SQL |
+|---|---|---|
+| `to_date ( '2001-03-31' , '%Y-%m-%d' )` | 2001-03-31 | `TO_DATE('2001-03-31','YYYY-MM-DD')` — ThoughtSpot translates the strftime pattern |
+| `to_date ( '2001-03-31' , 'yyyy-MM-dd' )` | 2001-03-31 | `TO_DATE('2001-03-31','yyyy-MM-dd')` — passed through verbatim; works because Snowflake's format elements are case-insensitive, so `'%Y-%m-%d'` is the form to emit |
+| `to_date ( '31/03/2001' , '%d/%m/%Y' )`, `to_date ( '03/04/2026' , '%m/%d/%Y' )` | 2001-03-31, 2026-03-04 | `'DD/MM/YYYY'`, `'MM/DD/YYYY'` |
+| `to_date ( '2001-03-31 10:20:30' , '%Y-%m-%d %H:%M:%S' )`; `day ( to_date ( '…T15:26:14' , '%Y-%m-%dT%H:%M:%S' ) )` | the date; 29 | `'YYYY-MM-DD HH24:MI:SS'` — the time is dropped |
+| `diff_days ( to_date ( '2000-01-01' , '%Y-%m-%d' ) , to_date ( '1899-12-30' , '%Y-%m-%d' ) )` | 36526 | Excel's serial for 2000-01-01 |
+| `to_integer ( 2.7 )`, `to_integer ( - 2.7 )`, `to_integer ( '2.5' )` | 3, −3, 3 | **rounds**, so it is not Excel's truncation; `floor ( - 2.5 )` = −3 |
+| `to_double ( '2.99999' )`, `to_double ( ' 7' )` | 2.99999, 7.0 | leading space accepted |
+| `to_string ( 2 < 3 )` | `true` | lower case (Excel: `TRUE`, BL-349) |
+| `to_string ( 534 )`, `to_string ( to_double ( '534' ) )` | `534`, `534` | |
+| `to_string ( [BASE_RATE] )` (95000.0) | `95000.00` | the column's NUMBER(…, 2) scale shows — a DOUBLE column's text follows the warehouse type |
+| `ceil ( 8.234567890134 * 100000000000 ) / 100000000000` | 8.234568 | **an integer quotient keeps scale 6 in Snowflake** (BL-348); `/ to_double ( 100000000000 )` and `to_double ( ceil ( … ) ) / 100000000000` give 8.234568 too |
+| `ceil ( 8.234567890134 * 100000000000 ) * 0.00000000001` | 8.23456789014 | multiplying by the increment keeps all 11 digits — the form the Excel translator now emits |
+
+*Review of #574 (2026-10-07, two more scratch Models, each deleted and confirmed absent).*
+
+| Formula | Result |
+|---|---|
+| `ceil ( to_double ( '1.1' ) * 100 ) * 0.01` | **1.11** — `1.1 * 100` is `110.00000000000001` in a double |
+| `ceil ( round ( to_double ( '1.1' ) * 100 , 0.000000001 ) ) * 0.01` | 1.1 — the snapped form the Excel translator now emits for a DOUBLE |
+| `floor ( to_double ( '0.29' ) * 100 ) * 0.01` / snapped | 0.28 / 0.29 |
+| `ceil ( to_double ( '1.1' ) / 0.1 ) * 0.1` / snapped | 1.1 / 1.1 here (the raw form gives 1.2 in IEEE arithmetic in general — `1.1 / 0.1` is `11.000000000000002`; the warehouse's rounding happened to absorb it) |
+| `floor ( round ( to_double ( '-0.57' ) * 100 , 0.000000001 ) ) * 0.01` | −0.5700000000000001 (within any 1e-12 tolerance) |
+| `ceil ( round ( [BASE_RATE] * 100 , 0.000000001 ) ) * 0.01` | 95000.0 — accepted over a column |
+| `to_double ( 'abc' )`, `to_double ( [DEPARTMENT] )` | **the query fails**: *Numeric value 'abc' is not recognized* (QUERY_EXECUTION_FAILED) — not NULL. Corrects the Excel map's E8, `VALUE` and `NUMBERVALUE` rows |
+| `sql_double_op ( "TRY_TO_DOUBLE({0})" , [DEPARTMENT] )`, `ifnull ( … , 0 )` | NULL, 0.0 — the null-on-failure form |
+| `sql_bool_op ( "TRY_TO_DOUBLE({0}) IS NOT NULL" , [DEPARTMENT] )` | false — the `ISNUMBER(VALUE(…))` form the translator now emits |
+| `to_string ( 100000000000000000000 )`, `to_string ( to_double ( '1E+20' ) )` | `'100000000000000000000'`, `'1e+20'` (Excel writes `1E+20`) |

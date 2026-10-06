@@ -146,6 +146,111 @@ queries. Teardown deleted the Model and the Table and confirmed both absent, and
 warehouse table and confirmed it with `SHOW TABLES`. The startup sweep found one earlier
 `ZZ_FIDELITY_*` warehouse table and only reported it; this run did not create it.
 
+## After fixes (2026-10-07)
+
+The fixes for BL-346..350 and BL-352..355 (ts-cli 0.161.0; the run used the fix commits before
+the version string was bumped, so its header reads 0.160.0) were re-run live on the same 250
+cases, the same manifest and the same cluster. Redacted results:
+`tools/formula-fidelity/runs/2026-10-07-excel-m1.json`; full evidence in the data dir
+(`runs/2026-10-07-excel-m1-full.json`). The findings above are the 2026-10-06 run and are kept
+as they were; the generated tables below are that run's too.
+
+**What changed in the translator.** A type checker over the emitted formula
+(`ts_cli/excel/typecheck.py`) now turns any provable type error into NEEDS_REVIEW, so a
+translation ThoughtSpot would reject at import can no longer come back TRANSLATED. Excel's
+implicit coercions are written out (`ts_cli/excel/coerce.py`): a text date becomes `to_date`, a
+serial number becomes its date, a number, boolean or date in a text function becomes Excel's
+text, numeric text in arithmetic becomes a number, a DOUBLE count or position becomes
+`floor ( … )`, and `IF` / `IFERROR` branches share one type. Then the silent rules were fixed:
+`CEILING.MATH` sign and mode, a zero `CEILING` significance, `ROUNDUP` / `ROUNDDOWN` precision,
+and booleans in text.
+
+| Class | 2026-10-06 | 2026-10-07 |
+|---|--:|--:|
+| SILENT_WRONG | 7 | **2** |
+| WARNED_WRONG | 2 | 2 |
+| DIVERGENCE_BLANK | 1 | 3 |
+| DIVERGENCE_ERROR | 2 | 2 |
+| IMPORT_FAILED | 36 | **0** |
+| TRANSLATE_FAILED (NEEDS_REVIEW) | 0 | 3 |
+| ERROR_EQUIV | 2 | 3 |
+| MATCH | 180 | **215** |
+| ORACLE_DISPUTED (not run) | 20 | 20 |
+
+**0 import failures among TRANSLATED or APPROXIMATED results.** Of the 36 former import
+failures, 30 now match, 2 are blank-input divergences (a blank cell read as 0 by Excel), 1 is
+error-equivalent (absolute value of non-numeric text: Excel `#VALUE!`, ThoughtSpot NULL) and 3
+are NEEDS_REVIEW:
+- `lo-date_time-day-sheet2-r5`: a date-time text before 1900. Excel does not read text before
+  1900 as a date and returns `#VALUE!`; the corpus value is LibreOffice's, which does. Refused
+  rather than translated to LibreOffice's answer.
+- `lo-date_time-eomonth-sheet2-r7`: text that is not a date in a date function (Excel
+  `#VALUE!`, which is also the corpus value). NEEDS_REVIEW is the honest answer.
+- `poi-…-f940`: a month taken from serial number 0, which is Excel's fictitious "1900-01-00";
+  no real date carries it.
+
+**Five of the seven silent wrong answers now match**: both `CEILING.MATH` cases, the zero
+`CEILING` significance, the date in `UPPER` and the boolean joined into text. Two remain:
+- `poi-…-f23` (BL-351): constant decimal arithmetic. The warehouse computes literals as exact
+  decimals, Excel as doubles. This is a platform divergence, documented in the Excel map and the
+  skill; the translation now carries a trap naming it, and the status stays TRANSLATED, so the
+  harness still scores it silent. The tolerance is not widened.
+- `lo-mathematical-roundup-sheet2-r17` (BL-348, now an oracle question, BL-356): the
+  round-up to more than 6 digits is no longer cut to 6. ThoughtSpot now returns the value that
+  Microsoft's documented rule gives (round away from zero at the 11th decimal), and that the
+  bronze `formulas` cross-check gives too. The LibreOffice silver value is one unit lower in the
+  last place, a relative difference of about 1.2e-12, just above the case's declared 1e-12
+  tolerance. The cross-check uses a 1e-9 bound, so it reported "agree" and the case was not
+  quarantined. Following oracles.md, it is not resolved by picking a side: BL-356 makes the
+  cross-check compare at the case's own tolerance.
+
+**No regression.** No case that matched on 2026-10-06 changed class. Every MATCH case was also
+re-translated offline: none moved to NEEDS_REVIEW, and the only changed formulas are the
+`ROUNDUP` / `ROUNDDOWN` increment form and the new coercions.
+
+**M0 (Snowflake, unchanged translator) re-run the same day:** 64 of 71 MATCH, 0 silent, 4 warned
+(BL-333), 2 NEEDS_REVIEW, 1 error-equivalent, the same as its after-fixes run
+(`tools/formula-fidelity/runs/2026-10-07-snowflake-m0-regression.json`). **60-case Excel
+regression set:** 58 match their reviewed answers and 2 differ by documented rule, unchanged.
+
+**Run.** 2026-10-06T20:34Z (2026-10-07 local), profile `se-thoughtspot`, connection `APJ_TAB`,
+227 cases imported (3 NEEDS_REVIEW were not sent), 674 s (650 s AgentQL; the cluster timed out one
+fetch, which was retried). Teardown deleted the Model and the Table and confirmed both absent,
+and dropped the warehouse table and confirmed it with `SHOW TABLES`. The startup sweep found no
+earlier `ZZ_FIDELITY_*` objects. After both runs, `ts metadata search` finds no `ZZ_FIDELITY_%`
+or `ZZ_PROBE_M1FIX%` objects and `SHOW TABLES LIKE 'ZZ_%'` in `AGENT_SKILLS.PUBLIC` is empty.
+The three scratch probe Models behind the new probe-record rows (§7) were deleted and confirmed
+absent.
+
+### Review round (2026-10-07, second live run)
+
+An independent review of PR #574 found more defects, and they are fixed in the same PR:
+- **DOUBLE representation error in the rounding compositions.** `1.1 * 100` is
+  `110.00000000000001`, so `ceil` gave 1.11. A DOUBLE is now snapped with `round ( … , 1e-9 )`
+  first, and more than 15 digits is NEEDS_REVIEW.
+- **Cross-type comparison folds and DOUBLE-to-text are now APPROXIMATED**, with traps that
+  name the assumption.
+- **Number literals are written as text in Excel's General format.**
+- **`to_double` of non-numeric text fails the whole query** (probed live; it does not return
+  NULL). `IFERROR` around `VALUE`, and `ISNUMBER` of `VALUE`, therefore use `TRY_TO_DOUBLE`.
+- **A slashed day/month date is APPROXIMATED**, with a locale trap.
+- **The `COERCION_EMITS` validator exemption is limited to the nodes the coercions add.**
+- **The exact leak scan now covers every tracked file.**
+
+The second live run, at commit `323d282` (recorded in the run header, which now carries the
+commit), replaced `tools/formula-fidelity/runs/2026-10-07-excel-m1.json`. Results:
+- **0 import failures and 2 silent wrong answers**, the two named above. Both now carry their
+  cause in the results: BL-351 (platform) and BL-356 (oracle dispute).
+- **215 MATCH**, 2 warned, 3 blank divergences, 2 error divergences, 3 error-equivalent and 3
+  NEEDS_REVIEW, the same classes as the first after-fixes run.
+- 17 results are now APPROXIMATED, up from the first run because of the review's downgrading
+  traps. None of them changed class.
+- No case that matched on 2026-10-06 changed class.
+
+M0 re-run at the same commit: 64 of 71, 0 silent, 4 warned. Cleanup was confirmed on both
+sides (the run's own teardown, then `ts metadata search` and `SHOW TABLES LIKE 'ZZ_%'`, both
+empty).
+
 *Everything below is generated from the redacted results; regenerate with `run_literal.py rebuild`.*
 
 <!-- generated by tools/formula-fidelity/run_literal.py: edit above this line -->

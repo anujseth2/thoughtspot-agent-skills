@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from ts_cli.excel import nodes as X
 from ts_cli.excel import tsast as T
-from ts_cli.excel.helpers import from_text, literal_int, need
+from ts_cli.excel.helpers import from_text, graft, literal_int, need
 from ts_cli.formula_common import ts_weekday_number
 
 def _nullary(fn: str):
@@ -20,7 +20,7 @@ def _nullary(fn: str):
 def _part(fn: str):
     def handler(tr, n):
         need(tr, n, 1, 1)
-        return T.call(fn, tr.expr(n.args[0]))
+        return T.call(fn, tr.date(n.args[0]))
     return handler
 
 
@@ -36,7 +36,7 @@ def _datedif(tr, n):
     unit = n.args[2]
     if not isinstance(unit, X.Str):
         tr.review("DATEDIF with a non-literal unit has no rule")
-    start, end = tr.expr(n.args[0]), tr.expr(n.args[1])
+    start, end = tr.date(n.args[0]), tr.date(n.args[1])
     u = unit.value.upper()
     if u == "D":
         return T.call("diff_days", end, start)
@@ -49,21 +49,22 @@ def _datedif(tr, n):
 
 def _eomonth(tr, n):
     need(tr, n, 2, 2)
-    months = literal_int(n.args[1])
-    ahead = (T.lit_number(str(months + 1)) if months is not None
-             else T.binop("+", tr.expr(n.args[1]), T.lit_number("1")))
-    som = T.call("start_of_month", tr.expr(n.args[0]))
+    offset = tr.int_arg(n.args[1], signed=True)
+    months = T.number_value(offset)
+    ahead = (T.lit_number(str(int(months) + 1)) if months is not None
+             else T.binop("+", offset, T.lit_number("1")))
+    som = T.call("start_of_month", tr.date(n.args[0]))
     return T.call("add_days", T.call("add_months", som, ahead), T.unop("-", T.lit_number("1")))
 
 
 def _edate(tr, n):
     need(tr, n, 2, 2)
-    return T.call("add_months", tr.expr(n.args[0]), tr.expr(n.args[1]))
+    return T.call("add_months", tr.date(n.args[0]), tr.int_arg(n.args[1], signed=True))
 
 
 def _days(tr, n):
     need(tr, n, 2, 2)
-    return T.call("diff_days", tr.expr(n.args[0]), tr.expr(n.args[1]))
+    return T.call("diff_days", tr.date(n.args[0]), tr.date(n.args[1]))
 
 
 # WEEKDAY return_type -> (first day, base), per the Excel map's WEEKDAY row.
@@ -77,8 +78,9 @@ def _weekday(tr, n):
     if rtype not in _WEEKDAY_TYPES:
         tr.review("WEEKDAY with this return_type has no rule (types 1, 2, 3, 11–17 are covered)")
     first, base = _WEEKDAY_TYPES[rtype]  # week-start trap: formula_translate.traps (OI-2)
-    date = T.to_text(tr.expr(n.args[0]))
-    return from_text(ts_weekday_number(date, first_day=first, base=base))
+    date_node = tr.date(n.args[0])
+    date = T.to_text(date_node)
+    return graft(from_text(ts_weekday_number(date, first_day=first, base=base)), date_node)
 
 
 # NETWORKDAYS.INTL weekend codes -> non-working day_number_of_week values (1 = Monday).
@@ -119,10 +121,11 @@ def _networkdays(intl: bool):
                       "code 1 is live-verified (probe record §6); compose it from the Excel "
                       "map's NETWORKDAYS.INTL row")
         weekend = _weekend_days(tr, n.args[2] if intl and len(n.args) > 2 else None)
-        start, end = T.to_text(tr.expr(n.args[0])), T.to_text(tr.expr(n.args[1]))
+        start_node, end_node = tr.date(n.args[0]), tr.date(n.args[1])
+        start, end = T.to_text(start_node), T.to_text(end_node)
         tr.trap("NETWORKDAYS counting form assumes end >= start (Excel returns a negative "
                 "count for a reversed range)")
-        return from_text(counting_form(start, end, weekend))
+        return graft(from_text(counting_form(start, end, weekend)), start_node, end_node)
     return handler
 
 
