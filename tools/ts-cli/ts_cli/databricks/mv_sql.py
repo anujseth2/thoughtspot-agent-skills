@@ -41,6 +41,9 @@ from ts_cli.databricks.mv_sql_constructs import (
 # sites are unaffected.
 from ts_cli.formula_common import (
     UntranslatableError,
+    expr_is_aggregated,
+    sql_passthrough_call,
+    sql_substr_to_ts,
     ts_round_from_sql_digits,
     ts_weekday_number,
 )
@@ -269,7 +272,10 @@ def _keyword_unit(text: str, cur: _Cursor, resolver,
 # --- function map: ts-databricks-formula-translation.md as data ------------
 
 _RENAME = {
-    "CONCAT": "concat", "LENGTH": "strlen", "SUBSTRING": "substr",
+    "CONCAT": "concat", "LENGTH": "strlen",
+    # SUBSTRING / SUBSTR deliberately do NOT live here (BL-340): Databricks' pos
+    # is 1-based (negative counts from the end), ThoughtSpot substr's zero-based
+    # — see formula_common.sql_substr_to_ts.
     # BL-171: TRIM/LTRIM/RTRIM/REPLACE/STARTSWITH/ENDSWITH deliberately do NOT
     # live here — none of those ThoughtSpot names exists (live-verified
     # 2026-07-29/30, se-thoughtspot; error_code 14516). They are handled by
@@ -336,7 +342,10 @@ def _call_dbx_dayofweek(args: list[str]) -> str:
 def _call_dbx_weekday(args: list[str]) -> str:
     _need(args, 1, "WEEKDAY")
     return _dbx_weekday_number("WEEKDAY", args[0])
-_DATEDIFF_UNIT = {"DAY": "diff_days", "MONTH": "diff_months"}
+# Units of the 3-argument datediff(unit, start, end) (datediff3 docs) — all emitted as
+# an exact pass-through except DAY over DATE columns; see _call_datediff (BL-345).
+_DATEDIFF_UNITS = frozenset({"MICROSECOND", "MILLISECOND", "SECOND", "MINUTE", "HOUR",
+                             "DAY", "WEEK", "MONTH", "QUARTER", "YEAR"})
 _NULLIF0 = "\x00NULLIF0\x00"  # marker prefix; collapsed before joining
 
 
@@ -368,11 +377,8 @@ def _call(name: str, cur: _Cursor, resolver) -> str:
         return _finish_aggregate(name, args[0], cur, resolver)
     if name == "DATE_TRUNC":
         return _call_date_trunc(args)
-    if name == "MONTHS_BETWEEN":
-        # months_between(expr1, expr2) is positive when expr1 is later — the
-        # same later-first order as diff_months, so no swap (BL-336).
-        _need(args, 2, name)
-        return _emit("diff_months", [args[0], args[1]])
+    if name in _EXACT_FORM_CALLS:  # BL-340 / BL-342
+        return _EXACT_FORM_CALLS[name](name, args)
     if name == "LOCATE":
         _need(args, 2, name)
         return _emit("strpos", [args[1], args[0]])
@@ -388,6 +394,49 @@ def _call(name: str, cur: _Cursor, resolver) -> str:
         f"function '{name}' is not in "
         f"ts-databricks-formula-translation.md — extend the mapping doc and "
         f"mv_sql._RENAME together")
+
+
+def _row_level_only(name: str, args: list[str]) -> None:
+    """A row-level sql_*_op pass-through cannot wrap an aggregate."""
+    if any(expr_is_aggregated(a) for a in args):
+        raise UntranslatableError(
+            f"{name} over an aggregate has no exact ThoughtSpot form (its exact form is a "
+            "row-level pass-through)")
+
+
+def _call_dbx_substr(name: str, args: list[str]) -> str:
+    """1-based SUBSTRING -> zero-based substr, or an exact pass-through (BL-340)."""
+    out = sql_substr_to_ts(name, args)
+    if out.startswith("sql_"):
+        _row_level_only(name, args)
+    return out
+
+
+def _call_months_between(name: str, args: list[str]) -> str:
+    """months_between(expr1, expr2[, roundOff]) -> exact pass-through (BL-342).
+
+    Databricks returns FRACTIONAL months — 31-day months; integral (time of day
+    ignored) when both are the same day of the month or both month ends; "rounded to
+    8 digits unless roundOff = false" (docs.databricks.com/aws/en/sql/language-manual/
+    functions/months_between). ``diff_months`` counts boundaries crossed, so the old
+    rename was a silent wrong number. The source's own argument order is kept.
+    """
+    if len(args) not in (2, 3):
+        raise UntranslatableError(
+            f"MONTHS_BETWEEN expects 2 or 3 arguments, got {len(args)}")
+    if len(args) == 3 and args[2].strip().lower() not in ("true", "false"):
+        raise UntranslatableError("MONTHS_BETWEEN roundOff must be a literal true/false")
+    _row_level_only("MONTHS_BETWEEN", args)
+    return sql_passthrough_call("sql_double_op", "months_between", args)
+
+
+_EXACT_FORM_CALLS = {"MONTHS_BETWEEN": _call_months_between,
+                     "SUBSTRING": _call_dbx_substr, "SUBSTR": _call_dbx_substr}
+# Every ThoughtSpot name each handler above can emit — read by check_mapping_code_sync.py
+# (requirement D), which cannot see through function-valued dispatch maps.
+EXACT_FORM_EMITS = {"MONTHS_BETWEEN": ("sql_double_op",),
+                    "SUBSTRING": ("substr", "strlen", "sql_string_op"),
+                    "SUBSTR": ("substr", "strlen", "sql_string_op")}
 
 
 def _call_round(args: list[str]) -> str:
@@ -634,24 +683,42 @@ def _call_datediff(cur: _Cursor, resolver) -> str:
     datediff(endDate, startDate) already has that order, so it passes
     through; the 3-arg datediff(unit, start, end) is end - start, so its
     date args are swapped. Emitting earlier-first flips every sign (BL-336).
-    DATEDIFF(MONTH, ...) counts complete months; diff_months counts month
-    boundaries — they differ by one when end's day-of-month < start's.
+
+    The 3-arg form is a synonym of timestampdiff and counts WHOLE elapsed units
+    in UTC, a DAY being 86400 s; "one month is considered elapsed when the
+    calendar month has increased and the calendar day and time is equal or
+    greater to the start" (docs.databricks.com/aws/en/sql/language-manual/
+    functions/datediff3; returns BIGINT). Every native diff_* counts calendar
+    BOUNDARIES instead (Jan 31 -> Feb 1: 0 months in Databricks, 1 in
+    ThoughtSpot), so the 3-arg form is an exact sql_int_op pass-through (BL-345)
+    — except DAY over two columns known to be DATE, where whole elapsed days and
+    date boundaries agree and diff_days is exact. The resolver says which
+    references are DATE through ``date_only_refs``; without it, DAY passes through.
 
     The 3-arg unit arrives as a bare ident (e.g. MONTH) that must NOT be
     resolved as a column — peek for '<unit-ident> ,' before parsing args.
     """
     kind, text = cur.peek()
     nk, nt = cur.peek(1)
-    if (kind == "ident" and text.upper() in _DATEDIFF_UNIT
+    if (kind == "ident" and text.upper() in _DATEDIFF_UNITS
             and nk == "op" and nt == ","):
         cur.advance()
         cur.advance()
         rest = _call_args(cur, resolver)
         _need(rest, 2, "DATEDIFF(unit, …)")
-        return _emit(_DATEDIFF_UNIT[text.upper()], [rest[1], rest[0]])
+        return _datediff3(text.upper(), rest, resolver)
     rest = _call_args(cur, resolver)
     _need(rest, 2, "DATEDIFF")
     return _emit("diff_days", [rest[0], rest[1]])
+
+
+def _datediff3(unit: str, args: list[str], resolver) -> str:
+    """``datediff(unit, start, end)`` with ``args = [start, end]`` (BL-345)."""
+    date_only = getattr(resolver, "date_only_refs", ()) or ()
+    if unit == "DAY" and all(a.strip() in date_only for a in args):
+        return _emit("diff_days", [args[1], args[0]])
+    _row_level_only("DATEDIFF", args)
+    return f'sql_int_op ( "DATEDIFF({unit}, {{0}}, {{1}})" , {args[0]} , {args[1]} )'
 
 
 def _call_nullif(args: list[str]) -> str:

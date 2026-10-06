@@ -20,12 +20,14 @@ from typing import Callable
 from ts_cli.formula_common import (
     CAST_MAP_FULL,
     UntranslatableError,
-    expr_is_aggregated,
     sql_digits_to_ts_increment,
     sql_int_digits,
     ts_round_from_sql_digits,
     ts_weekday_number,
 )
+from ts_cli.sv_sql_exact import EXACT_FORM_CALLS as _EXACT_FORM_CALLS
+from ts_cli.sv_sql_exact import datediff_to_ts
+from ts_cli.sv_sql_exact import is_aggregated as _is_aggregated
 
 
 _TOKEN_RE = re.compile(
@@ -253,8 +255,9 @@ def _keyword_unit(text: str, cur: _Cursor, resolver,
 # --- function map: ts-snowflake-formula-translation.md as data ---------------
 
 _RENAME = {
-    "CONCAT": "concat", "LENGTH": "strlen", "SUBSTR": "substr",
-    "SUBSTRING": "substr",
+    "CONCAT": "concat", "LENGTH": "strlen",
+    # SUBSTR / SUBSTRING deliberately do NOT live here (BL-340): Snowflake's start
+    # is 1-based, ThoughtSpot substr's zero-based — see _EXACT_FORM_CALLS.
     # BL-171: TRIM/LTRIM/RTRIM/REPLACE/STARTSWITH/ENDSWITH deliberately do NOT
     # live here — none of those ThoughtSpot names exists (live-verified
     # 2026-07-29/30, se-thoughtspot; error_code 14516). They are handled by
@@ -276,10 +279,9 @@ _RENAME = {
     # to day_number_of_week is a silent wrong number — see _WEEKDAY below.
     "DAYOFYEAR": "day_number_of_year",
     "WEEKOFYEAR": "week_number_of_year",
-    # MONTHS_BETWEEN(d1, d2) is positive when d1 is later — already the
-    # later-first order diff_months takes, so it maps in order, NOT swapped
-    # (BL-336). Not exact: fractional vs month boundaries crossed.
-    "MONTHS_BETWEEN": "diff_months",
+    # MONTHS_BETWEEN deliberately does NOT live here (BL-342): it is fractional
+    # (31-day months, integral only on the same day or both month ends), while
+    # diff_months counts boundaries crossed — see _call_months_between.
     "DATE": "date",
     "SUM": "sum", "AVG": "average", "MIN": "min", "MAX": "max",
     "MEDIAN": "median", "STDDEV": "stddev", "VARIANCE": "variance",
@@ -327,8 +329,10 @@ _EXTRACT_WEEKDAY = {
 def _weekday_number(name: str, date_expr: str) -> str:
     first_day, base = _WEEKDAY[name]
     return ts_weekday_number(date_expr, first_day=first_day, base=base)
-_DATEDIFF_UNIT = {"DAY": "diff_days", "MONTH": "diff_months",
-                  "YEAR": "diff_days", "SECOND": "diff_time"}
+
+
+# DATEDIFF units and the non-rename forms (SUBSTR, MONTHS_BETWEEN, TO_CHAR) live in
+# sv_sql_exact.py (BL-340..343).
 _DATEADD_UNIT = {"DAY": "add_days", "WEEK": "add_days",
                  "MONTH": "add_months", "YEAR": "add_months"}
 # Canonical map now lives in formula_common so both engines share one copy
@@ -349,7 +353,6 @@ _SPECIAL_DISPATCH: dict[str, str] = {
 }
 _IFF_NAMES = frozenset({"IFF", "IF"})
 _DIV0_NAMES = frozenset({"DIV0", "DIV0NULL"})
-_TO_STRING_NAMES = frozenset({"TO_CHAR", "TO_VARCHAR"})
 _TO_DOUBLE_NAMES = frozenset({"TO_NUMBER", "TO_DECIMAL", "TO_NUMERIC"})
 _CAST_NAMES = frozenset({"CAST", "TRY_CAST"})
 _ARG_SWAP = {"LOCATE": ("strpos", 2)}
@@ -386,8 +389,8 @@ def _call(name: str, cur: _Cursor, resolver) -> str:
 def _call_with_args(name: str, cur: _Cursor, resolver) -> str:
     """Handle functions that parse args first, then dispatch."""
     args = _call_args(cur, resolver, agg=name)
-    if name in _TO_STRING_NAMES:
-        return _emit("to_string", args[:1])
+    if name in _EXACT_FORM_CALLS:  # BL-340 / BL-342 / BL-343
+        return _EXACT_FORM_CALLS[name](name, args, resolver)
     if name in _TO_DOUBLE_NAMES:
         return _emit("to_double", args[:1])
     if name == "NULLIF":
@@ -427,13 +430,6 @@ def _round_args(args: list[str], name: str) -> tuple[str, str | None]:
         raise UntranslatableError(
             f"{name} expects 1 or 2 arguments, got {len(args)}")
     return args[0], (args[1] if len(args) == 2 else None)
-
-
-def _is_aggregated(x: str, resolver) -> bool:
-    """True if translated ``x`` is aggregated — by its text, or because it holds a
-    metric reference the resolver handed out (``[formula_X]`` hides it)."""
-    refs = getattr(resolver, "metric_refs", ()) or ()
-    return expr_is_aggregated(x) or any(r in x for r in refs)
 
 
 def _call_round(args: list[str], resolver=None) -> str:
@@ -675,13 +671,7 @@ def _call_datediff(cur: _Cursor, resolver) -> str:
     cur.expect_op(",")
     args = _call_args(cur, resolver)
     _need(args, 2, "DATEDIFF(unit, ...)")
-    fn = _DATEDIFF_UNIT.get(unit)
-    if fn is None:
-        raise UntranslatableError(
-            f"DATEDIFF unit '{unit}' not mapped (DAY|MONTH|YEAR|SECOND)")
-    if unit == "YEAR":
-        return f"( {_emit('diff_days', [args[1], args[0]])} / 365 )"
-    return _emit(fn, [args[1], args[0]])
+    return datediff_to_ts(unit, args, resolver)
 
 
 def _call_dateadd(cur: _Cursor, resolver) -> str:
