@@ -268,6 +268,7 @@ are roughly ordered by value÷effort.
 | BL-284 | a physical table and a SQL View sharing one relation name in one datasource are not fully separable from the parsed representation — `_sql_view_owns_column` is a conservative heuristic, undecidable when both declare the same column name; not present in the corpus | next Tableau converter pass |
 | BL-313 | MERGE mode skips SQL View disambiguation, so merging into a model that GENERATE built with this CLI emits the bare name where the target expects the qualified one | next Tableau converter pass |
 | BL-314 | nothing tells an author that a deliberate parse→TML transformation must also be declared to `tableau/verify.py`; three PRs have broken the fidelity gate the same way and the rule is prose in CLAUDE.md, not a check | next validator pass |
+| BL-337 | ts-object-formula-translate: offer a warehouse SQL pass-through for scalar functions (`--prefer-passthrough`) — evaluate performance and trade-offs | revisit after v1 testing feedback |
 
 ### Tier 4 — Deferred
 
@@ -12543,3 +12544,34 @@ Each one was a silent wrong number: the import and the lint were clean, and the 
 complete months, while `diff_months` counts month boundaries. `MONTHS_BETWEEN` is fractional. Both
 differ from `diff_months` by up to one month. `timestampdiff` and the `YEAR`/`QUARTER`/`WEEK` units of
 3-arg `DATEDIFF` are still unmapped in `mv_sql.py`, so they raise rather than translate.
+
+## BL-337 — ts-object-formula-translate: offer a warehouse SQL pass-through for scalar functions (`--prefer-passthrough`) — evaluate performance and trade-offs `Tier 3`
+
+**Filed:** 2026-10-06. **Status:** OPEN (future review).
+**Source:** user question during `ts-object-formula-translate` v1 (PR #560).
+
+**The question (user, 2026-10-06).** When the warehouse is known and has a single native scalar
+function equivalent, is a `sql_*_op` pass-through better than the native ThoughtSpot
+composition? The worry is that the native form expands into verbose SQL. The NETWORKDAYS
+example on Databricks repeated `DATEDIFF(...)` about 10 times per column, because ThoughtSpot
+inlines helper formulas.
+
+**Current reasoning (unmeasured):**
+- Both Spark/Databricks and Snowflake eliminate common subexpressions within a projection, and
+  per-row arithmetic is cheap next to scan and GROUP BY, so a runtime difference is expected to
+  be negligible.
+- Neither warehouse has a native NETWORKDAYS, so the pass-through would need a UDF, which is
+  often slower.
+- Pass-through costs: dialect lock-in; it is opaque to ThoughtSpot's planner (aggregate-aware
+  routing, type handling); the risk of picking the wrong `sql_*_op` variant (Ossie map E7).
+- Pass-through is already chosen for correctness where ThoughtSpot has no native equivalent
+  (regex, trim/replace/case, percentiles, LISTAGG, case-sensitive comparison per BL-333).
+
+**To do when revisited:** benchmark the native vs pass-through forms on a real table (e.g.
+`AGENT_SKILLS.DUNDER_MIFFLIN.DM_ORDER` on Databricks, and on Snowflake), comparing warehouse
+query-profile times. Then, if justified, add `--prefer-passthrough`, with the warehouse
+auto-detected from the Model's table connection, offering the pass-through alongside the native
+form with the trade-offs stated. Also consider recommending a precomputed warehouse column or
+view for heavy compositions.
+
+**Target:** revisit after v1 testing feedback.
