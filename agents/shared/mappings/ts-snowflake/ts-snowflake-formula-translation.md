@@ -42,6 +42,35 @@ All examples in this document use the correct single-line format.
 
 ---
 
+## String literals and `a * b / c` (BL-365, ts-cli 0.165.0)
+
+ThoughtSpot reads a doubled quote in a single-quoted literal as **two** quotes (`'it''s'` is
+`it''s`), its backslash escape fails before a space, and it reads `a * b / c` as
+`a * ( b / c )` — with a division of two integers fixed-point at scale 6 (live, se-thoughtspot
+2026-10-07; [formula reference](../../schemas/thoughtspot-formula-patterns.md#string-literals)).
+So in the from-direction a Snowflake literal is decoded (`''` and `\'` are one quote, `\\` one backslash; any other backslash escape is refused), a quote-bearing literal in a `sql_*_op` or `LIKE` template is bound as `{1}` rather than inlined (one that also holds a double quote, a brace or a backslash is still refused — unprobed as a bound value), a literal holding a quote is emitted **double-quoted** (`"O'Brien"`), a
+backslash doubled, and every product under a division bracketed (`( a * b ) / c`) — the
+translator's last step, `formula_text.ts_finalize_formula`. Copying `'O''Brien'` across was a silent
+wrong answer.
+
+### String literals, ThoughtSpot → Snowflake (BL-365, #579 review)
+
+**To-direction (ThoughtSpot → Snowflake)** — read each ThoughtSpot literal as ThoughtSpot does,
+then write Snowflake's own `'…'` literal with every `'` doubled:
+
+| ThoughtSpot literal | ThoughtSpot reads | Snowflake |
+|---|---|---|
+| `'Active'` | `Active` | `'Active'` |
+| `"O'Brien"` (double-quoted — **a string literal**, never an identifier) | `O'Brien` | `'O''Brien'` |
+| `'it''s'` | `it''s` (two quotes) | `'it''''s'` |
+| `'a\\b'` or `"a\\b"` | `a\b` | `'a\\b'` (Snowflake reads `\\` as one backslash) |
+| `concat ( 'say ' , '"' , 'hi' , '"' )` | `say "hi"` | `CONCAT('say ', '"', 'hi', '"')` |
+
+A double-quoted token as the **first argument of a `sql_*_op` call** is its template, not a
+literal — the only other place `"…"` appears in a ThoughtSpot formula. A double-quoted **name**
+in the Snowflake `expr` (`t."date"`, `ts-to-snowflake-rules.md`) is a Snowflake identifier and has
+nothing to do with a ThoughtSpot `"…"` literal.
+
 ## Translation Decision Flowchart
 
 Use this to quickly determine which section to consult for a given formula:
@@ -190,6 +219,10 @@ Verified 2026-07-10, SE cluster.
 | `log10 ( [x] )` → `LOG(10, x)` | `LOG(10, x)` → `log10 ( [x] )` |
 | `least ( [a] , [b] , ... )` → `LEAST(a, b, ...)` | `LEAST(a, b, ...)` → `least ( [a] , [b] , ... )` |
 | `greatest ( [a] , [b] , ... )` → `GREATEST(a, b, ...)` | `GREATEST(a, b, ...)` → `greatest ( [a] , [b] , ... )` |
+| `sin ( [x] )` → `SIN(x)` (and `cos`, `tan`, `asin`, `acos`, `atan` alike) | `SIN(x)`, `COS(x)`, `TAN(x)`, `ASIN(x)`, `ACOS(x)`, `ATAN(x)` → `sin ( [x] )`, `cos`, `tan`, `asin`, `acos`, `atan` — **ThoughtSpot trigonometry is in radians**, like Snowflake's (`sin ( 30 )` compiles to `SIN(30)` = −0.988, live 2026-10-07, probe record §7; BL-364) |
+| — | `COT(x)` → `( 1 / tan ( [x] ) )` (BL-364) |
+| — | `ATAN2(y, x)` → `sql_double_op ( "ATAN2({0}, {1})" , [y] , [x] )` — no catalogued native form; row-level only (BL-364) |
+| — | `PI()` → `sql_double_op ( "PI()" )` — the warehouse's own double; `DEGREES(x)` → `( ( [x] * 180 ) / sql_double_op ( "PI()" ) )`, `RADIANS(x)` → `( ( [x] * sql_double_op ( "PI()" ) ) / 180 )` — native, so they work over an aggregate. The product is bracketed: ThoughtSpot reads `a * b / c` as `a * ( b / c )` (BL-365) |
 
 ### Division and zero (BL-357, corrected 2026-10-07)
 
@@ -226,7 +259,7 @@ whose `expr` contains `LEAST(...)` or `GREATEST(...)`, classify the result as a
 | `concat ( [a] , [b] )` → `CONCAT(a, b)` | `CONCAT(a, b)` → `concat ( [a] , [b] )` |
 | `concat ( [a] , ' ' , [b] )` → `CONCAT(a, ' ', b)` *(supports N args)* | `CONCAT(a, ' ', b)` → `concat ( [a] , ' ' , [b] )` |
 | — | `a \|\| b \|\| c` → `concat ( [a] , [b] , [c] )` — NULL-propagating in both; a chain mixed with another operator is refused; `concat` takes Text only, so a numeric operand fails at import (BL-362; it was refused outright) |
-| — | `x LIKE 'p'` / `ILIKE` / `RLIKE` / `REGEXP`, and `NOT LIKE …` → `sql_bool_op ( "{0} LIKE 'p'" , [x] )` — Snowflake's own operator, so `LIKE` stays case-sensitive (no BL-333 divergence) and `RLIKE` keeps its whole-string regex match. A non-literal pattern, `ESCAPE`, or a pattern holding a double quote, a brace or a backslash is refused (BL-362) |
+| — | `x LIKE 'p'` / `ILIKE` / `RLIKE` / `REGEXP`, and `NOT LIKE …` → `sql_bool_op ( "{0} LIKE 'p'" , [x] )` — Snowflake's own operator, so `LIKE` stays case-sensitive (no BL-333 divergence) and `RLIKE` keeps its whole-string regex match. A non-literal pattern, `ESCAPE`, or a pattern holding a double quote, a brace or a backslash is refused; a pattern holding a quote is bound, `sql_bool_op ( "{0} LIKE {1}" , x , "O'B%" )` (BL-365) (BL-362) |
 | `substr ( [x] , [start] , [len] )` → `SUBSTR(x, start + 1, len)` — fold a literal start (`substr ( x , 1 , 3 )` → `SUBSTR(x, 2, 3)`) | `SUBSTR(x, start, len)` → `substr ( [x] , start - 1 , [len] )`, folded for a literal start: `SUBSTR(x, 2, 3)` → `substr ( [x] , 1 , 3 )`; `SUBSTR(x, start)` → `substr ( [x] , start - 1 , strlen ( [x] ) )`. **Not a rename (BL-340, fixed ts-cli 0.160.0):** ThoughtSpot `substr` is **zero**-based (`substr ( s , 2 , 3 )` compiles to `SUBSTRING(s, (2 + 1), 3)`) and Snowflake's start is 1-based, so the old identity row returned every substring shifted one character (`'Apple'` → `'ple'`, not `'ppl'`). A literal start **≤ 0**, or a non-literal start, becomes `sql_string_op ( "SUBSTR({0}, -3, 2)" , [x] )` (start as `{1}` when it is a column): Snowflake counts a negative start from the end and treats 0 as 1 ([SUBSTR](https://docs.snowflake.com/en/sql-reference/functions/substr)), which `substr` does not define. Live: formula fidelity M0 after-fixes run, 2026-10-06 (`sf-str-004`, `-009`, `-010`, `-011` MATCH) |
 | `substr ( [x] , [start] , [len] )` → `SUBSTRING(x, start + 1, len)` | `SUBSTRING(x, start, len)` → same as `SUBSTR` above (Snowflake `SUBSTRING` is a synonym) — `substr ( [x] , start - 1 , [len] )`, pass-through for a start ≤ 0 or a non-literal start (BL-340) |
 | `strlen ( [x] )` → `LENGTH(x)` | `LENGTH(x)` → `strlen ( [x] )` |

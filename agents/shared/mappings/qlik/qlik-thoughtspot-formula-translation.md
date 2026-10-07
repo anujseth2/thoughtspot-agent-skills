@@ -21,6 +21,25 @@ se-thoughtspot (2026-07-30) or replaced it with a form that was probed.
 
 ---
 
+## String literals and `a * b / c` (BL-365, ts-cli 0.165.0)
+
+ThoughtSpot reads a doubled quote in a single-quoted literal as **two** quotes (`'it''s'` is
+`it''s`), its backslash escape fails before a space, and it reads `a * b / c` as
+`a * ( b / c )` — with a division of two integers fixed-point at scale 6 (live, se-thoughtspot
+2026-10-07; [formula reference](../../schemas/thoughtspot-formula-patterns.md#string-literals)).
+So a Qlik literal is decoded (`''` is one quote), a literal holding a quote is emitted **double-quoted** (`"O'Brien"`), a
+backslash doubled, and every product under a division bracketed (`( a * b ) / c`) — the
+translator's last step, `formula_text.ts_finalize_formula`. Copying `'O''Brien'` across was a silent
+wrong answer.
+
+## String concatenation — `a & b` (#579 review, ts-cli 0.165.0)
+
+Qlik `a & b & c` → `concat ( a , b , c )`. It was rewritten to `+`, which ThoughtSpot uses for
+numbers only — even inside a literal (`'A&B'` became `'A+B'`). The rewrite is quote-aware and
+recursive (`Upper(s & 'x')`); `&` binds looser than arithmetic and tighter than comparison, so a
+segment with both (`s & 'a' = 'xa'`) is left for review. `concat` takes Text only: wrap a numeric
+operand in `to_string` (an unwrapped one fails at import, loudly).
+
 ## Aggregation
 
 | # | Qlik Sense | ThoughtSpot | Status | Notes |

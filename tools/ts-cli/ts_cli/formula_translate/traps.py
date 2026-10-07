@@ -44,7 +44,8 @@ _WEEK_OUT = re.compile(
     r"week_number_of_month|week_number_of_quarter)\s*\(")
 _STRCMP_OUT = re.compile(
     r"(\bcontains\s*\(|\bstrpos\s*\(|\bbegins_with\s*\(|\bends_with\s*\(|"
-    r"(?:=|!=|<>)\s*'|'\s*(?:=|!=|<>))")
+    # a literal is single- or (holding a quote or backslash, BL-365) double-quoted
+    r"(?:=|!=|<>)\s*['\"]|['\"]\s*(?:=|!=|<>))")
 _PASSTHROUGH_OUT = re.compile(r"\bsql_(\w+?)_op\s*\(")
 _COUNT_STAR = re.compile(r"\bcount\s*\(\s*(?:\*|1)\s*\)", re.I)
 _SQL_LEFTOVER = re.compile(r"\b(DISTINCT|OVER|PARTITION\s+BY|QUALIFY|WITHIN\s+GROUP)\b", re.I)
@@ -55,7 +56,9 @@ _SQL_KEYWORD_REF = re.compile(
     r"AND|OR|IN|BETWEEN|CASE|WHEN|THEN|ELSE|END|EXISTS|ANY|ALL)\s*\]", re.I)
 _BARE_TOTAL = re.compile(r"\bTOTAL\b", re.I)
 _DOUBLE_EQ = re.compile(r"==")
-_PLUS_STRING = re.compile(r"''\s*\+|\+\s*''")
+# a string literal (blanked to '' in the code text) or a concat ( … ) beside a `+`: the
+# double-quoted and concat literal forms (BL-365) must not slip past the guard (#579 review)
+_PLUS_STRING = re.compile(r"''\s*\+|\+\s*''|\+\s*concat\s*\(|\bconcat\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*\+")
 _COLUMN_CMP = re.compile(r"\]\s*(?:=|!=|<>)\s*\[")
 _CALENDAR_OUT = re.compile(r"\bstart_of_(month|quarter|year)\s*\(")
 _SCALED_CAST_SRC = re.compile(
@@ -140,6 +143,11 @@ def output_guard(expr: str, allow: frozenset = frozenset(), source: str = "") ->
     bare ``TOTAL``, ``==``, ``+`` beside a string literal (ThoughtSpot concatenates with
     ``concat``), and the leftover SQL keywords of ``leftover_sql``.
     """
+    from ts_cli.formula_text import ts_literals_unbalanced
+    if ts_literals_unbalanced(expr):
+        return ("a string literal does not close where ThoughtSpot would read it (a "
+                "backslash-escaped quote, 'it\\'s', or an unbalanced quote): write a quote "
+                "inside text as a double-quoted literal, \"it's\" (BL-365)")
     code = _code(expr)
     for m in _CALL.finditer(code):
         name = m.group(1)
