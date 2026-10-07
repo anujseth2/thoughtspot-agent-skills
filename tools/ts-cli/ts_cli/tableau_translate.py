@@ -73,6 +73,7 @@ from ts_cli.tableau.functions import (  # noqa: F401
     _convert_datepart,
     _convert_datetrunc,
     _convert_zn,
+    exact_week_starts,
     map_date_functions,
     map_functions,
 )
@@ -81,10 +82,11 @@ from ts_cli.tableau.functions import (  # noqa: F401
 # validation warning — the assumption must reach the conversion report, not just
 # a code comment (BL-334).
 WEEK_START_ASSUMED_NOTE = (
-    "DATEPART('weekday', …) numbered from Sunday = 1: the datasource records no "
-    "Week start and the formula passes no start_of_week, so Tableau would use the "
-    "author's locale (Sunday in the US, Monday in the EU). Confirm the week start "
-    "or add start_of_week to the source formula (BL-334)")
+    "DATEPART('weekday' / 'week', …), WEEK(…) or DATETRUNC('week', …) translated with "
+    "a Sunday week start: the datasource records no Week start and the formula passes "
+    "no start_of_week, so Tableau would use the author's locale (Sunday in the US, "
+    "Monday in the EU). Confirm the week start or add start_of_week to the source "
+    "formula (BL-334)")
 
 from ts_cli.tableau.strings_types import (  # noqa: F401
     _CONCAT_OPERAND,
@@ -105,7 +107,7 @@ from ts_cli.tableau.lod import (  # noqa: F401
 )
 from ts_cli.formula_text import ts_finalize_formula
 from ts_cli.formula_week import (
-    WEEK_DIFF_DAYS_NOTE, is_week_review_note, week_start_mismatch_note, week_start_note)
+    WEEK_DIFF_DAYS_NOTE, is_week_review_note, week_start_note)
 from ts_cli.tableau.literals import (  # noqa: F401
     PLACEHOLDER_RE,
     is_string_placeholder,
@@ -306,13 +308,9 @@ def week_review(expr: str, notes: dict[str, int]) -> dict:
     the formula is migrated but belongs under "Formulas needing review", the
     converter's equivalent of ``ts formula translate``'s APPROXIMATED."""
     review = [WEEK_START_ASSUMED_NOTE] if notes.get(WEEK_START_ASSUMED) else []
-    review += [week_start_mismatch_note(
-                   "the Tableau week start (a literal start_of_week argument or the "
-                   "datasource's Week start)", key.split(":", 1)[1])
-               for key in sorted(notes) if key.startswith(WEEK_START_MISMATCH + ":")]
     if notes.get(WEEK_DIFF_DAYS):
         review.append(WEEK_DIFF_DAYS_NOTE)
-    week = week_start_note(expr)
+    week = week_start_note(expr, exact_starts=exact_week_starts(notes))
     if week:
         review.append(week)
     out: dict = {}
