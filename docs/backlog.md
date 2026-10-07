@@ -64,6 +64,8 @@ are roughly ordered by value÷effort.
 | Item | Summary | Target |
 |---|---|---|
 | BL-178 | from-Snowflake identifier resolution: 3-defect regression, every metric formula dangles | immediate |
+| BL-364 | ThoughtSpot trigonometry is in **radians** (live 2026-10-07), but the Tableau translator and the Tableau, Ossie, Omni and Sigma maps convert by `180 / π` as if it were degrees — a silent wrong answer for every non-zero input. Excel map and translator fixed | 2026-10-31 |
+| BL-365 | ThoughtSpot reads `a * b / c` as `a * ( b / c )` (fixed-point scale 6 over literals) and a doubled quote in a string literal as two quotes (live 2026-10-07). Fixed in the Excel printer; the other translators' printers are unaudited | 2026-10-31 |
 | ~~BL-232~~ | ~~`description` under `properties` silently dropped on import; five sites + `ts tml lint` I15~~ | DONE (2026-09-02) |
 | ~~BL-200~~ | ~~SV entry splitter not quote aware -- a comma in `comment=` shatters the entry~~ | DONE (2026-07-31) |
 | ~~BL-201~~ | ~~live `sample_values` unmatched, read as part of the expression~~ | DONE (2026-07-31) |
@@ -13072,6 +13074,46 @@ widen any tolerance.
 
 **Target:** the next M1 / M2 harness change.
 
+## BL-364 — ThoughtSpot trigonometry is in radians; the Tableau translator and four maps convert as if it were degrees `Tier 1`
+
+**Filed:** 2026-10-07. **Status:** OPEN (Excel fixed; Tableau translator and the other maps not).
+**Source:** the Excel coverage pass (fidelity M1), probe record §7 ("Trigonometry").
+
+**The facts (live, se-thoughtspot, 2026-10-07, scratch Model deleted and confirmed absent).**
+`sin ( 30 )` compiles to `SIN(30)` and returns −0.988 (sin of 30 *radians*); `cos ( 60 )`
+returns −0.952; `asin ( 0.5 )` returns 0.5236 and `atan ( 1 )` 0.7854 (radians, not 30 and
+45). So ThoughtSpot's trigonometry takes and returns radians, exactly as SQL, Excel, Tableau
+and Ossie do, and the identity form is right: Excel `SIN(x)` is `sin ( x )`.
+
+The repo's rule said the opposite. It started as an assumption in the Tableau map ("Tableau
+trig is in radians; ThoughtSpot trig is in degrees — convert"; the inverse functions "by
+symmetry"), was never probed, and was copied into the Ossie, Excel, Omni and Sigma maps. Every
+row built on it imports cleanly and is wrong for every non-zero input.
+
+**Where it still is.**
+- **Code (silent wrong answers today):** `tools/ts-cli/ts_cli/tableau/functions.py`
+  (`SIN`, `COS`, `TAN`, `COT`, `ACOS`, `ASIN`, `ATAN`), and its `DEGREES` / `RADIANS`
+  (`:201-202`) and `PI()` literal (`:83`): correct algebra, but `x * 180 / 3.14159…` is read as
+  `x * ( 180 / 3.14159… )` and that literal division is fixed-point at scale 6 (BL-365), which
+  lost seven digits live — the Excel translator now passes `DEGREES` / `RADIANS` through and
+  emits `PI()` as `sql_double_op ( "PI()" )`, its tests in
+  `tests/test_tableau_translate.py`, and
+  `agents/cli/ts-convert-from-tableau/references/coverage-matrix.md` rows 132–133.
+- **Maps:** `agents/shared/mappings/tableau/tableau-formula-translation.md` (the trig rows),
+  `docs/ossie/ts-ossie-function-mapping.md` (`SIN` … `ATAN`), `docs/function-maps/ts-omni-function-mapping.md`
+  and `ts-sigma-function-mapping.md` (trig rows and `DistanceGlobe`).
+- **Upstream:** check whether the apache/ossie ThoughtSpot converter's `expressions/catalog.py`
+  carries the same conversion (`check_ossie_mapping_sync.py` compares the two).
+
+**Fix.** Drop the conversion everywhere (`sin ( x )`, `acos ( x )`), re-pin the Tableau tests by
+value, bump `ts-convert-from-tableau` (PATCH), and re-run a Tableau trigonometry case live.
+
+**Fixed for Excel** in the coverage pass (ts-cli 0.164.0): the Excel map's E16 rule and its
+`SIN` … `ATAN` rows, and the translator's new rules, use the identity form.
+
+**Target:** 2026-10-31.
+
+
 ## BL-357 — `x / NULLIF(y, 0)` and `COALESCE(x / NULLIF(y, 0), 0)` are both collapsed to `safe_divide`, which is neither `Tier 1`
 
 **Filed:** 2026-10-07. **Filed:** 2026-10-07. **Status:** DONE (2026-10-07).
@@ -13308,6 +13350,42 @@ corpus would be executable input running with that reach.
   `current_user()` is the confined principal.
 
 **Target:** 2026-11-15, and in any case before any third-party SQL corpus is run on Databricks.
+
+## BL-365 — `a * b / c` is read as `a * ( b / c )`, and a doubled quote in a string literal is two quotes: audit every formula emitter `Tier 1`
+
+**Filed:** 2026-10-07. **Status:** OPEN (the Excel printer is fixed in ts-cli 0.164.0).
+**Source:** the Excel coverage pass's fresh M1 run (16 silent wrong answers, every one a
+`… * 180 / PI()` shape) and the follow-up probes in probe record §7.
+
+**The facts (live, se-thoughtspot, 2026-10-07, scratch Models deleted and confirmed absent).**
+- `[n] * 4 / 3` compiles to `n * (4 / NULLIF(3, 0))` and returns 3.999999 for n = 3:
+  ThoughtSpot groups a division under a preceding product, and a literal-over-literal division
+  is fixed-point at scale 6 in Snowflake (BL-348's mechanism). `( [n] * 4 ) / 3` returns 4;
+  `12 / [n] * 2` stays left to right.
+- `'it''s'` is read as `it''s` (it compiles to four quotes). A backslash escape works in
+  `'o\'neil'` but fails to parse when the literal follows an earlier string literal in the
+  same formula (*Search did not find "''s ' ,"*). `sql_string_op ( "'it''s'" )` is reliable,
+  and `'a\\b'` is `a\b`.
+
+**Where it still is** (sites from the #577 review):
+- **Doubled quotes in emitted ThoughtSpot string literals:** `ts_cli/tableau/literals.py:102`,
+  `ts_cli/powerbi/functions.py:274`, `ts_cli/sv_sql.py:34`, `:137`, `:152-155`,
+  `ts_cli/databricks/mv_sql.py:53`, `:199`, `:214-219`, `ts_cli/qlik/functions.py:189`,
+  `ts_cli/sisense/functions.py:362`.
+- **`a * b / c` printed without brackets:** the formula emitters of all six translators
+  (Tableau, Power BI, Qlik, Sisense, Snowflake `sv_sql`, Databricks `mv_sql`).
+- **The Excel reverse direction** (`ts_cli/excel/to_excel*.py`, `--from thoughtspot --to
+  excel`) reads `'it''s'` as `it's` and writes `"it's"`, the SQL reading, where ThoughtSpot
+  itself reads two quotes. Left for the cross-translator quoting PR, which should settle one
+  reading for both directions.
+- The shared tokenizer `ts_cli/databricks/mv_emit_expr.py` accepts only `''` inside a string;
+  the quoting PR decides whether it should also read a backslash escape.
+
+**Fix.** Share the Excel printer's two rules (`tsast._binop_text`, `tsast._string_text`)
+through `formula_common` (BL-217), re-pin the tests, and add a fidelity case for each shape per
+dialect.
+
+**Target:** 2026-10-31.
 
 ## BL-366 — To-direction `safe_divide` is not exact on NULL: Databricks `COALESCE(a / NULLIF(b, 0), 0)`, Snowflake `DIV0` `Tier 2`
 

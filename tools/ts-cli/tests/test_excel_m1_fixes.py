@@ -158,7 +158,7 @@ def test_coercion_emitted_form(src, expected):
     ("=ABS([@name])", "abs ( to_double ( [T::name] ) )"),
     ("=[@name]/[@qty]", "to_double ( [T::name] ) / [T::qty]"),
     ("=POWER([@name],2)", "pow ( to_double ( [T::name] ) , 2 )"),
-    ("=CEILING([@name],1)", "ceil ( round ( to_double ( [T::name] ) / 1 , 0.000000001 ) ) * 1"),
+    ("=CEILING([@name],1)", "ceil ( to_double ( [T::name] ) / 1 - 0.000000001 ) * 1"),
 ])
 def test_text_column_in_arithmetic_is_to_double_with_a_trap(src, expected):
     r = ok(src)
@@ -278,24 +278,29 @@ def test_ceiling_math_documented_examples(args, expected):
 
 
 def test_ceiling_math_emitted_forms():
-    # integer columns: no snapping, so the composition shows plainly
-    assert f("=CEILING.MATH([@qty],[@qty])") == (
-        "if ( [T::qty] = 0 ) then 0 else ceil ( [T::qty] / abs ( [T::qty] ) ) * abs ( [T::qty] )")
-    assert f("=CEILING.MATH([@qty],-2,1)") == (
-        "if ( [T::qty] < 0 ) then floor ( [T::qty] / 2 ) * 2 else ceil ( [T::qty] / 2 ) * 2")
+    # integer columns: no division (Snowflake divides integers at scale 6) — the remainder
+    # form, checked by value in test_excel_coverage.py::TestIntegerDivision
+    e = f("=CEILING.MATH([@qty],[@qty])")
+    assert e.startswith("if ( [T::qty] = 0 ) then 0 else [T::qty] - mod ( [T::qty] , "
+                        "abs ( [T::qty] ) )") and "/" not in e
+    e = f("=CEILING.MATH([@qty],-2,1)")
+    assert e.startswith("if ( [T::qty] < 0 ) then [T::qty] - ( if ( mod ( [T::qty] , 2 ) < 0 )")
     assert f("=CEILING.MATH([@qty])") == "ceil ( [T::qty] )"
     assert f("=CEILING.MATH([@qty],,1)") == (
         "if ( [T::qty] < 0 ) then floor ( [T::qty] ) else ceil ( [T::qty] )")
+    assert f("=CEILING.MATH([@amt],-2,1)") == (
+        "if ( [T::amt] < 0 ) then floor ( [T::amt] / 2 + 0.000000001 ) * 2 else "
+        "ceil ( [T::amt] / 2 - 0.000000001 ) * 2")
     assert "non-literal mode" in review("=CEILING.MATH([@amt],2,[@qty])")
 
 
 def test_zero_significance():
-    assert f("=CEILING([@qty],[@qty])") == (
-        "if ( [T::qty] = 0 ) then 0 else ceil ( [T::qty] / [T::qty] ) * [T::qty]")
+    assert f("=CEILING([@qty],[@qty])").startswith("if ( [T::qty] = 0 ) then 0 else ")
     assert f("=CEILING([@amt],0)") == "0"
-    assert f("=CEILING([@qty],2)") == "ceil ( [T::qty] / 2 ) * 2"
-    # FLOOR with 0 is #DIV/0! in Excel: no guard, the NULL stands for the error
-    assert f("=FLOOR([@qty],[@qty])") == "floor ( [T::qty] / [T::qty] ) * [T::qty]"
+    assert "/" not in f("=CEILING([@qty],2)")
+    # FLOOR with 0 is #DIV/0! in Excel: NULL stands for the error — guarded, because mod by
+    # zero fails the whole query in Snowflake (live 2026-10-07)
+    assert f("=FLOOR([@qty],[@qty])").startswith("if ( [T::qty] = 0 ) then null else ")
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +310,9 @@ def test_zero_significance():
 @pytest.mark.parametrize("src,expected", [
     ("=ROUNDUP([@qty],9)", "if ( [T::qty] >= 0 ) then ceil ( [T::qty] * 1000000000 ) * "
                            "0.000000001 else floor ( [T::qty] * 1000000000 ) * 0.000000001"),
-    ("=ROUNDDOWN([@qty],1)", "if ( [T::qty] >= 0 ) then floor ( [T::qty] * 10 ) * 0.1 else "
-                             "ceil ( [T::qty] * 10 ) * 0.1"),
+    # up to 6 digits the result is scaled back by DIVISION (exact; * 0.1 adds float noise)
+    ("=ROUNDDOWN([@qty],1)", "if ( [T::qty] >= 0 ) then floor ( [T::qty] * 10 ) / 10 else "
+                             "ceil ( [T::qty] * 10 ) / 10"),
     ("=ROUNDDOWN([@qty],-2)", "if ( [T::qty] >= 0 ) then floor ( [T::qty] / 100 ) * 100 else "
                               "ceil ( [T::qty] / 100 ) * 100"),
 ])
@@ -415,10 +421,15 @@ def ts_eval_with(text: str, amt: float):
     ("=ROUNDUP([@amt],2)", 1.101, 1.11), ("=ROUNDDOWN([@amt],2)", 0.299, 0.29),
     ("=CEILING([@amt],0.1)", 1.1, 1.1), ("=FLOOR([@amt],0.1)", 0.3, 0.3),
     ("=CEILING.MATH([@amt],0.1)", 1.1, 1.1), ("=ROUNDDOWN([@amt],-1)", 70.0, 70),
+    # the #577 review grid: round ( v , 1e-9 ) compiled to 1e-9 * round ( v / 1e-9 ), one ulp
+    # above the integer, so ceil jumped a step (live 2026-10-07)
+    ("=ROUNDUP([@amt],1)", 3.0, 3.0), ("=ROUNDUP([@amt],2)", 0.15, 0.15),
+    ("=ROUNDUP([@amt],2)", 2.5, 2.5), ("=ROUNDDOWN([@amt],1)", -200.0, -200.0),
+    ("=ROUNDUP([@amt],2)", 40.955, 40.96), ("=ROUNDUP([@amt],1)", 3.00000001, 3.1),
 ])
-def test_double_is_snapped_before_ceil_floor(src, amt, expected):
+def test_double_is_nudged_before_ceil_floor(src, amt, expected):
     r = ok(src)
-    assert "round (" in r.expr and "0.000000001" in r.expr
+    assert "round (" not in r.expr and "0.000000001" in r.expr
     assert ts_eval_with(r.expr, amt) == pytest.approx(expected, rel=1e-12)
 
 

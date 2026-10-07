@@ -19,6 +19,8 @@ second one (BL-217):
 """
 from __future__ import annotations
 
+import re
+
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -28,7 +30,38 @@ _PRIMARY = 9
 
 
 def lit_string(value: str) -> dict:
-    return {"node": "lit", "kind": "string", "value": "'" + value.replace("'", "''") + "'"}
+    """A string literal: a backslash doubled (ThoughtSpot's escape), a quote stored SQL-style
+    (``'it''s'``); ``to_text`` prints it in a form ThoughtSpot reads back as the same text
+    (``_string_text``), and ``string_text`` reads either spelling."""
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return {"node": "lit", "kind": "string", "value": "'" + escaped + "'"}
+
+
+def _string_text(literal: str) -> str:
+    """How a string literal is PRINTED (live 2026-10-07, probe record §7). ThoughtSpot reads
+    ``'it''s'`` as two quotes (``it''s``), and its backslash escape ``'it\'s'`` fails to parse
+    after an earlier string literal in the same formula. So text with a quote is printed as the
+    warehouse's own literal, ``sql_string_op ( "'it''s'" )``; a backslash is doubled
+    (``'a\\b'`` is ``a\b``, live)."""
+    text = string_text(literal)
+    if "'" in text:
+        return 'sql_string_op ( "\'' + text.replace("\\", "\\\\").replace("'", "''") + '\'" )'
+    return "'" + text.replace("\\", "\\\\") + "'"
+
+
+def unprintable_string(literal: str) -> bool:
+    """A quote-bearing text the ``sql_string_op`` form cannot carry: a ``"`` ends the template
+    (it has no escape, probe record §7), ``{`` / ``}`` read as placeholders, and a backslash
+    inside a template does not survive (``INITCAP`` delimiters with ``\\t`` / ``\\x22``
+    became letters, §7), so ``it\\'s`` has no form that is known to work."""
+    text = string_text(literal)
+    return "'" in text and any(c in text for c in '"{}\\')
+
+
+def string_text(literal: str) -> str:
+    """The text of a quoted ThoughtSpot string literal (``'…'``), unescaped."""
+    inner = literal[1:-1]
+    return re.sub(r"\\(.)|''", lambda m: m.group(1) if m.group(1) is not None else "'", inner)
 
 
 def lit_number(text: str) -> dict:
@@ -161,6 +194,11 @@ def _wrap(node: dict, minimum: int) -> str:
     return f"( {text} )" if _prec(node) < minimum else text
 
 
+def wrapped(node: dict) -> str:
+    """``node``'s text, bracketed unless it binds tighter than ``*`` and ``/``."""
+    return _wrap(node, 7)
+
+
 def _call_text(node: dict) -> str:
     fn, args = node["fn"], node["args"]
     if fn == "in":
@@ -183,13 +221,22 @@ def _ifelse_text(node: dict) -> str:
     return out
 
 
+def _binop_text(node: dict) -> str:
+    p = _PREC[node["op"]]
+    left_min = p + 1 if p == 4 else p  # a comparison inside a comparison is bracketed
+    if node["op"] == "/" and node["left"].get("node") == "binop" and node["left"]["op"] == "*":
+        # ThoughtSpot reads `a * b / c` as `a * ( b / c )`, and with literals that inner
+        # division is fixed-point at scale 6 (`[n] * 4 / 3` gave 3.999999; live
+        # 2026-10-07, probe record §7): bracket the product
+        left_min = p + 1
+    return f"{_wrap(node['left'], left_min)} {node['op']} {_wrap(node['right'], p + 1)}"
+
+
 def to_text(node: dict) -> str:
     """Canonical ThoughtSpot formula text for ``node``."""
     kind = node.get("node")
     if kind == "binop":
-        p = _PREC[node["op"]]
-        left_min = p + 1 if p == 4 else p  # a comparison inside a comparison is bracketed
-        return f"{_wrap(node['left'], left_min)} {node['op']} {_wrap(node['right'], p + 1)}"
+        return _binop_text(node)
     if kind == "unop":
         if node["op"] == "not":
             return f"not ( {to_text(node['operand'])} )"
@@ -199,7 +246,7 @@ def to_text(node: dict) -> str:
     if kind == "ifelse":
         return _ifelse_text(node)
     if kind == "lit":
-        return node["value"]
+        return _string_text(node["value"]) if node["kind"] == "string" else node["value"]
     if kind == "col":
         return f"[{node['table']}::{node['column']}]"
     if kind == "ref":

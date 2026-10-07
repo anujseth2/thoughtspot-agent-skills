@@ -311,7 +311,7 @@ DOUBLE column and a decimal literal alike:
 | Formula | Result |
 |---|---|
 | `ceil ( to_double ( '1.1' ) * 100 ) * 0.01` | **1.11** — `1.1 * 100` is `110.00000000000001` in a double |
-| `ceil ( round ( to_double ( '1.1' ) * 100 , 0.000000001 ) ) * 0.01` | 1.1 — the snapped form the Excel translator now emits for a DOUBLE |
+| `ceil ( round ( to_double ( '1.1' ) * 100 , 0.000000001 ) ) * 0.01` | 1.1 — **but the snap is wrong on other values**: `round ( v , 0.000000001 )` compiles to `1.0E-9 * round ( v / 1.0E-9 )`, which lands one ulp above the integer, so `ceil` jumps a step on exact grid values (3.0 → 3.1, 0.15 → 0.16, 2.5 → 2.51; `floor` −200 → −200.1). Superseded by the nudge, ts-cli 0.164.0 — see the grid below |
 | `floor ( to_double ( '0.29' ) * 100 ) * 0.01` / snapped | 0.28 / 0.29 |
 | `ceil ( to_double ( '1.1' ) / 0.1 ) * 0.1` / snapped | 1.1 / 1.1 here (the raw form gives 1.2 in IEEE arithmetic in general — `1.1 / 0.1` is `11.000000000000002`; the warehouse's rounding happened to absorb it) |
 | `floor ( round ( to_double ( '-0.57' ) * 100 , 0.000000001 ) ) * 0.01` | −0.5700000000000001 (within any 1e-12 tolerance) |
@@ -320,3 +320,50 @@ DOUBLE column and a decimal literal alike:
 | `sql_double_op ( "TRY_TO_DOUBLE({0})" , [DEPARTMENT] )`, `ifnull ( … , 0 )` | NULL, 0.0 — the null-on-failure form |
 | `sql_bool_op ( "TRY_TO_DOUBLE({0}) IS NOT NULL" , [DEPARTMENT] )` | false — the `ISNUMBER(VALUE(…))` form the translator now emits |
 | `to_string ( 100000000000000000000 )`, `to_string ( to_double ( '1E+20' ) )` | `'100000000000000000000'`, `'1e+20'` (Excel writes `1E+20`) |
+
+*Excel coverage pass (2026-10-07, five scratch Models over a one-row fidelity fixture — `ZZ_FIDELITY_PROBECOV_*_DELETE_ME` — each deleted and confirmed absent by the harness's teardown, warehouse tables dropped and confirmed with `SHOW TABLES`).* Values by `ts agentql fetch-data`; every formula also passed the VALIDATE_ONLY import first.
+
+| Formula | Result |
+|---|---|
+| `sin ( 30 )`, `cos ( 60 )`, `tan ( 45 )` | −0.988, −0.952, 1.620 — compiled `SIN(30)`: **ThoughtSpot trigonometry is in radians** (BL-364). The repo's "degrees" rule was never probed and was wrong |
+| `asin ( 0.5 )`, `acos ( [x] )` (0.5), `atan ( 1 )` | 0.5236, 1.0472, 0.7854 — radians out too |
+| `sin ( 3.141592653589793 )` | 1.2246467991473532E-16, as a double `SIN(π)` |
+| `sql_double_op ( "SINH({0})" , … )`, `COSH`, `TANH` (of 1000), `ASINH`, `ACOSH`, `ATANH`, `DEGREES`, `RADIANS`, `ATAN2` | Python `math` to the last digit; `TANH(1000)` = 1.0, `SINH(1e-10)` = 1e-10 (the `exp` compositions cancel / overflow there); `ATAN2(0, 0)` = 0 (Excel `#DIV/0!`) |
+| `log2 ( 8 )`, `ln ( 27 ) / ln ( 3 )`, `log10 ( 1000 )` | 3.0, 3.0, **2.9999999999999996** (within 1e-12; Excel gives 3) |
+| `sql_double_op ( "FACTORIAL(FLOOR({0}))" , 5.5 )`, `… , 25 )` | 120.0, 1.5511210043330986E+25 — the `sql_int_op` variant would overflow INT64 from 21! |
+| `sql_string_op ( "CHR({0})" , … )` of 65, 233, 150, 0 | `A`, `é`, **U+0096** (Windows-1252 150 is an en dash), U+0000 (Excel `CHAR(0)` is `#VALUE!`) |
+| `sql_int_op ( "ASCII({0})" , 'é…' )` / `"UNICODE({0})"` | **195** (the first UTF-8 *byte*) / 233. Excel `CODE` is 233, so the map's `ASCII` row was wrong for every non-ASCII character |
+| `TO_CHAR({0}, 'FM…0.00')` of 2.675, 0.125 (FLOAT), 2.675 (literal); `'FM…0'` of −2.5 | `2.68`, `0.13`, `2.68`; `-3` — half away from zero, as Excel |
+| `TO_CHAR({0}, 'FM…0.00')` of −0.001 | **`-0.00`** (Excel's output for a negative that rounds to zero was not verified: the translator refuses a literal and traps a column) |
+| `TO_CHAR({0}, 'FM999,…,990')`, `'…0.0'`, 14-digit integer part | `1,234,568`, `12.3`, `12345679012654.31` |
+| `TO_CHAR` of a DATE with `YYYY-MM-DD`, `DD MON YYYY`, `MMMM`, `DY`, `YY/MM/DD HH24:MI:SS`, `DD.MM.YYYY`, `HH24:MI:SS` | `2024-03-15`, `15 Mar 2024`, `March`, `Fri`, `24/03/15 00:00:00`, `15.03.2024`, `00:00:00` |
+| `day_of_week ( [d] )` | **`friday`** — lower case (Excel `TEXT(d, "dddd")` is `Friday`; the translator wraps it in `INITCAP`) |
+| `month ( [d] )`, `left ( month ( [d] ) , 3 )` | **`march`**, `mar` — lower case too (Excel `March`, `Mar`; the translator uses `TO_CHAR` `MMMM` / `MON`) |
+| `sql_string_op ( "INITCAP({0})" , day_of_week ( [d] ) )` | `Friday` |
+| `sql_string_op ( "INITCAP({0})" , … )` | `Abc1def X-Y O'neil` — Snowflake's default delimiters skip digits and the apostrophe, where Excel `PROPER` gives `Abc1Def X-Y O'Neil`. A delimiter list built with `\|\|` is rejected (*argument 1 to function INITCAP needs to be constant*), and **backslash escapes in a `sql_*_op` template do not survive** (`'\t\x22…'` became the letters `t`, `x`, `2`…): `PROPER` was left out of the coverage pass |
+| `add_days ( add_months ( to_date ( concat ( to_string ( y ) , '-01-01' ) , '%Y-%m-%d' ) , 13 ) , -1 )` (y = 2024) | 2025-01-31 — the `DATE` composition, overflow-safe |
+| `sql_int_op ( "POSITION({0}, {1}, {2})" , 'r' , s , 7 )`, `"POSITION(LOWER({0}), LOWER({1}), {2})"` | the 1-based position at or after the start — `FIND` / `SEARCH` with `start_num` |
+| `[n] * 4 / 3` (n = 3); `( [n] * 4 ) / 3`; `12 / [n] * 2` | **3.999999** — compiled `n * (4 / NULLIF(3,0))`: ThoughtSpot groups a division under a preceding product, and the literal division is fixed-point at scale 6; bracketed, 4.0; left to right, 8.0 (BL-365). `[x] * 180 / 3.141592653589793` likewise lost seven digits — the 16 silent wrong answers of the coverage run's first fresh pass |
+| `sql_double_op ( "PI()" )`; `[x] * 180 / sql_double_op ( "PI()" )` | 3.141592653589793; exact — a zero-argument template is accepted |
+| `concat ( 'Bob' , 'x\'s ' , … )`, `concat ( 'x' , '\'s ' )` | **rejected at import** (*Search did not find "''s ' ,"*); `'o\'neil'` and `'\'s'` alone are accepted — the backslash escape fails after an earlier string literal |
+| `if ( … ) then 'it''s' else 'no'` | **`it''s`** — a doubled quote is two quotes (BL-365) |
+| `concat ( 'Bob' , sql_string_op ( "'''s '" ) , … )`; `'a\\b'` | `Bob's …`; `a\b` — the forms the Excel printer now emits |
+
+The same run checked 39 translator outputs end to end against hand-computed Excel values (the new rounding family, `LOG`, trigonometry, `ATAN2`, `FACT`, `CHAR` / `CODE` / `UNICODE`, `REPLACE`, the `B` variants, `TEXT` number / percent / date formats, `DATE` overflow, `ISTEXT` / `ISLOGICAL`, `FIND` / `SEARCH` with a start): 39 of 39 equal after `dddd` moved to `INITCAP`.
+
+*Review of #577 (2026-10-07, two more scratch Models, each deleted and confirmed absent).*
+
+| Formula | Result |
+|---|---|
+| `floor ( 1999999 / 2000000 )` over two INT64 columns (the old `QUOTIENT` / `FLOOR` forms) | **1** — two NUMBER(38,0) values divide at scale 6 (0.9999995 → 1.000000) |
+| `( [a] - mod ( [a] , [b] ) ) / [b]`; the remainder forms of `FLOOR`, `CEILING`, `FLOOR.MATH` (with and without mode), `CEILING.PRECISE` over a = ±1999999, b = 2000000 | 0, 0, 0, −2000000, 0, 2000000 — Excel's values; no division feeds `floor` / `ceil` |
+| `mod ( [a] , [z] )` with z = 0 | **the query fails** (*Division by zero*), where `/` returns NULL — so the translator guards it, `if ( [z] = 0 ) then null else …` (NULL for `FLOOR` / `QUOTIENT`, 0 for `CEILING`); all three guarded forms returned NULL / 0 |
+| a quote-bearing literal as `sql_string_op ( "'it''s here'" )` in `=` and `!=`, the `count_if` and `sum_if` conditions, `contains`, `left`, `substr`, `strlen`, and as an argument to `sql_string_op` (`UPPER`, `REPLACE`) and `sql_bool_op` templates | all imported and all returned Excel's values (`count_if` 1, `sum_if` 3, `IT'S`, `it-s here`, `true`); compiled e.g. `LOWER("S2") = LOWER('it''s here')` |
+
+*The nudge replaces the snap (2026-10-07, a scratch Model over a 13-row DOUBLE fixture, deleted and confirmed absent).* `ceil ( v - 0.000000001 )` / `floor ( v + 0.000000001 )`, scaled back by `/ 10^n` (exact) up to 6 digits — the forms `formula_common.scaled_ceil_floor` now emits for every Excel `ROUNDUP` / `ROUNDDOWN` / `TRUNC` / `CEILING*` / `FLOOR*` over a DOUBLE. The grid: x = 3.0, 0.15, 0.29, 2.5, 1.1, −200, 0.57, 40.955, 3.00000001, −0.57, 1.101, −1.1 and 3.000000000001, through `ROUNDUP` and `ROUNDDOWN` at 0, 1, 2 and −1 decimals (both `ceil` and `floor`, both signs), `CEILING.MATH` at 0.1 and 1, `FLOOR.MATH` at 0.01 and 10, and `TRUNC` at 2 — 169 values, compared with Excel's result on the 15-significant-digit reading of x.
+
+| Result | Values |
+|---|---|
+| equal to Excel | **164 of 169**, including every exact grid value the snap broke (3.0, 0.15, 2.5, −200 → unchanged) and the genuine near-step 3.00000001 (`ROUNDUP` to 1 place → 3.1) |
+| different | 5: x = 3.000000000001 rounded up (to 0, 1, 2 places and `CEILING.MATH` 0.1 and 1) returns 3 where Excel gives 4, 3.1, 3.01 — **the documented trade-off**: a value within 1e-9 of a step (scaled) is read as on the step |
+

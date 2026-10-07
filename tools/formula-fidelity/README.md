@@ -26,7 +26,7 @@ operator-run, not workflow-run.
 | `fidelity/sources.py` | Stdlib readers for LibreOffice `.fods` and Excel `.xlsx`: one formula cell → a scalar case, or a named refusal |
 | `fidelity/literal.py` | Data dir, manifest, materialising cases and the input fixture in memory, the `literal` oracle |
 | `fidelity/redact.py` | What M1 may commit (redacted results, generated report tables) and the leak scanner |
-| `cases/excel/` | `m1-manifest.jsonl` (ids + file + sha256 + locator, no formulas or values) and `m1-selection.json` (counts) |
+| `cases/excel/` | `m1-manifest.jsonl` (ids + file + sha256 + locator, no formulas or values) and `m1-selection.json` (counts); `m1-coverage-manifest.jsonl` / `m1-coverage-selection.json`, the 2026-10-07 coverage pass's fresh selection (the cases it newly translates, at most 15 per leading function) |
 | `cases/snowflake/` | `m0.jsonl` (95 cases: 50 original, 21 BL-340..343 / #572 guards, 24 `sf-fix-*` for the M2 fixes and their review) and `fixture-m0.json` (10 edge rows) |
 | `cases/databricks/` | `m2.jsonl` (122 cases, `ANSI_MODE=true`; 31 `dbx-fix-*` added with the BL-357..362 fixes), `m2-nonansi.jsonl` (7 cases, `ANSI_MODE=false`), and their fixtures: M0's rows as Databricks types |
 | `runs/` | Run JSON evidence (raw oracle and ThoughtSpot values, compiled SQL, verdicts) |
@@ -288,6 +288,18 @@ PYTHONPATH= uv run --no-project --python 3.12 --with pyyaml --with typer --with 
 - **ANSI.** ThoughtSpot's own queries over the Databricks connection behaved as **non-ANSI** in
   M2 (BL-358, documented as accepted platform semantics; `ts formula translate` traps it). So an ANSI oracle and ThoughtSpot can disagree on overflow and bad casts, and
   `m2-nonansi.jsonl` measures the legacy semantics separately.
+
+### What M1 does not exercise: DOUBLE grid values
+
+Half the M1 cases are formulas over constants, which the warehouse computes as exact NUMBER
+decimals, and the input cells it does read seldom sit exactly on a rounding step. So binary
+representation error at a step (`3.0 * 10`, `0.15 * 100`) was never scored, and the 0.161.0
+precision snap shipped with a step-jump on exactly those values (found by review,
+2026-10-07). The grid is now pinned by a live probe (probe record §7, 13 DOUBLE values × 13
+rounding forms) and by `tools/ts-cli/tests/test_scaled_ceil_floor.py`. A future case set
+should add a typed fixture of DOUBLE grid values (3.0, 0.15, 0.29, 2.5, 1.1, -200, 0.57,
+40.955 and near-steps) for every directed-rounding function, with Excel's 15-digit result as
+the oracle.
 
 ## Extending
 

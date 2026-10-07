@@ -19,24 +19,51 @@ from __future__ import annotations
 FUNCTION_RULES = {
     # --- Math and trigonometry
     "ABS": {"map": "excel", "emits": ("abs",)},
-    "CEILING": {"map": "excel", "emits": ("ceil", "round")},
-    "CEILING.MATH": {"map": "excel", "emits": ("ceil", "floor", "abs", "round")},
+    "CEILING": {"map": "excel", "emits": ("ceil", "mod")},
+    "CEILING.MATH": {"map": "excel", "emits": ("ceil", "floor", "abs", "mod")},
+    "CEILING.PRECISE": {"map": "excel", "emits": ("ceil", "abs", "mod")},
+    "ISO.CEILING": {"map": "excel", "emits": ("ceil", "abs", "mod")},
     "EXP": {"map": "excel", "emits": ("exp",)},
-    "FLOOR": {"map": "excel", "emits": ("floor", "round")},
+    "EVEN": {"map": "excel", "emits": ("ceil", "floor")},
+    "FACT": {"map": "excel", "emits": ("sql_double_op",)},
+    "FLOOR": {"map": "excel", "emits": ("floor", "mod")},
+    "FLOOR.MATH": {"map": "excel", "emits": ("floor", "ceil", "abs", "mod")},
+    "FLOOR.PRECISE": {"map": "excel", "emits": ("floor", "abs", "mod")},
     "INT": {"map": "excel", "emits": ("floor",)},
     "LN": {"map": "excel", "emits": ("ln",)},
+    "LOG": {"map": "excel", "emits": ("log10", "log2", "ln")},
     "LOG10": {"map": "excel", "emits": ("log10",)},
     "MOD": {"map": "excel", "emits": ("floor",)},
     "MROUND": {"map": "excel", "emits": ("round", "abs")},
+    "ODD": {"map": "excel", "emits": ("ceil", "floor")},
+    "PI": {"map": "excel", "emits": ("sql_double_op",)},
     "POWER": {"map": "excel", "emits": ("pow",)},
+    "QUOTIENT": {"map": "excel", "emits": ("floor", "ceil", "mod")},
     "ROUND": {"map": "excel", "emits": ("round", "sql_double_op")},
-    "ROUNDDOWN": {"map": "excel", "emits": ("floor", "ceil", "round")},
-    "ROUNDUP": {"map": "excel", "emits": ("ceil", "floor", "quarter_number", "round")},
+    "ROUNDDOWN": {"map": "excel", "emits": ("floor", "ceil")},
+    "ROUNDUP": {"map": "excel", "emits": ("ceil", "floor", "quarter_number")},
     "SIGN": {"map": "excel", "emits": ()},
     "SQRT": {"map": "excel", "emits": ("sqrt",)},
     "SUM": {"map": "excel", "emits": ("sum",)},
     "SUMIF": {"map": "excel", "emits": ("sum_if",)},
     "SUMIFS": {"map": "excel", "emits": ("sum_if",)},
+    "TRUNC": {"map": "excel", "emits": ("floor", "ceil")},
+    # trigonometry: radians on both sides (probe record §7)
+    "SIN": {"map": "excel", "emits": ("sin",)},
+    "COS": {"map": "excel", "emits": ("cos",)},
+    "TAN": {"map": "excel", "emits": ("tan",)},
+    "ASIN": {"map": "excel", "emits": ("asin",)},
+    "ACOS": {"map": "excel", "emits": ("acos",)},
+    "ATAN": {"map": "excel", "emits": ("atan",)},
+    "ATAN2": {"map": "excel", "emits": ("sql_double_op",)},
+    "SINH": {"map": "excel", "emits": ("sql_double_op",)},
+    "COSH": {"map": "excel", "emits": ("sql_double_op",)},
+    "TANH": {"map": "excel", "emits": ("sql_double_op",)},
+    "ASINH": {"map": "excel", "emits": ("sql_double_op",)},
+    "ACOSH": {"map": "excel", "emits": ("sql_double_op",)},
+    "ATANH": {"map": "excel", "emits": ("sql_double_op",)},
+    "DEGREES": {"map": "excel", "emits": ("sql_double_op",)},
+    "RADIANS": {"map": "excel", "emits": ("sql_double_op",)},
     # --- Statistical
     "AVERAGE": {"map": "excel", "emits": ("average",)},
     "AVERAGEIF": {"map": "excel", "emits": ("average_if",)},
@@ -53,6 +80,8 @@ FUNCTION_RULES = {
     "STDEV.S": {"map": "excel", "emits": ("stddev",)},
     "VAR.S": {"map": "excel", "emits": ("variance",)},
     # --- Text
+    "CHAR": {"map": "excel", "emits": ("sql_string_op",)},
+    "CODE": {"map": "excel", "emits": ("sql_int_op",)},
     "CONCAT": {"map": "excel", "emits": ("concat", "to_string")},
     "CONCATENATE": {"map": "excel", "emits": ("concat",)},
     "EXACT": {"map": "excel", "emits": ("sql_bool_op",)},
@@ -62,11 +91,23 @@ FUNCTION_RULES = {
     "LOWER": {"map": "excel", "emits": ("sql_string_op",)},
     "MID": {"map": "excel", "emits": ("substr",)},
     "RIGHT": {"map": "excel", "emits": ("right",)},
-    "SEARCH": {"map": "excel", "emits": ("strpos",)},
+    "SEARCH": {"map": "excel", "emits": ("strpos", "sql_int_op")},
+    "REPLACE": {"map": "excel", "emits": ("concat", "left", "substr", "strlen")},
     "SUBSTITUTE": {"map": "excel", "emits": ("sql_string_op",)},
+    "TEXT": {"map": "excel", "emits": ("sql_string_op", "day_of_week")},
     "TEXTJOIN": {"map": "excel", "emits": ("concat",)},
     "TRIM": {"map": "excel", "emits": ("sql_string_op",)},
+    "UNICHAR": {"map": "excel", "emits": ("sql_string_op",)},
+    "UNICODE": {"map": "excel", "emits": ("sql_int_op",)},
     "UPPER": {"map": "excel", "emits": ("sql_string_op",)},
+    # the byte variants: the plain function outside a DBCS default language (map rows)
+    "FINDB": {"map": "excel", "emits": ("sql_int_op",)},
+    "LEFTB": {"map": "excel", "emits": ("left",)},
+    "LENB": {"map": "excel", "emits": ("strlen",)},
+    "MIDB": {"map": "excel", "emits": ("substr",)},
+    "REPLACEB": {"map": "excel", "emits": ("concat", "left", "substr", "strlen")},
+    "RIGHTB": {"map": "excel", "emits": ("right",)},
+    "SEARCHB": {"map": "excel", "emits": ("strpos", "sql_int_op")},
     "VALUE": {"map": "excel", "emits": ("to_double", "sql_double_op")},
     # --- Date and time
     "DATEDIF": {"map": "excel", "emits": ("diff_days", "diff_months", "day", "floor")},
@@ -82,6 +123,8 @@ FUNCTION_RULES = {
     "TODAY": {"map": "excel", "emits": ("today",)},
     "WEEKDAY": {"map": "excel", "emits": ("day_number_of_week", "mod")},
     "YEAR": {"map": "excel", "emits": ("year",)},
+    "DATE": {"map": "excel", "emits": ("to_date", "concat", "to_string", "add_months",
+                                       "add_days")},
     # --- Logical
     "AND": {"map": "excel", "emits": ()},
     "FALSE": {"map": "excel", "emits": ()},
@@ -95,6 +138,9 @@ FUNCTION_RULES = {
     # --- Information
     "ISBLANK": {"map": "excel", "emits": ("isnull",)},
     "ISNUMBER": {"map": "excel", "emits": ("contains", "not", "isnull", "sql_bool_op")},
+    "ISLOGICAL": {"map": "excel", "emits": ("not", "isnull")},
+    "ISNONTEXT": {"map": "excel", "emits": ("isnull",)},
+    "ISTEXT": {"map": "excel", "emits": ("not", "isnull")},
 }
 
 # The criteria-string table (Excel map E11, "Criteria strings") that every *IF / *IFS rule
@@ -138,4 +184,4 @@ SHEETS_RULES = {
 # Names the shared machinery emits whatever the rule (checked against the catalog by the
 # gate): `to_string` around a non-text `&` operand, `isnull` / `not` in a blank test
 # (`x = ""`) and in `not ( isnull ( … ) )`.
-SHARED_EMITS = ("to_string", "isnull", "not")
+SHARED_EMITS = ("to_string", "isnull", "not", "sql_string_op")
