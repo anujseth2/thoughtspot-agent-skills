@@ -316,23 +316,38 @@ def _brace_depth(c: str, depth: int) -> int:
     return depth
 
 
-def translate(expr: str, first_week_day: Optional[int] = None
-              ) -> tuple[str, bool, str]:
+def translate(expr: str, first_week_day: Optional[int] = None,
+              field_types: Optional[dict[str, str]] = None) -> tuple[str, bool, str]:
     """Translate a Qlik expression to a ThoughtSpot formula (see ``_translate``). Qlik
     string literals are SQL-standard (``'it''s'``); the output's literals are printed in
     the form ThoughtSpot reads back exactly, and a product under a division is bracketed
     (BL-365). Double-quoted field names are read as fields first (BL-368), so the
-    converter and ``ts formula translate --from qlik`` share one reading."""
+    converter and ``ts formula translate --from qlik`` share one reading. The advisory
+    notes of ``translate_with_notes`` are dropped here."""
+    out, review, reason, _notes = translate_with_notes(expr, first_week_day, field_types)
+    return out, review, reason
+
+
+def translate_with_notes(expr: str, first_week_day: Optional[int] = None,
+                         field_types: Optional[dict[str, str]] = None
+                         ) -> tuple[str, bool, str, list[str]]:
+    """``translate`` plus advisory notes that never change the status (Set Analysis
+    semantics ThoughtSpot cannot match exactly — the converter's ``review_notes``).
+
+    ``field_types``: lower-cased field name -> ThoughtSpot data type (``VARCHAR``,
+    ``INT64`` …), when known; it decides whether a bare Set Analysis value is quoted."""
     fixed, problem = _field_quotes(expr or "")
     if problem:
         return (f"/* TODO review: {(expr or '').strip()} */", True,
-                f"Cannot read {problem} (BL-368)")
-    out, review, reason = _translate(fixed, first_week_day)
-    return ts_finalize_formula(out), review, reason
+                f"Cannot read {problem} (BL-368)", [])
+    ctx = {"notes": [], "field_types": {k.lower(): v for k, v in (field_types or {}).items()}}
+    out, review, reason = _translate(fixed, first_week_day, ctx)
+    notes = [] if review else list(dict.fromkeys(ctx["notes"]))
+    return ts_finalize_formula(out), review, reason, notes
 
 
-def _translate(expr: str, first_week_day: Optional[int] = None
-               ) -> tuple[str, bool, str]:
+def _translate(expr: str, first_week_day: Optional[int] = None,
+               ctx: Optional[dict] = None) -> tuple[str, bool, str]:
     """Translate a Qlik expression to a ThoughtSpot formula.
 
     Returns ``(ts_formula, review_required, reason)``. When review_required is
@@ -349,7 +364,7 @@ def _translate(expr: str, first_week_day: Optional[int] = None
 
     # Set Analysis first — recognizable by {<...>} / {1} / {$}.
     if "{" in expr:
-        return _set_analysis(expr)
+        return _set_analysis(expr, first_week_day, ctx)
 
     # Count(DISTINCT X) -> `unique count(X)`. BL-171: the function name has a
     # SPACE — `unique_count` (underscore) does not exist and is rejected with
@@ -624,13 +639,30 @@ def _split_top_level(s: str) -> list[str]:
     return [p.strip() for p in parts]
 
 
-def _agg_fn(name: str) -> str:
-    """The ThoughtSpot aggregation for a Qlik aggregation name.
+# Aggregations Set Analysis translates, and the value rows OUTSIDE the set contribute:
+# 0 is neutral only for a sum (a count or average over `else 0` counts / averages the
+# zeros). Anything else (Only, Mode, Concat, FirstSortedValue, ...) is NEEDS_REVIEW --
+# it was silently read as `sum` (#586 review).
+_SET_AGGS: dict[str, tuple[str, str]] = {
+    "sum": ("sum", "0"), "avg": ("average", "null"), "count": ("count", "null"),
+    "min": ("min", "null"), "max": ("max", "null"),
+}
 
-    Falls back to `sum` both for an unmapped name and for one mapped to None
-    (no equivalent) — the previous `.get(name, "sum")` returned None for the
-    latter and emitted a literal `None(...)` into the formula."""
-    return FUNCTION_MAP.get(name.lower()) or "sum"
+
+def _set_agg(name: str, measure: str) -> tuple[Optional[tuple[str, str, str]], Optional[str]]:
+    """(ThoughtSpot aggregation, measure, value outside the set) or a review reason.
+    ``Count(DISTINCT x)`` becomes ``unique count``, whose ThoughtSpot name has a space
+    (thoughtspot-formula-patterns.md)."""
+    agg = _SET_AGGS.get(name.lower())
+    if agg is None:
+        return None, (f"the aggregation {name}() has no Set Analysis translation (only "
+                      "Sum, Avg, Count, Min and Max)")
+    distinct = re.match(r"(?i)^distinct\s+(.+)$", measure.strip())
+    if distinct:
+        if agg[0] != "count":
+            return None, f"{name}(DISTINCT ...) is not translated"
+        return ("unique count", distinct.group(1).strip(), "null"), None
+    return (agg[0], measure.strip(), agg[1]), None
 
 
 _SET_MODIFIER = re.compile(r"\{\s*\$?\s*<(.*?)>\s*\}", re.S)
@@ -654,45 +686,188 @@ def _set_analysis_shape_problem(expr: str) -> Optional[str]:
     return None
 
 
-def _set_analysis(expr: str) -> tuple[str, bool, str]:
-    problem = _set_analysis_shape_problem(expr)
+def _set_field(raw: str) -> str:
+    """The modifier's field as a reference: ``[Field Name]`` stays ONE bracketed field
+    (BL-378 -- stripped to ``Field Name`` it was read as two bare names)."""
+    name = raw.strip()
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    return f"[{name}]" if not re.fullmatch(r"[A-Za-z_]\w*", name) else name
+
+
+_SEARCH_CHARS = re.compile(r"[*?]|^\s*[<>=^~]")
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+SELECTION_NOTE = ("Set Analysis: an = modifier REPLACES the user's selection on that field in "
+                  "Qlik, while the ThoughtSpot if ( … ) intersects with a filter on it — the "
+                  "two differ only when the user filters on that field.")
+NUMBER_NOTE = ("Set Analysis: a bare value ({0}) is emitted as a number because the field's "
+               "type is not known; if the field is text-coded (e.g. {{007}}), quote the value.")
+_NUMERIC_TYPES = ("INT", "DOUBLE", "FLOAT", "DECIMAL", "NUMBER", "NUMERIC", "BIGINT")
+CASE_NOTE = ("Set Analysis: a single-quoted element value is a case-SENSITIVE literal in "
+             "Qlik, but ThoughtSpot's = is case-insensitive (BL-333), so a value differing "
+             "only in case now matches too. Apps built before June 2017 read single quotes "
+             "as a search instead.")
+
+
+def _set_values(raw_vals: str, field_type: Optional[str] = None,
+                notes: Optional[list] = None) -> tuple[list[str], Optional[str], bool]:
+    """(ThoughtSpot literals, review reason, whether a single-quoted value was read).
+
+    Values split on commas OUTSIDE quotes (BL-376: ``{'A, B'}`` is one value). A single-
+    quoted value is a literal; a bare number stays a number (``{2023}`` -> ``2023``),
+    another bare value is quoted. A double-quoted value is a Qlik SEARCH string --
+    exact (case-insensitively, as ThoughtSpot's ``=`` is) only without wildcards
+    (``*``, ``?``) or a leading ``<`` ``>`` ``=`` ``^`` ``~`` (range, expression or
+    fuzzy search), which are flagged (BL-377). Loud, never guessed: a set operator
+    other than ``+`` (union) between element sets, a function element set (``P()``,
+    ``E()``), and an empty set."""
+    groups = _brace_groups(raw_vals)
+    problem = _element_set_problem(raw_vals, groups)
     if problem:
-        return (f"/* TODO review set analysis: {expr} */", True,
-                f"Set Analysis: {problem}")
-    # Pattern 1: {1} -> ignore all selections (total).
+        return [], problem, False
+    values: list[str] = []
+    single = False
+    for g in groups:
+        for v in _split_top_level(g[1:-1]):
+            if not v:
+                continue
+            lit, why = _element_literal(v, field_type, notes)
+            if why:
+                return [], why, False
+            single = single or v[0] == "'"
+            values.append(lit)
+    if not values:
+        return [], "an empty element set ({}) selects nothing; it is not translated", False
+    return values, None, single
+
+
+def _element_set_problem(raw_vals: str, groups: list[str]) -> Optional[str]:
+    if re.match(r"(?i)^\s*[EP]\s*\(", raw_vals):
+        return ("a function element set (P() / E(), the possible or excluded values) "
+                "depends on selection state; it is not translated")
+    if not groups:
+        return f"the element set {raw_vals.strip()} is not a {{…}} list; it is not translated"
+    rest = raw_vals
+    for g in groups:
+        rest = rest.replace(g, " ", 1)
+    ops = set(rest.split())
+    if ops - {"+"}:
+        return ("a set operator between element sets ("
+                + " ".join(sorted(ops - {"+"})) + ") — only + (union) is translated")
+    return None
+
+
+def _element_literal(v: str, field_type: Optional[str] = None,
+                     notes: Optional[list] = None) -> tuple[str, Optional[str]]:
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        text = v[1:-1].replace('""', '"')
+        if _SEARCH_CHARS.search(text):
+            return "", (f"the element value {v} is a search (wildcard, range, expression or "
+                        "fuzzy), not a single value; it is not translated")
+    elif len(v) >= 2 and v[0] == v[-1] == "'":
+        text = v[1:-1].replace("''", "'")
+    elif _NUMBER.fullmatch(v):
+        kind = (field_type or "").upper()
+        if kind.startswith(_NUMERIC_TYPES):
+            return v, None
+        if kind:                      # a known non-numeric field: the value is text
+            return "'" + v + "'", None
+        if notes is not None:
+            notes.append(NUMBER_NOTE.format(v))
+        return v, None
+    else:
+        text = v
+    return "'" + text.replace("'", "''") + "'", None
+
+
+def _brace_groups(raw: str) -> list[str]:
+    """Each top-level ``{…}`` in ``raw`` (quotes respected), braces included."""
+    out, start = [], None
+    for k, (ch, depth, opaque) in enumerate(_scan(raw, "{", "}")):
+        if opaque:
+            continue
+        if ch == "{" and depth == 1:
+            start = k
+        elif ch == "}" and depth == 0 and start is not None:
+            out.append(raw[start:k + 1])
+            start = None
+    return out
+
+
+def _set_analysis(expr: str, first_week_day: Optional[int] = None,
+                  ctx: Optional[dict] = None) -> tuple[str, bool, str]:
+    ctx = ctx if ctx is not None else {"notes": [], "field_types": {}}
+    problem = _set_analysis_shape_problem(expr)
+    # Selection state ({$}, {$<…>}) and $(…) dollar expansion first: a value like
+    # {$(vYear)} must never reach the literal patterns below (#586 review).
+    if not problem and "$" in expr:
+        problem = ("uses current-selection context ($) or $-expansion; approximate "
+                   "manually — selection state is not preserved in ThoughtSpot")
+    if not problem:
+        out, problem = _set_analysis_patterns(expr, first_week_day, ctx)
+        if out:
+            return out, False, ""
+    return (f"/* TODO review set analysis: {expr} */", True,
+            f"Set Analysis: {problem or 'unrecognized pattern'}")
+
+
+def _set_measure(measure: str, first_week_day: Optional[int], ctx: dict
+                 ) -> tuple[Optional[str], Optional[str]]:
+    """The aggregated expression, translated like any other (functions remapped, If()
+    rewritten), or a review reason. TOTAL and Aggr() change the aggregation's grain and
+    are not translated inside Set Analysis (#586 review)."""
+    if re.search(r"(?i)\btotal\b", measure) or re.search(r"(?i)\baggr\s*\(", measure):
+        return None, "TOTAL / Aggr() inside a Set Analysis aggregation is not translated"
+    out, review, reason = _translate(measure, first_week_day, ctx)
+    if review or not out:
+        return None, f"the aggregated expression {measure!r}: {reason or 'needs review'}"
+    return out, None
+
+
+def _set_analysis_patterns(expr: str, first_week_day: Optional[int], ctx: dict
+                           ) -> tuple[Optional[str], Optional[str]]:
+    """(formula, None) for a shape translated exactly (notes go to ``ctx``), else
+    (None, reason)."""
+    # Pattern 1: {1} ignores the user's selections; the chart's dimensions still group
+    # it (dropping them is TOTAL), so the grouping is query_groups ( ) and only the
+    # filters are emptied (#586 review — it was a grand total).
     m = re.match(r"(?i)^(\w+)\(\s*\{1\}\s*(.+?)\)$", expr)
     if m:
-        agg = _agg_fn(m.group(1))
-        return f"group_aggregate({agg}({m.group(2).strip()}), {{}}, {{}})", False, ""
+        agg, why = _set_agg(m.group(1), m.group(2))
+        measure, why = (None, why) if why else _set_measure(agg[1], first_week_day, ctx)
+        if why:
+            return None, why
+        return f"group_aggregate ( {agg[0]} ( {measure} ) , query_groups ( ) , {{}} )", None
 
     # Pattern 2/3/4: {<Field={...}>} (equals / exclude / union).
     m = re.match(r"(?i)^(\w+)\(\s*\{<\s*([\w \[\]]+?)\s*(-?=)\s*(.+?)\s*>\}\s*(.+?)\)$", expr)
-    if m:
-        agg_fn = _agg_fn(m.group(1))
-        field = m.group(2).strip().strip("[]")
-        op = m.group(3)
-        raw_vals = m.group(4)
-        measure = m.group(5).strip()
-        groups = re.findall(r"\{([^}]*)\}", raw_vals) or [raw_vals]
-        values = []
-        for g in groups:
-            values += [v.strip().strip("'\"") for v in g.split(",") if v.strip()]
-        if op == "-=":
-            cond = " and ".join(f"{field} != '{v}'" for v in values) or "true"
-        else:
-            cond = " or ".join(f"{field} = '{v}'" for v in values) or "true"
-        if len(values) > 1:
-            cond = f"({cond})"
-        return f"{agg_fn}(if ({cond}) then {measure} else 0)", False, ""
+    if not m:
+        return None, None
+    return _modifier_formula(m, first_week_day, ctx)
 
-    # Pattern 5/6: intersection with selection ($*<...>) or $-expansion.
-    if "$" in expr:
-        return (f"/* TODO review set analysis: {expr} */", True,
-                "Set analysis uses current-selection context ($) or $-expansion; "
-                "approximate manually — selection state is not preserved in ThoughtSpot.")
 
-    return (f"/* TODO review set analysis: {expr} */", True,
-            f"Unrecognized Set Analysis pattern: {expr}")
+def _modifier_formula(m: re.Match, first_week_day: Optional[int], ctx: dict
+                      ) -> tuple[Optional[str], Optional[str]]:
+    agg, why = _set_agg(m.group(1), m.group(5))
+    if why:
+        return None, why
+    field = _set_field(m.group(2))
+    notes: list[str] = []
+    ftype = ctx["field_types"].get(field.strip("[]").lower())
+    values, why, single = _set_values(m.group(4), ftype, notes)
+    measure, why = (None, why) if why else _set_measure(agg[1], first_week_day, ctx)
+    if why:
+        return None, why
+    fn, _m, other = agg
+    if m.group(3) == "-=":
+        cond = " and ".join(f"{field} != {v}" for v in values)
+    else:
+        cond = " or ".join(f"{field} = {v}" for v in values)
+        notes.append(SELECTION_NOTE)
+    if len(values) > 1:
+        cond = f"({cond})"
+    ctx["notes"].extend(notes + ([CASE_NOTE] if single else []))
+    return f"{fn}(if ({cond}) then {measure} else {other})", None
 
 
 # ---------------------------------------------------------------------------

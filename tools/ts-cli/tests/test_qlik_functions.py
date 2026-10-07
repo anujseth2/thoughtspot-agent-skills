@@ -26,6 +26,7 @@ from ts_cli.qlik.functions import (
     PASSTHROUGH_MAP,
     field_quotes_to_brackets,
     translate,
+    translate_with_notes,
 )
 
 _REPO = Path(__file__).resolve().parents[3]
@@ -521,7 +522,7 @@ class TestUnchangedBehaviour:
 
     def test_set_analysis_total(self):
         assert tr("Sum({1} Revenue)") == \
-            "group_aggregate(sum(Revenue), {}, {})"
+            "group_aggregate ( sum ( Revenue ) , query_groups ( ) , {} )"
 
     def test_set_analysis_equals(self):
         assert tr("Sum({<Region={'EMEA'}>} Revenue)") == \
@@ -616,3 +617,130 @@ class TestPr583ScannerEdges:
     def test_two_set_analysis_aggregations_flagged(self):
         _out, review, reason = translate('Sum({<Year={2023}>}"Sales") / Sum({1} "Sales")')
         assert review and "more than one aggregation" in reason
+
+
+class TestSetModifierValues:
+    """BL-376..378 and the count/average neutral element."""
+
+    def test_comma_inside_a_quoted_value_is_one_value(self):  # BL-376
+        assert tr("Sum({<Region={'A, B'}>} Sales)") == \
+            "sum(if (Region = 'A, B') then Sales else 0)"
+
+    def test_several_values_still_split(self):
+        assert tr("Sum({<Region={'A','B'}>} Sales)") == \
+            "sum(if ((Region = 'A' or Region = 'B')) then Sales else 0)"
+
+    @pytest.mark.parametrize("vals", ['">=2020<=2023"', '"*"', '"A*"', '"A?"', '"=Sum(x)>1"'])
+    def test_search_strings_need_review(self, vals):  # BL-377
+        out, review, reason = translate("Sum({<Year={" + vals + "}>} Sales)")
+        assert review and "search" in reason and out.startswith("/* TODO review")
+
+    def test_plain_double_quoted_value_is_exact(self):
+        assert tr('Sum({<Region={"East"}>} Sales)') == \
+            "sum(if (Region = 'East') then Sales else 0)"
+
+    def test_single_quoted_value_with_a_star_is_a_literal(self):
+        assert tr("Sum({<Code={'A*'}>} Sales)") == \
+            "sum(if (Code = 'A*') then Sales else 0)"
+
+    def test_bracketed_field_is_one_reference(self):  # BL-378
+        assert tr('Sum({<[Field Name]={"x"}>} Sales)') == \
+            "sum(if ([Field Name] = 'x') then Sales else 0)"
+
+    def test_apostrophe_in_a_value(self):
+        assert tr('Sum({<Name={"O\'Brien"}>} Sales)') == \
+            "sum(if (Name = \"O'Brien\") then Sales else 0)"
+
+    def test_count_and_average_use_null_outside_the_set(self):
+        assert tr("Count({<Region={'A'}>} Id)") == \
+            "count(if (Region = 'A') then Id else null)"
+        assert tr("Avg({<Region={'A'}>} Price)") == \
+            "average(if (Region = 'A') then Price else null)"
+
+
+class TestSetAnalysisLoudShapes:
+    """#586 review: Set Analysis shapes that were silent wrong answers are NEEDS_REVIEW
+    with a named reason, or translated exactly."""
+
+    @pytest.mark.parametrize("src,why", [
+        ("Sum({<Region={'A'}-{'B'}>} Sales)", "set operator"),
+        ("Sum({<Region={'A'}*{'B'}>} Sales)", "set operator"),
+        ("Sum({<Region={'A'}/{'B'}>} Sales)", "set operator"),
+        ("Sum({<Region=P(Region)>} Sales)", "function element set"),
+        ("Sum({<Region=E(Region)>} Sales)", "function element set"),
+        ("Sum({<Year={$(vYear)}>} Sales)", "$-expansion"),
+        ("Sum({<Region={}>} Sales)", "empty element set"),
+        ("Only({<Region={'A'}>} Sales)", "Only()"),
+        ("Mode({1} Sales)", "Mode()"),
+        ("Concat({<Region={'A'}>} Name)", "Concat()"),
+        ("FirstSortedValue({<Region={'A'}>} Name, Date)", "FirstSortedValue()"),
+        ("Sum({<Region={\"^A\"}>} Sales)", "search"),
+        ("Sum({<Region={\"~A\"}>} Sales)", "search"),
+        ("Sum({<Region={'A'}>} DISTINCT Sales)", "DISTINCT"),
+    ])
+    def test_flagged(self, src, why):
+        out, review, reason = translate(src)
+        assert review and why in reason and out.startswith("/* TODO review")
+
+    def test_union_operator_is_exact(self):
+        out, review, _ = translate("Sum({<Region={'A'}+{'B'}>} Sales)")
+        assert not review
+        assert out == "sum(if ((Region = 'A' or Region = 'B')) then Sales else 0)"
+
+    def test_count_distinct_over_a_set(self):
+        out, review, _ = translate("Count({<Region={'A'}>} DISTINCT Id)")
+        assert not review
+        assert out == "unique count(if (Region = 'A') then Id else null)"
+        assert tr("Count({1} DISTINCT Id)") == \
+            "group_aggregate ( unique count ( Id ) , query_groups ( ) , {} )"
+
+    def test_bare_number_stays_a_number(self):
+        assert tr("Sum({<Year={2023}>} Sales)") == "sum(if (Year = 2023) then Sales else 0)"
+        assert tr("Sum({<Year={'2023'}>} Sales)") == "sum(if (Year = '2023') then Sales else 0)"
+
+    def test_single_quoted_value_carries_the_case_note(self):
+        out, review, reason, notes = translate_with_notes("Sum({<Region={'A'}>} Sales)")
+        assert not review and reason == ""
+        assert any("BL-333" in n and "June 2017" in n for n in notes)
+        _o, _r, _w, notes2 = translate_with_notes('Sum({<Region={"East"}>} Sales)')
+        assert not any("BL-333" in n for n in notes2)
+
+
+class TestSetAnalysisReviewRound2:
+    """#586 re-review."""
+
+    def test_one_keeps_the_query_groups(self):
+        assert tr("Sum({1} Sales)") == "group_aggregate ( sum ( Sales ) , query_groups ( ) , {} )"
+
+    @pytest.mark.parametrize("src,expected", [
+        ("Sum({<Region={'A'}>} Log(x))", "sum(if (Region = 'A') then ln(x) else 0)"),
+        ("Sum({<Region={'A'}>} If(x > 1, x, 0))",
+         "sum(if (Region = 'A') then if (x > 1) then x else 0 else 0)"),
+        ("Sum({1} Len(s))", "group_aggregate ( sum ( strlen(s) ) , query_groups ( ) , {} )"),
+    ])
+    def test_inner_measure_is_translated(self, src, expected):
+        out, review, _ = translate(src)
+        assert not review and out == expected
+
+    @pytest.mark.parametrize("src", [
+        "Sum({1} TOTAL <Year> Sales)", "Sum({<Region={'A'}>} TOTAL Sales)",
+        "Sum({1} Aggr(Sum(x), y))", "Sum({<Region={'A'}>} Hash128(x))",
+    ])
+    def test_total_aggr_unknown_inside_need_review(self, src):
+        _out, review, _ = translate(src)
+        assert review
+
+    def test_equals_modifier_carries_the_selection_note(self):
+        _o, review, _r, notes = translate_with_notes('Sum({<Region={"A"}>} Sales)')
+        assert not review and any("REPLACES the user's selection" in n for n in notes)
+        _o, _r, _w, notes = translate_with_notes('Sum({<Region-={"A"}>} Sales)')
+        assert not any("REPLACES" in n for n in notes)
+
+    def test_bare_number_follows_the_field_type(self):
+        assert translate("Sum({<Year={2023}>} Sales)", field_types={"Year": "INT64"})[0] == \
+            "sum(if (Year = 2023) then Sales else 0)"
+        assert translate("Sum({<Code={007}>} Sales)", field_types={"code": "VARCHAR"})[0] == \
+            "sum(if (Code = '007') then Sales else 0)"
+        out, _r, _w, notes = translate_with_notes("Sum({<Code={007}>} Sales)")
+        assert out == "sum(if (Code = 007) then Sales else 0)"
+        assert any("text-coded" in n for n in notes)
